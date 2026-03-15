@@ -21,11 +21,18 @@ model_advisor = None
 CURRENT_CHAT_ID = None
 
 def format_as_code(text: str) -> str:
-    """Оборачивает текст в блок кода для второго сообщения"""
+    """Оборачивает текст в красивый блок кода с кнопкой копирования"""
     if not text:
-        return "<pre><code>Команда выполнена (нет вывода).</code></pre>"
-    escaped_text = html.escape(text[:4000])
-    return f"<pre><code>{escaped_text}</code></pre>"
+        return '<pre><code class="language-bash">Команда выполнена (нет вывода).</code></pre>'
+    
+    # Жестко вырезаем markdown-кавычки, если ИИ их случайно добавил
+    clean_text = text.replace("```bash", "").replace("```html", "").replace("```", "").strip()
+    
+    # Экранируем символы и ограничиваем длину
+    escaped_text = html.escape(clean_text[:4000])
+    
+    # Добавляем class="language-bash" — это триггер для Telegram показать шапку с кнопкой "Копировать"
+    return f'<pre><code class="language-bash">{escaped_text}</code></pre>'
 
 def execute_bash(command: str) -> str:
     print(f"Выполнение: {command}")
@@ -62,7 +69,7 @@ def init_models(model_name):
             "ВАЖНОЕ ПРАВИЛО ФОРМАТИРОВАНИЯ ОТВЕТА:\n"
             "Твой финальный ответ ВСЕГДА должен содержать разделитель ===SPLIT===.\n"
             "До ===SPLIT===: напиши свои комментарии или пояснения (обычным текстом).\n"
-            "После ===SPLIT===: вставь ТОЛЬКО голый вывод терминала или статус файла (БЕЗ markdown разметки и кавычек)."
+            "После ===SPLIT===: вставь ТОЛЬКО голый вывод терминала или статус файла (СТРОГО БЕЗ markdown разметки и кавычек)."
         )
     )
     chat_agent = model_agent.start_chat(enable_automatic_function_calling=True)
@@ -71,7 +78,7 @@ def init_models(model_name):
         model_name=model_name,
         system_instruction=(
             "Ты эксперт по Linux. Напиши только готовую bash-команду для решения задачи пользователя. "
-            "Ничего не выполняй. Выдавай только чистый текст команды."
+            "Ничего не выполняй. Выдавай ТОЛЬКО саму команду, без текста, без markdown разметки и без кавычек."
         )
     )
 
@@ -163,7 +170,6 @@ def handle_message(message):
             audio_file = genai.upload_file(path=voice_path, mime_type="audio/ogg")
             response = chat_agent.send_message([audio_file, "Слушай аудио и выполни команду."])
             os.remove(voice_path)
-            # Мы убрали genai.delete_file, чтобы не ломать историю чата!
         else:
             response = chat_agent.send_message(text)
             
@@ -196,4 +202,4 @@ def handle_message(message):
 if __name__ == '__main__':
     print("AI-Админ запущен. Ожидание команд...")
     bot.polling(none_stop=True)
-        
+    
