@@ -14,7 +14,7 @@ ADMIN_ID = int(os.getenv("ADMIN_ID", 0))
 
 bot = telebot.TeleBot(TG_TOKEN)
 
-# Инициализируем первым ключом по умолчанию
+# Инициализируем первым ключом
 genai.configure(api_key=API_KEY_1)
 CURRENT_KEY_NUM = 1
 
@@ -25,8 +25,8 @@ chat_agent = None
 model_advisor = None
 CURRENT_CHAT_ID = None
 PENDING_RETRY_MESSAGE = None
+PENDING_FILES = {} # <-- Память для входящих файлов
 
-# Тот самый приоритетный список
 PRIORITY_MODELS = [
     "gemini-2.5-flash",
     "gemini-flash-latest",
@@ -93,7 +93,6 @@ def init_models(model_name):
         chat_agent = model_agent.start_chat()
         model_advisor = genai.GenerativeModel(model_name=model_name)
     else:
-        # Максимально сжатый и оптимизированный промпт для админа
         model_agent = genai.GenerativeModel(
             model_name=model_name,
             tools=[execute_bash, send_file_to_telegram],
@@ -101,7 +100,7 @@ def init_models(model_name):
                 "Ты root-админ Debian. Инструменты: execute_bash, send_file_to_telegram.\n"
                 "1. Пакеты: используй apt/apt-get. Ты root, sudo не нужен.\n"
                 "2. Отправка файлов: ТОЛЬКО send_file_to_telegram. Чтение: cat.\n"
-                "3. Ты слышишь аудио.\n"
+                "3. Ты слышишь аудио и читаешь файлы.\n"
                 "ФОРМАТ ОТВЕТА СТРОГО:\n"
                 "Комментарии\n"
                 "===SPLIT===\n"
@@ -170,6 +169,36 @@ def change_key_cmd(message):
     )
     bot.reply_to(message, "Выберите API-ключ для работы:", reply_markup=markup)
 
+# --- Обработка загрузки ФАЙЛОВ в чат ---
+@bot.message_handler(content_types=['document'])
+def handle_document(message):
+    if message.from_user.id != ADMIN_ID: return
+    global CURRENT_CHAT_ID
+    CURRENT_CHAT_ID = message.chat.id
+    
+    file_id = message.document.file_id
+    file_name = message.document.file_name
+    mime_type = message.document.mime_type
+    
+    # Запоминаем данные о файле для этого чата
+    PENDING_FILES[message.chat.id] = {
+        'file_id': file_id,
+        'file_name': file_name,
+        'mime_type': mime_type
+    }
+    
+    markup = InlineKeyboardMarkup()
+    markup.row(
+        InlineKeyboardButton("✅ Да", callback_data="file_yes"),
+        InlineKeyboardButton("❌ Нет", callback_data="file_no")
+    )
+    markup.row(
+        InlineKeyboardButton("🧠 Обработать ИИ", callback_data="file_ai")
+    )
+    
+    bot.reply_to(message, f"📥 Загрузить файл <b>{html.escape(file_name)}</b> на сервер?", reply_markup=markup, parse_mode='HTML')
+
+
 @bot.callback_query_handler(func=lambda call: True)
 def handle_query(call):
     if call.from_user.id != ADMIN_ID: return
@@ -177,6 +206,7 @@ def handle_query(call):
     global CURRENT_MODEL, PENDING_RETRY_MESSAGE, CURRENT_KEY_NUM, AVAILABLE_MODELS
     data = call.data
     
+    # 1. Смена ключей
     if data.startswith("key_"):
         key_num = int(data.split("_")[1])
         target_key = API_KEY_1 if key_num == 1 else API_KEY_2
@@ -194,6 +224,7 @@ def handle_query(call):
                               text=f"✅ Активен <b>KEY {key_num}</b>.\nТеперь выберите модель /gemini", parse_mode='HTML')
         return
 
+    # 2. Выбор модели
     if data.startswith("mod_"):
         model_name = data.replace("mod_", "")
         CURRENT_MODEL = model_name
@@ -215,6 +246,96 @@ def handle_query(call):
                 
         except Exception as e:
             bot.answer_callback_query(call.id, f"Ошибка инициализации: {e}")
+        return
+
+    # 3. Обработка кнопок файлов
+    if data in ["file_yes", "file_no", "file_ai"]:
+        file_info_dict = PENDING_FILES.get(call.message.chat.id)
+        
+        if data == "file_no":
+            bot.edit_message_text(chat_id=call.message.chat.id, message_id=call.message.message_id, text="❌ Операция с файлом отменена.")
+            PENDING_FILES.pop(call.message.chat.id, None)
+            return
+            
+        if not file_info_dict:
+            bot.answer_callback_query(call.id, "❌ Файл устарел или не найден в памяти.", show_alert=True)
+            return
+
+        if data == "file_yes":
+            bot.edit_message_text(chat_id=call.message.chat.id, message_id=call.message.message_id, text="⏳ Сохраняю файл на сервер...")
+            try:
+                file_info = bot.get_file(file_info_dict['file_id'])
+                downloaded_file = bot.download_file(file_info.file_path)
+                
+                # Сохраняем прямо в текущую директорию (внутри контейнера это /app)
+                save_path = os.path.join(os.getcwd(), file_info_dict['file_name'])
+                with open(save_path, 'wb') as new_file:
+                    new_file.write(downloaded_file)
+                    
+                bot.edit_message_text(chat_id=call.message.chat.id, message_id=call.message.message_id, 
+                                      text=f"✅ Файл <b>{html.escape(file_info_dict['file_name'])}</b> успешно сохранен!\n📁 Путь: <code>{html.escape(save_path)}</code>", parse_mode='HTML')
+            except Exception as e:
+                bot.edit_message_text(chat_id=call.message.chat.id, message_id=call.message.message_id, text=f"❌ Ошибка загрузки: {e}")
+            
+            PENDING_FILES.pop(call.message.chat.id, None)
+            return
+            
+        if data == "file_ai":
+            if not CURRENT_MODEL:
+                bot.answer_callback_query(call.id, "⚠️ Сначала выберите модель (/gemini)!", show_alert=True)
+                return
+                
+            clean_name = CURRENT_MODEL.replace('models/', '')
+            is_gemma = "gemma" in clean_name.lower()
+            
+            bot.edit_message_text(chat_id=call.message.chat.id, message_id=call.message.message_id, text=f"<b>{clean_name}:</b>\n🧠 Читаю и анализирую файл...", parse_mode='HTML')
+            msg_wait = bot.send_message(call.message.chat.id, "🤖 Ожидайте вывода...")
+            
+            try:
+                # Временно качаем файл
+                file_info = bot.get_file(file_info_dict['file_id'])
+                downloaded_file = bot.download_file(file_info.file_path)
+                temp_file_name = f"temp_ai_{file_info_dict['file_name']}"
+                
+                with open(temp_file_name, 'wb') as new_file:
+                    new_file.write(downloaded_file)
+                
+                # Грузим в ИИ
+                mime = file_info_dict['mime_type']
+                gemini_file = genai.upload_file(path=temp_file_name, mime_type=mime) if mime else genai.upload_file(path=temp_file_name)
+                
+                if is_gemma:
+                     response = chat_agent.send_message("Я получил файл, но как модель Gemma я пока не умею напрямую читать файлы через этот интерфейс.")
+                else:
+                     response = chat_agent.send_message([gemini_file, "Проанализируй этот файл. Расскажи, что в нём (сделай саммари текста или объясни код). Если есть инструкции к действию - выполни их."])
+                
+                os.remove(temp_file_name)
+                
+                full_text = response.text
+                if is_gemma:
+                    try:
+                        bot.edit_message_text(chat_id=call.message.chat.id, message_id=call.message.message_id, text=f"*{clean_name} (Чат):*\n\n{full_text}", parse_mode='Markdown')
+                    except:
+                        bot.edit_message_text(chat_id=call.message.chat.id, message_id=call.message.message_id, text=f"<b>{clean_name} (Чат):</b>\n\n{html.escape(full_text)}", parse_mode='HTML')
+                    bot.delete_message(chat_id=call.message.chat.id, message_id=msg_wait.message_id)
+                else:
+                    if "===SPLIT===" in full_text:
+                        parts = full_text.split("===SPLIT===", 1)
+                        comment = parts[0].strip()
+                        raw_out = parts[1].strip()
+                    else:
+                        comment = ""
+                        raw_out = full_text.strip()
+                        
+                    first_text = f"<b>{clean_name}:</b>" + (f"\n\n{html.escape(comment)}" if comment else "")
+                    bot.edit_message_text(chat_id=call.message.chat.id, message_id=call.message.message_id, text=first_text, parse_mode='HTML')
+                    bot.edit_message_text(chat_id=call.message.chat.id, message_id=msg_wait.message_id, text=format_as_code(raw_out), parse_mode='HTML')
+                    
+            except Exception as e:
+                handle_api_error(e, call.message.chat.id, msg_wait.message_id, None, clean_name)
+                
+            PENDING_FILES.pop(call.message.chat.id, None)
+            return
 
 @bot.message_handler(content_types=['voice', 'text'])
 def handle_message(message):
@@ -279,7 +400,6 @@ def handle_message(message):
         full_text = response.text
         
         if is_gemma:
-            # Пытаемся отправить с красивым Markdown, если ИИ выдал кривую разметку - падаем в безопасный HTML
             try:
                 bot.edit_message_text(chat_id=message.chat.id, message_id=msg_first.message_id,
                                       text=f"*{clean_model_name} (Чат):*\n\n{full_text}", parse_mode='Markdown')
@@ -312,4 +432,4 @@ def handle_message(message):
 if __name__ == '__main__':
     print("AI-Админ запущен. Ожидание команд...")
     bot.polling(none_stop=True)
-    
+        
