@@ -25,7 +25,7 @@ chat_agent = None
 model_advisor = None
 CURRENT_CHAT_ID = None
 PENDING_RETRY_MESSAGE = None
-PENDING_FILES = {} # <-- Память для входящих файлов
+PENDING_FILES = {}
 
 PRIORITY_MODELS = [
     "gemini-2.5-flash",
@@ -180,7 +180,6 @@ def handle_document(message):
     file_name = message.document.file_name
     mime_type = message.document.mime_type
     
-    # Запоминаем данные о файле для этого чата
     PENDING_FILES[message.chat.id] = {
         'file_id': file_id,
         'file_name': file_name,
@@ -206,7 +205,6 @@ def handle_query(call):
     global CURRENT_MODEL, PENDING_RETRY_MESSAGE, CURRENT_KEY_NUM, AVAILABLE_MODELS
     data = call.data
     
-    # 1. Смена ключей
     if data.startswith("key_"):
         key_num = int(data.split("_")[1])
         target_key = API_KEY_1 if key_num == 1 else API_KEY_2
@@ -224,7 +222,6 @@ def handle_query(call):
                               text=f"✅ Активен <b>KEY {key_num}</b>.\nТеперь выберите модель /gemini", parse_mode='HTML')
         return
 
-    # 2. Выбор модели
     if data.startswith("mod_"):
         model_name = data.replace("mod_", "")
         CURRENT_MODEL = model_name
@@ -248,7 +245,7 @@ def handle_query(call):
             bot.answer_callback_query(call.id, f"Ошибка инициализации: {e}")
         return
 
-    # 3. Обработка кнопок файлов
+    # Обработка кнопок файлов
     if data in ["file_yes", "file_no", "file_ai"]:
         file_info_dict = PENDING_FILES.get(call.message.chat.id)
         
@@ -261,19 +258,30 @@ def handle_query(call):
             bot.answer_callback_query(call.id, "❌ Файл устарел или не найден в памяти.", show_alert=True)
             return
 
+        # --- ОБНОВЛЕННАЯ ЛОГИКА СОХРАНЕНИЯ В ОБЩУЮ ПАПКУ ---
         if data == "file_yes":
             bot.edit_message_text(chat_id=call.message.chat.id, message_id=call.message.message_id, text="⏳ Сохраняю файл на сервер...")
             try:
                 file_info = bot.get_file(file_info_dict['file_id'])
                 downloaded_file = bot.download_file(file_info.file_path)
                 
-                # Сохраняем прямо в текущую директорию (внутри контейнера это /app)
-                save_path = os.path.join(os.getcwd(), file_info_dict['file_name'])
+                # Создаем папку, если вдруг её еще нет
+                download_dir = "/app/downloads"
+                os.makedirs(download_dir, exist_ok=True)
+                
+                # Сохраняем файл в наш "портал"
+                save_path = os.path.join(download_dir, file_info_dict['file_name'])
                 with open(save_path, 'wb') as new_file:
                     new_file.write(downloaded_file)
                     
-                bot.edit_message_text(chat_id=call.message.chat.id, message_id=call.message.message_id, 
-                                      text=f"✅ Файл <b>{html.escape(file_info_dict['file_name'])}</b> успешно сохранен!\n📁 Путь: <code>{html.escape(save_path)}</code>", parse_mode='HTML')
+                bot.edit_message_text(
+                    chat_id=call.message.chat.id, 
+                    message_id=call.message.message_id, 
+                    text=f"✅ Файл <b>{html.escape(file_info_dict['file_name'])}</b> успешно сохранен!\n\n"
+                         f"📁 Путь в боте: <code>{html.escape(save_path)}</code>\n"
+                         f"📁 Путь на сервере: <code>/root/ai_files/{html.escape(file_info_dict['file_name'])}</code>", 
+                    parse_mode='HTML'
+                )
             except Exception as e:
                 bot.edit_message_text(chat_id=call.message.chat.id, message_id=call.message.message_id, text=f"❌ Ошибка загрузки: {e}")
             
@@ -292,7 +300,6 @@ def handle_query(call):
             msg_wait = bot.send_message(call.message.chat.id, "🤖 Ожидайте вывода...")
             
             try:
-                # Временно качаем файл
                 file_info = bot.get_file(file_info_dict['file_id'])
                 downloaded_file = bot.download_file(file_info.file_path)
                 temp_file_name = f"temp_ai_{file_info_dict['file_name']}"
@@ -300,7 +307,6 @@ def handle_query(call):
                 with open(temp_file_name, 'wb') as new_file:
                     new_file.write(downloaded_file)
                 
-                # Грузим в ИИ
                 mime = file_info_dict['mime_type']
                 gemini_file = genai.upload_file(path=temp_file_name, mime_type=mime) if mime else genai.upload_file(path=temp_file_name)
                 
@@ -432,4 +438,3 @@ def handle_message(message):
 if __name__ == '__main__':
     print("AI-Админ запущен. Ожидание команд...")
     bot.polling(none_stop=True)
-        
