@@ -1,9 +1,11 @@
 version: '3.8'
 
 services:
-  web-api:
+  ai-bot:
     build: .
-    container_name: my_python_api
+    container_name: my_ai_admin
     restart: always
-    ports:
-      - "5000:5000"
+    environment:
+      - TG_TOKEN=${TG_TOKEN}
+      - GEMINI_API_KEY=${GEMINI_API_KEY}
+      
