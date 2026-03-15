@@ -4,6 +4,7 @@ import telebot
 from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
 import google.generativeai as genai
 import html
+import re # <-- Добавили для красивого парсинга ошибок
 
 # Загружаем ключи
 TG_TOKEN = os.getenv("TG_TOKEN")
@@ -13,25 +14,20 @@ ADMIN_ID = int(os.getenv("ADMIN_ID", 0))
 bot = telebot.TeleBot(TG_TOKEN)
 genai.configure(api_key=GEMINI_API_KEY)
 
-# Глобальные переменные
+# Глобальные переменные состояния
 AVAILABLE_MODELS = []
 CURRENT_MODEL = None
 chat_agent = None
 model_advisor = None
 CURRENT_CHAT_ID = None
+PENDING_RETRY_MESSAGE = None # <-- Память для автоматического повтора после 429 ошибки
 
 def format_as_code(text: str) -> str:
     """Оборачивает текст в красивый блок кода с кнопкой копирования"""
     if not text:
         return '<pre><code class="language-bash">Команда выполнена (нет вывода).</code></pre>'
-    
-    # Жестко вырезаем markdown-кавычки, если ИИ их случайно добавил
     clean_text = text.replace("```bash", "").replace("```html", "").replace("```", "").strip()
-    
-    # Экранируем символы и ограничиваем длину
     escaped_text = html.escape(clean_text[:4000])
-    
-    # Добавляем class="language-bash" — это триггер для Telegram показать шапку с кнопкой "Копировать"
     return f'<pre><code class="language-bash">{escaped_text}</code></pre>'
 
 def execute_bash(command: str) -> str:
@@ -93,6 +89,34 @@ def get_models_keyboard():
         markup.add(InlineKeyboardButton(text=clean_name, callback_data=model_name))
     return markup
 
+# --- Умная обработка ошибок API ---
+def handle_api_error(e, chat_id, message_id, original_message, clean_model_name):
+    """Парсит ошибку Google API и предлагает смену модели с авто-повтором"""
+    error_text = str(e)
+    
+    # Ищем код 429 или слова о квотах
+    if "429" in error_text or "Quota exceeded" in error_text:
+        global PENDING_RETRY_MESSAGE
+        PENDING_RETRY_MESSAGE = original_message # Запоминаем сообщение!
+        
+        # Пытаемся вытащить время ожидания (например, "retry in 35.9s")
+        delay_match = re.search(r'retry in ([\d\.]+)s', error_text)
+        delay_str = f"<b>{float(delay_match.group(1)):.0f} сек.</b>" if delay_match else "некоторое время"
+        
+        pretty_error = (
+            "⚠️ <b>Ошибка 429: Лимиты API исчерпаны!</b>\n\n"
+            f"Текущая модель (<code>{clean_model_name}</code>) достигла лимита бесплатного тарифа Google.\n"
+            f"⏳ Блокировка этой модели спадет через: {delay_str}\n\n"
+            "👇 <b>Выберите резервную модель ниже</b>, и я мгновенно повторю ваш запрос:"
+        )
+        bot.edit_message_text(chat_id=chat_id, message_id=message_id, 
+                              text=pretty_error, parse_mode='HTML', reply_markup=get_models_keyboard())
+    else:
+        # Если это другая ошибка (не лимиты), выводим как есть
+        bot.edit_message_text(chat_id=chat_id, message_id=message_id, 
+                              text=f"❌ Ошибка ИИ: {html.escape(error_text)}", parse_mode='HTML')
+
+# --- Хэндлеры команд ---
 @bot.message_handler(commands=['start'])
 def send_welcome(message):
     if message.from_user.id != ADMIN_ID: return
@@ -107,13 +131,21 @@ def change_model(message):
 def handle_query(call):
     if call.from_user.id != ADMIN_ID: return
     
-    global CURRENT_MODEL
+    global CURRENT_MODEL, PENDING_RETRY_MESSAGE
     CURRENT_MODEL = call.data
     try:
         init_models(CURRENT_MODEL)
         clean_name = CURRENT_MODEL.replace('models/', '')
         bot.edit_message_text(chat_id=call.message.chat.id, message_id=call.message.message_id, 
                               text=f"✅ Выбрана модель: <b>{clean_name}</b>", parse_mode='HTML')
+        
+        # МАГИЯ: Автоматический повтор запроса!
+        if PENDING_RETRY_MESSAGE:
+            msg_to_retry = PENDING_RETRY_MESSAGE
+            PENDING_RETRY_MESSAGE = None # Очищаем память
+            bot.send_message(call.message.chat.id, f"🔄 Повторяю прерванный запрос на новой модели (<b>{clean_name}</b>)...", parse_mode='HTML')
+            handle_message(msg_to_retry) # Отправляем сообщение на обработку заново
+            
     except Exception as e:
         bot.answer_callback_query(call.id, f"Ошибка инициализации: {e}")
 
@@ -152,7 +184,8 @@ def handle_message(message):
                 bot.edit_message_text(chat_id=message.chat.id, message_id=msg_wait.message_id,
                                       text=format_as_code(response.text), parse_mode='HTML')
             except Exception as e:
-                bot.edit_message_text(chat_id=message.chat.id, message_id=msg_wait.message_id, text=f"❌ Ошибка: {e}")
+                # Используем нашу умную обработку ошибок
+                handle_api_error(e, message.chat.id, msg_wait.message_id, message, clean_model_name)
             return
 
     # Отправляем первичные сообщения
@@ -175,7 +208,6 @@ def handle_message(message):
             
         full_text = response.text
         
-        # Разрезаем ответ ИИ на комментарии и голый код
         if "===SPLIT===" in full_text:
             parts = full_text.split("===SPLIT===", 1)
             comment = parts[0].strip()
@@ -184,12 +216,10 @@ def handle_message(message):
             comment = ""
             raw_out = full_text.strip()
             
-        # Формируем первое сообщение (Имя + Комментарий)
         first_message_text = f"<b>{clean_model_name}:</b>"
         if comment:
             first_message_text += f"\n\n{html.escape(comment)}"
             
-        # Обновляем оба сообщения в ТГ
         bot.edit_message_text(chat_id=message.chat.id, message_id=msg_first.message_id,
                               text=first_message_text, parse_mode='HTML')
                               
@@ -197,9 +227,9 @@ def handle_message(message):
                               text=format_as_code(raw_out), parse_mode='HTML')
                               
     except Exception as e:
-        bot.edit_message_text(chat_id=message.chat.id, message_id=msg_wait.message_id, text=f"❌ Ошибка выполнения: {e}")
+        # Используем нашу умную обработку ошибок для автономного агента
+        handle_api_error(e, message.chat.id, msg_wait.message_id, message, clean_model_name)
 
 if __name__ == '__main__':
     print("AI-Админ запущен. Ожидание команд...")
     bot.polling(none_stop=True)
-    
