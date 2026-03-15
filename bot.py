@@ -54,14 +54,13 @@ def init_models(model_name):
     global chat_agent, model_advisor
     model_agent = genai.GenerativeModel(
         model_name=model_name,
-        # Теперь у ИИ два инструмента: консоль и отправка файлов!
         tools=[execute_bash, send_file_to_telegram],
         system_instruction=(
             "Ты автономный системный администратор. У тебя есть инструменты execute_bash и send_file_to_telegram. "
             "ПРАВИЛА РАБОТЫ С ФАЙЛАМИ: "
             "1. Если пользователь просит 'пришли', 'скачай' или 'отправь' файл - используй ТОЛЬКО send_file_to_telegram. "
             "2. Если пользователь просит 'покажи текст' или 'выведи содержимое' - читай файл через execute_bash (cat). "
-            "Анализируй ошибки и исправляй их автономно."
+            "Анализируй ошибки и исправляй их автономно. Не используй markdown форматирование в финальном ответе, выдавай чистый текст."
         )
     )
     chat_agent = model_agent.start_chat(enable_automatic_function_calling=True)
@@ -70,7 +69,7 @@ def init_models(model_name):
         model_name=model_name,
         system_instruction=(
             "Ты эксперт по Linux. Напиши только готовую bash-команду для решения задачи пользователя. "
-            "Ничего не выполняй."
+            "Ничего не выполняй. Не используй markdown форматирование, выдавай только чистый текст команды и краткое объяснение."
         )
     )
 
@@ -113,7 +112,6 @@ def handle_query(call):
 
 # --- Обработка Текста и Голоса ---
 
-# Добавили content_types=['voice', 'text']
 @bot.message_handler(content_types=['voice', 'text'])
 def handle_message(message):
     if message.from_user.id != ADMIN_ID:
@@ -142,7 +140,9 @@ def handle_message(message):
 
         if text.startswith('#'):
             task = text[1:].strip()
+            # Первое сообщение - имя модели
             bot.send_message(message.chat.id, f"<b>{clean_model_name}:</b>", parse_mode='HTML')
+            # Второе сообщение - процесс и результат
             msg_wait = bot.send_message(message.chat.id, "🧠 Думаю...")
             try:
                 response = model_advisor.generate_content(task)
@@ -154,8 +154,9 @@ def handle_message(message):
 
     # Автономный агент (Текст или Голос)
     
-    # Отправляем первое сообщение с именем модели
+    # Первое сообщение - имя модели
     bot.send_message(message.chat.id, f"<b>{clean_model_name}:</b>", parse_mode='HTML')
+    # Второе сообщение - процесс и результат
     msg_wait = bot.send_message(message.chat.id, "🤖 Обрабатываю запрос...")
 
     try:
@@ -167,14 +168,16 @@ def handle_message(message):
             with open(voice_path, 'wb') as new_file:
                 new_file.write(downloaded_file)
             
-            # Грузим в Gemini
-            audio_file = genai.upload_file(path=voice_path)
+            # Грузим в Gemini с правильным mime_type
+            audio_file = genai.upload_file(path=voice_path, mime_type="audio/ogg")
             
-            # Отправляем ИИ аудиофайл + текстовую инструкцию к нему
-            response = chat_agent.send_message([audio_file, "Выполни то, что сказано в этом голосовом сообщении."])
+            # Отправляем ИИ аудиофайл
+            response = chat_agent.send_message([audio_file, "Слушай аудио. Выполни задачу через консоль."])
             
-            # Заметаем следы (удаляем временный файл)
+            # Удаляем локальный файл
             os.remove(voice_path)
+            # Удаляем файл из облака Google
+            genai.delete_file(audio_file.name)
         else:
             response = chat_agent.send_message(text)
             
@@ -186,4 +189,3 @@ def handle_message(message):
 if __name__ == '__main__':
     print("AI-Админ запущен. Ожидание команд...")
     bot.polling(none_stop=True)
-        
