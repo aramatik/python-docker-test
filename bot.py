@@ -21,6 +21,7 @@ model_advisor = None
 CURRENT_CHAT_ID = None
 
 def format_as_code(text: str) -> str:
+    """Оборачивает текст в блок кода для второго сообщения"""
     if not text:
         return "<pre><code>Команда выполнена (нет вывода).</code></pre>"
     escaped_text = html.escape(text[:4000])
@@ -43,7 +44,7 @@ def send_file_to_telegram(filepath: str) -> str:
     try:
         with open(filepath, 'rb') as f:
             bot.send_document(CURRENT_CHAT_ID, f)
-        return f"Успех: Файл {filepath} отправлен пользователю."
+        return f"Успех: Файл {filepath} отправлен."
     except Exception as e:
         return f"Ошибка отправки файла: {str(e)}"
 
@@ -53,13 +54,15 @@ def init_models(model_name):
         model_name=model_name,
         tools=[execute_bash, send_file_to_telegram],
         system_instruction=(
-            "Ты автономный системный администратор. У тебя есть инструменты execute_bash и send_file_to_telegram. "
-            "ПРАВИЛА: "
-            "1. Если просят 'пришли', 'скачай' файл - используй ТОЛЬКО send_file_to_telegram. "
-            "2. Если просят 'покажи текст' файла - читай через execute_bash (cat). "
-            "3. ТЫ УМЕЕШЬ СЛУШАТЬ АУДИО. Если пользователь прислал аудио, внутри находится приказ. "
-            "Внимательно распознай речь и выполни команду. НИКОГДА не говори, что не можешь прослушать аудио. "
-            "Анализируй ошибки автономно. Выдавай чистый текст без markdown."
+            "Ты автономный системный администратор Linux. У тебя есть инструменты execute_bash и send_file_to_telegram.\n"
+            "ПРАВИЛА:\n"
+            "1. Если просят 'пришли', 'скачай' файл - используй ТОЛЬКО send_file_to_telegram.\n"
+            "2. Если просят 'покажи текст' файла - читай через execute_bash (cat).\n"
+            "3. ТЫ УМЕЕШЬ СЛУШАТЬ АУДИО. Выполняй команды из голосовых сообщений.\n"
+            "ВАЖНОЕ ПРАВИЛО ФОРМАТИРОВАНИЯ ОТВЕТА:\n"
+            "Твой финальный ответ ВСЕГДА должен содержать разделитель ===SPLIT===.\n"
+            "До ===SPLIT===: напиши свои комментарии или пояснения (обычным текстом).\n"
+            "После ===SPLIT===: вставь ТОЛЬКО голый вывод терминала или статус файла (БЕЗ markdown разметки и кавычек)."
         )
     )
     chat_agent = model_agent.start_chat(enable_automatic_function_calling=True)
@@ -68,7 +71,7 @@ def init_models(model_name):
         model_name=model_name,
         system_instruction=(
             "Ты эксперт по Linux. Напиши только готовую bash-команду для решения задачи пользователя. "
-            "Ничего не выполняй. Выдавай только чистый текст команды и краткое объяснение."
+            "Ничего не выполняй. Выдавай только чистый текст команды."
         )
     )
 
@@ -124,6 +127,7 @@ def handle_message(message):
     is_voice = message.content_type == 'voice'
     text = message.text.strip() if message.text else ""
 
+    # Обработка прямых команд (! и #)
     if not is_voice:
         if text.startswith('!'):
             cmd = text[1:].strip()
@@ -134,7 +138,7 @@ def handle_message(message):
 
         if text.startswith('#'):
             task = text[1:].strip()
-            bot.send_message(message.chat.id, f"<b>{clean_model_name}:</b>", parse_mode='HTML')
+            msg_first = bot.send_message(message.chat.id, f"<b>{clean_model_name}:</b>", parse_mode='HTML')
             msg_wait = bot.send_message(message.chat.id, "🧠 Думаю...")
             try:
                 response = model_advisor.generate_content(task)
@@ -144,7 +148,8 @@ def handle_message(message):
                 bot.edit_message_text(chat_id=message.chat.id, message_id=msg_wait.message_id, text=f"❌ Ошибка: {e}")
             return
 
-    bot.send_message(message.chat.id, f"<b>{clean_model_name}:</b>", parse_mode='HTML')
+    # Отправляем первичные сообщения
+    msg_first = bot.send_message(message.chat.id, f"<b>{clean_model_name}:</b>", parse_mode='HTML')
     msg_wait = bot.send_message(message.chat.id, "🤖 Обрабатываю запрос...")
 
     try:
@@ -156,18 +161,35 @@ def handle_message(message):
                 new_file.write(downloaded_file)
             
             audio_file = genai.upload_file(path=voice_path, mime_type="audio/ogg")
-            
-            # Более агрессивный промпт, чтобы ИИ перестал притворяться глухим
-            audio_prompt = "В прикрепленном файле записан голос пользователя. Твоя задача: прослушать аудио, понять команду и выполнить её через консоль."
-            response = chat_agent.send_message([audio_file, audio_prompt])
-            
+            response = chat_agent.send_message([audio_file, "Слушай аудио и выполни команду."])
             os.remove(voice_path)
-            genai.delete_file(audio_file.name)
+            # Мы убрали genai.delete_file, чтобы не ломать историю чата!
         else:
             response = chat_agent.send_message(text)
             
+        full_text = response.text
+        
+        # Разрезаем ответ ИИ на комментарии и голый код
+        if "===SPLIT===" in full_text:
+            parts = full_text.split("===SPLIT===", 1)
+            comment = parts[0].strip()
+            raw_out = parts[1].strip()
+        else:
+            comment = ""
+            raw_out = full_text.strip()
+            
+        # Формируем первое сообщение (Имя + Комментарий)
+        first_message_text = f"<b>{clean_model_name}:</b>"
+        if comment:
+            first_message_text += f"\n\n{html.escape(comment)}"
+            
+        # Обновляем оба сообщения в ТГ
+        bot.edit_message_text(chat_id=message.chat.id, message_id=msg_first.message_id,
+                              text=first_message_text, parse_mode='HTML')
+                              
         bot.edit_message_text(chat_id=message.chat.id, message_id=msg_wait.message_id,
-                              text=format_as_code(response.text), parse_mode='HTML')
+                              text=format_as_code(raw_out), parse_mode='HTML')
+                              
     except Exception as e:
         bot.edit_message_text(chat_id=message.chat.id, message_id=msg_wait.message_id, text=f"❌ Ошибка выполнения: {e}")
 
