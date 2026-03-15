@@ -14,11 +14,9 @@ ADMIN_ID = int(os.getenv("ADMIN_ID", 0))
 
 bot = telebot.TeleBot(TG_TOKEN)
 
-# Инициализируем первым ключом
 genai.configure(api_key=API_KEY_1)
 CURRENT_KEY_NUM = 1
 
-# Глобальные переменные состояния
 AVAILABLE_MODELS = []
 CURRENT_MODEL = None
 chat_agent = None
@@ -44,6 +42,16 @@ PRIORITY_MODELS = [
     "gemma-3n-e2b",
     "gemini-2.5-pro"
 ]
+
+# --- УМНЫЙ ПРЕДОХРАНИТЕЛЬ ДЛЯ ТЕЛЕГРАМА ---
+def safe_edit_message(chat_id, message_id, text, parse_mode='HTML', reply_markup=None):
+    """Редактирует сообщение, игнорируя ошибку, если текст не изменился"""
+    try:
+        bot.edit_message_text(chat_id=chat_id, message_id=message_id, text=text, 
+                              parse_mode=parse_mode, reply_markup=reply_markup)
+    except Exception as e:
+        if "message is not modified" not in str(e).lower():
+            raise e # Если ошибка серьезная - пробрасываем дальше
 
 def format_as_code(text: str) -> str:
     if not text:
@@ -141,13 +149,9 @@ def handle_api_error(e, chat_id, message_id, original_message, clean_model_name)
             f"⏳ Блокировка спадет через: {delay_str}\n\n"
             "👇 Выберите другую модель ниже, либо смените ключ командой /changekey"
         )
-        bot.edit_message_text(chat_id=chat_id, message_id=message_id, 
-                              text=pretty_error, parse_mode='HTML', reply_markup=get_models_keyboard())
+        safe_edit_message(chat_id, message_id, pretty_error, reply_markup=get_models_keyboard())
     else:
-        bot.edit_message_text(chat_id=chat_id, message_id=message_id, 
-                              text=f"❌ Ошибка ИИ: {html.escape(error_text)}", parse_mode='HTML')
-
-# --- Хэндлеры команд ---
+        safe_edit_message(chat_id, message_id, f"❌ Ошибка ИИ: {html.escape(error_text)}")
 
 @bot.message_handler(commands=['start'])
 def send_welcome(message):
@@ -169,7 +173,6 @@ def change_key_cmd(message):
     )
     bot.reply_to(message, "Выберите API-ключ для работы:", reply_markup=markup)
 
-# --- Обработка загрузки ФАЙЛОВ в чат ---
 @bot.message_handler(content_types=['document'])
 def handle_document(message):
     if message.from_user.id != ADMIN_ID: return
@@ -197,7 +200,6 @@ def handle_document(message):
     
     bot.reply_to(message, f"📥 Загрузить файл <b>{html.escape(file_name)}</b> на сервер?", reply_markup=markup, parse_mode='HTML')
 
-
 @bot.callback_query_handler(func=lambda call: True)
 def handle_query(call):
     if call.from_user.id != ADMIN_ID: return
@@ -218,8 +220,8 @@ def handle_query(call):
         AVAILABLE_MODELS = [] 
         CURRENT_MODEL = None
         
-        bot.edit_message_text(chat_id=call.message.chat.id, message_id=call.message.message_id, 
-                              text=f"✅ Активен <b>KEY {key_num}</b>.\nТеперь выберите модель /gemini", parse_mode='HTML')
+        safe_edit_message(call.message.chat.id, call.message.message_id, 
+                          f"✅ Активен <b>KEY {key_num}</b>.\nТеперь выберите модель /gemini")
         return
 
     if data.startswith("mod_"):
@@ -232,8 +234,8 @@ def handle_query(call):
             is_gemma = "gemma" in clean_name.lower()
             mode_text = "(Режим Чатбота)" if is_gemma else "(Режим Админа)"
             
-            bot.edit_message_text(chat_id=call.message.chat.id, message_id=call.message.message_id, 
-                                  text=f"✅ Выбрана модель: <b>{clean_name}</b> {mode_text}", parse_mode='HTML')
+            safe_edit_message(call.message.chat.id, call.message.message_id, 
+                              f"✅ Выбрана модель: <b>{clean_name}</b> {mode_text}")
             
             if PENDING_RETRY_MESSAGE:
                 msg_to_retry = PENDING_RETRY_MESSAGE
@@ -245,12 +247,11 @@ def handle_query(call):
             bot.answer_callback_query(call.id, f"Ошибка инициализации: {e}")
         return
 
-    # Обработка кнопок файлов
     if data in ["file_yes", "file_no", "file_ai"]:
         file_info_dict = PENDING_FILES.get(call.message.chat.id)
         
         if data == "file_no":
-            bot.edit_message_text(chat_id=call.message.chat.id, message_id=call.message.message_id, text="❌ Операция с файлом отменена.")
+            safe_edit_message(call.message.chat.id, call.message.message_id, "❌ Операция с файлом отменена.")
             PENDING_FILES.pop(call.message.chat.id, None)
             return
             
@@ -258,32 +259,28 @@ def handle_query(call):
             bot.answer_callback_query(call.id, "❌ Файл устарел или не найден в памяти.", show_alert=True)
             return
 
-        # --- ОБНОВЛЕННАЯ ЛОГИКА СОХРАНЕНИЯ В ОБЩУЮ ПАПКУ ---
         if data == "file_yes":
-            bot.edit_message_text(chat_id=call.message.chat.id, message_id=call.message.message_id, text="⏳ Сохраняю файл на сервер...")
+            safe_edit_message(call.message.chat.id, call.message.message_id, "⏳ Сохраняю файл на сервер...")
             try:
                 file_info = bot.get_file(file_info_dict['file_id'])
                 downloaded_file = bot.download_file(file_info.file_path)
                 
-                # Создаем папку, если вдруг её еще нет
                 download_dir = "/app/downloads"
                 os.makedirs(download_dir, exist_ok=True)
                 
-                # Сохраняем файл в наш "портал"
                 save_path = os.path.join(download_dir, file_info_dict['file_name'])
                 with open(save_path, 'wb') as new_file:
                     new_file.write(downloaded_file)
                     
-                bot.edit_message_text(
-                    chat_id=call.message.chat.id, 
-                    message_id=call.message.message_id, 
-                    text=f"✅ Файл <b>{html.escape(file_info_dict['file_name'])}</b> успешно сохранен!\n\n"
-                         f"📁 Путь в боте: <code>{html.escape(save_path)}</code>\n"
-                         f"📁 Путь на сервере: <code>/root/ai_files/{html.escape(file_info_dict['file_name'])}</code>", 
-                    parse_mode='HTML'
+                safe_edit_message(
+                    call.message.chat.id, 
+                    call.message.message_id, 
+                    f"✅ Файл <b>{html.escape(file_info_dict['file_name'])}</b> успешно сохранен!\n\n"
+                    f"📁 Путь в боте: <code>{html.escape(save_path)}</code>\n"
+                    f"📁 Путь на сервере: <code>/root/ai_files/{html.escape(file_info_dict['file_name'])}</code>"
                 )
             except Exception as e:
-                bot.edit_message_text(chat_id=call.message.chat.id, message_id=call.message.message_id, text=f"❌ Ошибка загрузки: {e}")
+                safe_edit_message(call.message.chat.id, call.message.message_id, f"❌ Ошибка загрузки: {e}")
             
             PENDING_FILES.pop(call.message.chat.id, None)
             return
@@ -296,7 +293,7 @@ def handle_query(call):
             clean_name = CURRENT_MODEL.replace('models/', '')
             is_gemma = "gemma" in clean_name.lower()
             
-            bot.edit_message_text(chat_id=call.message.chat.id, message_id=call.message.message_id, text=f"<b>{clean_name}:</b>\n🧠 Читаю и анализирую файл...", parse_mode='HTML')
+            safe_edit_message(call.message.chat.id, call.message.message_id, f"<b>{clean_name}:</b>\n🧠 Читаю и анализирую файл...")
             msg_wait = bot.send_message(call.message.chat.id, "🤖 Ожидайте вывода...")
             
             try:
@@ -320,9 +317,9 @@ def handle_query(call):
                 full_text = response.text
                 if is_gemma:
                     try:
-                        bot.edit_message_text(chat_id=call.message.chat.id, message_id=call.message.message_id, text=f"*{clean_name} (Чат):*\n\n{full_text}", parse_mode='Markdown')
+                        safe_edit_message(call.message.chat.id, call.message.message_id, f"*{clean_name} (Чат):*\n\n{full_text}", parse_mode='Markdown')
                     except:
-                        bot.edit_message_text(chat_id=call.message.chat.id, message_id=call.message.message_id, text=f"<b>{clean_name} (Чат):</b>\n\n{html.escape(full_text)}", parse_mode='HTML')
+                        safe_edit_message(call.message.chat.id, call.message.message_id, f"<b>{clean_name} (Чат):</b>\n\n{html.escape(full_text)}")
                     bot.delete_message(chat_id=call.message.chat.id, message_id=msg_wait.message_id)
                 else:
                     if "===SPLIT===" in full_text:
@@ -334,8 +331,8 @@ def handle_query(call):
                         raw_out = full_text.strip()
                         
                     first_text = f"<b>{clean_name}:</b>" + (f"\n\n{html.escape(comment)}" if comment else "")
-                    bot.edit_message_text(chat_id=call.message.chat.id, message_id=call.message.message_id, text=first_text, parse_mode='HTML')
-                    bot.edit_message_text(chat_id=call.message.chat.id, message_id=msg_wait.message_id, text=format_as_code(raw_out), parse_mode='HTML')
+                    safe_edit_message(call.message.chat.id, call.message.message_id, first_text)
+                    safe_edit_message(call.message.chat.id, msg_wait.message_id, format_as_code(raw_out))
                     
             except Exception as e:
                 handle_api_error(e, call.message.chat.id, msg_wait.message_id, None, clean_name)
@@ -375,8 +372,7 @@ def handle_message(message):
             msg_wait = bot.send_message(message.chat.id, "🧠 Думаю...")
             try:
                 response = model_advisor.generate_content(task)
-                bot.edit_message_text(chat_id=message.chat.id, message_id=msg_wait.message_id,
-                                      text=format_as_code(response.text), parse_mode='HTML')
+                safe_edit_message(message.chat.id, msg_wait.message_id, format_as_code(response.text))
             except Exception as e:
                 handle_api_error(e, message.chat.id, msg_wait.message_id, message, clean_model_name)
             return
@@ -407,11 +403,9 @@ def handle_message(message):
         
         if is_gemma:
             try:
-                bot.edit_message_text(chat_id=message.chat.id, message_id=msg_first.message_id,
-                                      text=f"*{clean_model_name} (Чат):*\n\n{full_text}", parse_mode='Markdown')
+                safe_edit_message(message.chat.id, msg_first.message_id, f"*{clean_model_name} (Чат):*\n\n{full_text}", parse_mode='Markdown')
             except Exception:
-                bot.edit_message_text(chat_id=message.chat.id, message_id=msg_first.message_id,
-                                      text=f"<b>{clean_model_name} (Чат):</b>\n\n{html.escape(full_text)}", parse_mode='HTML')
+                safe_edit_message(message.chat.id, msg_first.message_id, f"<b>{clean_model_name} (Чат):</b>\n\n{html.escape(full_text)}")
             bot.delete_message(chat_id=message.chat.id, message_id=msg_wait.message_id)
         else:
             if "===SPLIT===" in full_text:
@@ -426,11 +420,8 @@ def handle_message(message):
             if comment:
                 first_message_text += f"\n\n{html.escape(comment)}"
                 
-            bot.edit_message_text(chat_id=message.chat.id, message_id=msg_first.message_id,
-                                  text=first_message_text, parse_mode='HTML')
-                                  
-            bot.edit_message_text(chat_id=message.chat.id, message_id=msg_wait.message_id,
-                                  text=format_as_code(raw_out), parse_mode='HTML')
+            safe_edit_message(message.chat.id, msg_first.message_id, first_message_text)
+            safe_edit_message(message.chat.id, msg_wait.message_id, format_as_code(raw_out))
                               
     except Exception as e:
         handle_api_error(e, message.chat.id, msg_wait.message_id, message, clean_model_name)
