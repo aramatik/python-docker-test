@@ -18,17 +18,15 @@ AVAILABLE_MODELS = []
 CURRENT_MODEL = None
 chat_agent = None
 model_advisor = None
-CURRENT_CHAT_ID = None # Нужен для функции отправки файла
+CURRENT_CHAT_ID = None
 
 def format_as_code(text: str) -> str:
-    """Безопасно оборачивает текст в моноширинный блок кода для Telegram"""
     if not text:
         return "<pre><code>Команда выполнена (нет вывода).</code></pre>"
-    escaped_text = html.escape(text[:4000]) # Ограничиваем длину ответа лимитами ТГ
+    escaped_text = html.escape(text[:4000])
     return f"<pre><code>{escaped_text}</code></pre>"
 
 def execute_bash(command: str) -> str:
-    """Выполняет bash-команду в Linux и возвращает результат."""
     print(f"Выполнение: {command}")
     try:
         result = subprocess.run(command, shell=True, capture_output=True, text=True, timeout=30)
@@ -38,7 +36,6 @@ def execute_bash(command: str) -> str:
         return f"Ошибка: {str(e)}"
 
 def send_file_to_telegram(filepath: str) -> str:
-    """Отправляет файл пользователю в Telegram как документ."""
     global CURRENT_CHAT_ID
     if not CURRENT_CHAT_ID: return "Ошибка: ID чата неизвестен."
     if not os.path.exists(filepath): return f"Ошибка: Файл {filepath} не найден."
@@ -57,10 +54,12 @@ def init_models(model_name):
         tools=[execute_bash, send_file_to_telegram],
         system_instruction=(
             "Ты автономный системный администратор. У тебя есть инструменты execute_bash и send_file_to_telegram. "
-            "ПРАВИЛА РАБОТЫ С ФАЙЛАМИ: "
-            "1. Если пользователь просит 'пришли', 'скачай' или 'отправь' файл - используй ТОЛЬКО send_file_to_telegram. "
-            "2. Если пользователь просит 'покажи текст' или 'выведи содержимое' - читай файл через execute_bash (cat). "
-            "Анализируй ошибки и исправляй их автономно. Не используй markdown форматирование в финальном ответе, выдавай чистый текст."
+            "ПРАВИЛА: "
+            "1. Если просят 'пришли', 'скачай' файл - используй ТОЛЬКО send_file_to_telegram. "
+            "2. Если просят 'покажи текст' файла - читай через execute_bash (cat). "
+            "3. ТЫ УМЕЕШЬ СЛУШАТЬ АУДИО. Если пользователь прислал аудио, внутри находится приказ. "
+            "Внимательно распознай речь и выполни команду. НИКОГДА не говори, что не можешь прослушать аудио. "
+            "Анализируй ошибки автономно. Выдавай чистый текст без markdown."
         )
     )
     chat_agent = model_agent.start_chat(enable_automatic_function_calling=True)
@@ -69,7 +68,7 @@ def init_models(model_name):
         model_name=model_name,
         system_instruction=(
             "Ты эксперт по Linux. Напиши только готовую bash-команду для решения задачи пользователя. "
-            "Ничего не выполняй. Не используй markdown форматирование, выдавай только чистый текст команды и краткое объяснение."
+            "Ничего не выполняй. Выдавай только чистый текст команды и краткое объяснение."
         )
     )
 
@@ -83,8 +82,6 @@ def get_models_keyboard():
         clean_name = model_name.replace('models/', '')
         markup.add(InlineKeyboardButton(text=clean_name, callback_data=model_name))
     return markup
-
-# --- Хэндлеры команд ---
 
 @bot.message_handler(commands=['start'])
 def send_welcome(message):
@@ -110,8 +107,6 @@ def handle_query(call):
     except Exception as e:
         bot.answer_callback_query(call.id, f"Ошибка инициализации: {e}")
 
-# --- Обработка Текста и Голоса ---
-
 @bot.message_handler(content_types=['voice', 'text'])
 def handle_message(message):
     if message.from_user.id != ADMIN_ID:
@@ -129,7 +124,6 @@ def handle_message(message):
     is_voice = message.content_type == 'voice'
     text = message.text.strip() if message.text else ""
 
-    # Обработка прямых команд (! и #) работает только для текста
     if not is_voice:
         if text.startswith('!'):
             cmd = text[1:].strip()
@@ -140,9 +134,7 @@ def handle_message(message):
 
         if text.startswith('#'):
             task = text[1:].strip()
-            # Первое сообщение - имя модели
             bot.send_message(message.chat.id, f"<b>{clean_model_name}:</b>", parse_mode='HTML')
-            # Второе сообщение - процесс и результат
             msg_wait = bot.send_message(message.chat.id, "🧠 Думаю...")
             try:
                 response = model_advisor.generate_content(task)
@@ -152,31 +144,24 @@ def handle_message(message):
                 bot.edit_message_text(chat_id=message.chat.id, message_id=msg_wait.message_id, text=f"❌ Ошибка: {e}")
             return
 
-    # Автономный агент (Текст или Голос)
-    
-    # Первое сообщение - имя модели
     bot.send_message(message.chat.id, f"<b>{clean_model_name}:</b>", parse_mode='HTML')
-    # Второе сообщение - процесс и результат
     msg_wait = bot.send_message(message.chat.id, "🤖 Обрабатываю запрос...")
 
     try:
         if is_voice:
-            # Скачиваем голосовое
             file_info = bot.get_file(message.voice.file_id)
             downloaded_file = bot.download_file(file_info.file_path)
             voice_path = "temp_voice.ogg"
             with open(voice_path, 'wb') as new_file:
                 new_file.write(downloaded_file)
             
-            # Грузим в Gemini с правильным mime_type
             audio_file = genai.upload_file(path=voice_path, mime_type="audio/ogg")
             
-            # Отправляем ИИ аудиофайл
-            response = chat_agent.send_message([audio_file, "Слушай аудио. Выполни задачу через консоль."])
+            # Более агрессивный промпт, чтобы ИИ перестал притворяться глухим
+            audio_prompt = "В прикрепленном файле записан голос пользователя. Твоя задача: прослушать аудио, понять команду и выполнить её через консоль."
+            response = chat_agent.send_message([audio_file, audio_prompt])
             
-            # Удаляем локальный файл
             os.remove(voice_path)
-            # Удаляем файл из облака Google
             genai.delete_file(audio_file.name)
         else:
             response = chat_agent.send_message(text)
@@ -189,3 +174,4 @@ def handle_message(message):
 if __name__ == '__main__':
     print("AI-Админ запущен. Ожидание команд...")
     bot.polling(none_stop=True)
+        
