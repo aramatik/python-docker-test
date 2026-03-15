@@ -2,9 +2,9 @@ FROM python:3.10-slim
 
 WORKDIR /app
 
-# Устанавливаем базовые утилиты Linux для ИИ (чтобы он мог пинговать, качать и т.д.)
+# Добавили пакет docker.io в список установки
 RUN apt-get update && apt-get install -y \
-    iputils-ping curl wget nano net-tools htop \
+    iputils-ping curl wget nano net-tools htop docker.io \
     && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt .
