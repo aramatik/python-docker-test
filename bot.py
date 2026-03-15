@@ -26,7 +26,7 @@ model_advisor = None
 CURRENT_CHAT_ID = None
 PENDING_RETRY_MESSAGE = None
 
-# Тот самый приоритетный список (в нужном порядке)
+# Тот самый приоритетный список
 PRIORITY_MODELS = [
     "gemini-2.5-flash",
     "gemini-flash-latest",
@@ -74,14 +74,11 @@ def send_file_to_telegram(filepath: str) -> str:
         return f"Ошибка отправки файла: {str(e)}"
 
 def sort_models_list(raw_models):
-    """Сортирует список моделей согласно нашему приоритету"""
     sorted_list = []
-    # Сначала ищем приоритетные модели
     for priority_name in PRIORITY_MODELS:
         for actual_model in raw_models:
             if priority_name.lower() in actual_model.lower() and actual_model not in sorted_list:
                 sorted_list.append(actual_model)
-    # Затем добавляем весь остальной "мусор"
     for actual_model in raw_models:
         if actual_model not in sorted_list:
             sorted_list.append(actual_model)
@@ -89,41 +86,33 @@ def sort_models_list(raw_models):
 
 def init_models(model_name):
     global chat_agent, model_advisor
-    
-    # Проверяем, это умная модель или простая (Gemma)
     is_gemma = "gemma" in model_name.lower()
     
     if is_gemma:
-        # РЕЖИМ ПРОСТОГО ЧАТБОТА (Без тулзов и системных инструкций)
         model_agent = genai.GenerativeModel(model_name=model_name)
         chat_agent = model_agent.start_chat()
-        
         model_advisor = genai.GenerativeModel(model_name=model_name)
     else:
-        # РЕЖИМ АДМИНА (С консолью и инструкциями)
+        # Максимально сжатый и оптимизированный промпт для админа
         model_agent = genai.GenerativeModel(
             model_name=model_name,
             tools=[execute_bash, send_file_to_telegram],
             system_instruction=(
-                "Ты автономный системный администратор Linux. У тебя есть инструменты execute_bash и send_file_to_telegram.\n"
-                "ПРАВИЛА:\n"
-                "1. Если просят 'пришли', 'скачай' файл - используй ТОЛЬКО send_file_to_telegram.\n"
-                "2. Если просят 'покажи текст' файла - читай через execute_bash (cat).\n"
-                "3. ТЫ УМЕЕШЬ СЛУШАТЬ АУДИО. Выполняй команды из голосовых сообщений.\n"
-                "ВАЖНОЕ ПРАВИЛО ФОРМАТИРОВАНИЯ:\n"
-                "Твой финальный ответ ВСЕГДА должен содержать разделитель ===SPLIT===.\n"
-                "До ===SPLIT===: напиши свои комментарии.\n"
-                "После ===SPLIT===: вставь ТОЛЬКО голый вывод терминала (СТРОГО БЕЗ markdown разметки и кавычек)."
+                "Ты root-админ Debian. Инструменты: execute_bash, send_file_to_telegram.\n"
+                "1. Пакеты: используй apt/apt-get. Ты root, sudo не нужен.\n"
+                "2. Отправка файлов: ТОЛЬКО send_file_to_telegram. Чтение: cat.\n"
+                "3. Ты слышишь аудио.\n"
+                "ФОРМАТ ОТВЕТА СТРОГО:\n"
+                "Комментарии\n"
+                "===SPLIT===\n"
+                "Голый вывод терминала (БЕЗ markdown/кавычек)."
             )
         )
         chat_agent = model_agent.start_chat(enable_automatic_function_calling=True)
         
         model_advisor = genai.GenerativeModel(
             model_name=model_name,
-            system_instruction=(
-                "Ты эксперт по Linux. Напиши только готовую bash-команду для решения задачи пользователя. "
-                "Ничего не выполняй. Выдавай ТОЛЬКО саму команду, без текста и без кавычек."
-            )
+            system_instruction="Ты root-админ Debian. Дай только bash-команду (через apt-get, без sudo). Без markdown и пояснений."
         )
 
 def get_models_keyboard():
@@ -188,7 +177,6 @@ def handle_query(call):
     global CURRENT_MODEL, PENDING_RETRY_MESSAGE, CURRENT_KEY_NUM, AVAILABLE_MODELS
     data = call.data
     
-    # Обработка смены ключа
     if data.startswith("key_"):
         key_num = int(data.split("_")[1])
         target_key = API_KEY_1 if key_num == 1 else API_KEY_2
@@ -199,14 +187,13 @@ def handle_query(call):
             
         CURRENT_KEY_NUM = key_num
         genai.configure(api_key=target_key)
-        AVAILABLE_MODELS = [] # Сбрасываем кэш моделей для нового ключа
+        AVAILABLE_MODELS = [] 
         CURRENT_MODEL = None
         
         bot.edit_message_text(chat_id=call.message.chat.id, message_id=call.message.message_id, 
                               text=f"✅ Активен <b>KEY {key_num}</b>.\nТеперь выберите модель /gemini", parse_mode='HTML')
         return
 
-    # Обработка выбора модели
     if data.startswith("mod_"):
         model_name = data.replace("mod_", "")
         CURRENT_MODEL = model_name
@@ -214,7 +201,6 @@ def handle_query(call):
             init_models(CURRENT_MODEL)
             clean_name = CURRENT_MODEL.replace('models/', '')
             
-            # Добавляем пометку, если это Gemma
             is_gemma = "gemma" in clean_name.lower()
             mode_text = "(Режим Чатбота)" if is_gemma else "(Режим Админа)"
             
@@ -281,7 +267,6 @@ def handle_message(message):
             
             audio_file = genai.upload_file(path=voice_path, mime_type="audio/ogg")
             
-            # Gemma может упасть от аудио, ловим это
             if is_gemma:
                  response = chat_agent.send_message("Я получил аудиофайл, но я модель Gemma и не умею слушать звук.")
             else:
@@ -293,10 +278,14 @@ def handle_message(message):
             
         full_text = response.text
         
-        # Если это Gemma, она не выдаст ===SPLIT===, просто выводим текст
         if is_gemma:
-            bot.edit_message_text(chat_id=message.chat.id, message_id=msg_first.message_id,
-                                  text=f"<b>{clean_model_name} (Чат):</b>\n\n{html.escape(full_text)}", parse_mode='HTML')
+            # Пытаемся отправить с красивым Markdown, если ИИ выдал кривую разметку - падаем в безопасный HTML
+            try:
+                bot.edit_message_text(chat_id=message.chat.id, message_id=msg_first.message_id,
+                                      text=f"*{clean_model_name} (Чат):*\n\n{full_text}", parse_mode='Markdown')
+            except Exception:
+                bot.edit_message_text(chat_id=message.chat.id, message_id=msg_first.message_id,
+                                      text=f"<b>{clean_model_name} (Чат):</b>\n\n{html.escape(full_text)}", parse_mode='HTML')
             bot.delete_message(chat_id=message.chat.id, message_id=msg_wait.message_id)
         else:
             if "===SPLIT===" in full_text:
@@ -323,4 +312,4 @@ def handle_message(message):
 if __name__ == '__main__':
     print("AI-Админ запущен. Ожидание команд...")
     bot.polling(none_stop=True)
-                   
+    
