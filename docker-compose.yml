@@ -5,7 +5,11 @@ services:
     build: .
     container_name: my_ai_admin
     restart: always
+    # Пробрасываем управление Docker внутрь песочницы
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
     environment:
       - TG_TOKEN=${TG_TOKEN}
       - GEMINI_API_KEY=${GEMINI_API_KEY}
       - ADMIN_ID=${ADMIN_ID}
+      
