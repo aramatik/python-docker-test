@@ -7,7 +7,7 @@ app = Flask(__name__)
 def home():
     return jsonify({
         "status": "success",
-        "message": "Привет! Мой первый Docker-контейнер работает!",
+        "message": "Hello world!",
         "server_time": str(datetime.datetime.now())
     })
 
