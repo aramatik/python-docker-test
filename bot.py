@@ -10,6 +10,7 @@ import re
 TG_TOKEN = os.getenv("TG_TOKEN")
 API_KEY_1 = os.getenv("GEMINI_API_KEY")
 API_KEY_2 = os.getenv("GEMINI2_API_KEY")
+API_KEY_3 = os.getenv("GEMINI3_API_KEY")
 
 # Безопасно собираем все ID админов в множество
 ADMIN_IDS = set()
@@ -183,9 +184,11 @@ def change_key_cmd(message):
     if message.from_user.id not in ADMIN_IDS: return
     log_admin_action(message.from_user.id, "Команда /changekey")
     markup = InlineKeyboardMarkup()
+    # Добавлена третья кнопка
     markup.add(
         InlineKeyboardButton(text="🔑 KEY 1" + (" (Активен)" if CURRENT_KEY_NUM == 1 else ""), callback_data="key_1"),
-        InlineKeyboardButton(text="🔑 KEY 2" + (" (Активен)" if CURRENT_KEY_NUM == 2 else ""), callback_data="key_2")
+        InlineKeyboardButton(text="🔑 KEY 2" + (" (Активен)" if CURRENT_KEY_NUM == 2 else ""), callback_data="key_2"),
+        InlineKeyboardButton(text="🔑 KEY 3" + (" (Активен)" if CURRENT_KEY_NUM == 3 else ""), callback_data="key_3")
     )
     bot.reply_to(message, "Выберите API-ключ для работы:", reply_markup=markup)
 
@@ -228,8 +231,17 @@ def handle_query(call):
     
     if data.startswith("key_"):
         key_num = int(data.split("_")[1])
-        target_key = API_KEY_1 if key_num == 1 else API_KEY_2
         
+        # Определяем, какой ключ был выбран
+        if key_num == 1:
+            target_key = API_KEY_1
+        elif key_num == 2:
+            target_key = API_KEY_2
+        elif key_num == 3:
+            target_key = API_KEY_3
+        else:
+            target_key = None
+            
         if not target_key:
             bot.answer_callback_query(call.id, f"❌ KEY {key_num} не задан в переменных!", show_alert=True)
             return
