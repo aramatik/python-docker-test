@@ -13,7 +13,7 @@ services:
       - TG_TOKEN=${TG_TOKEN}
       - GEMINI_API_KEY=${GEMINI_API_KEY}
       - GEMINI2_API_KEY=${GEMINI2_API_KEY}
+      - GEMINI3_API_KEY=${GEMINI3_API_KEY}
       - ADMIN_ID=${ADMIN_ID}
       - ADMIN2_ID=${ADMIN2_ID}
       - ADMIN3_ID=${ADMIN3_ID}
-      
