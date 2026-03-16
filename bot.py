@@ -10,7 +10,16 @@ import re
 TG_TOKEN = os.getenv("TG_TOKEN")
 API_KEY_1 = os.getenv("GEMINI_API_KEY")
 API_KEY_2 = os.getenv("GEMINI2_API_KEY")
-ADMIN_ID = int(os.getenv("ADMIN_ID", 0))
+
+# Безопасно собираем все ID админов в множество
+ADMIN_IDS = set()
+for env_var in ["ADMIN_ID", "ADMIN2_ID", "ADMIN3_ID"]:
+    val = os.getenv(env_var)
+    if val and val.strip().lstrip('-').isdigit():
+        ADMIN_IDS.add(int(val.strip()))
+
+if not ADMIN_IDS:
+    print("ВНИМАНИЕ: Не задано ни одного ADMIN_ID! Бот никого не пустит.")
 
 bot = telebot.TeleBot(TG_TOKEN)
 
@@ -43,6 +52,10 @@ PRIORITY_MODELS = [
     "gemini-2.5-pro"
 ]
 
+def log_admin_action(user_id, action):
+    """Логирует действия админов в консоль"""
+    print(f"[ADMIN {user_id}] {action}")
+
 # --- УМНЫЙ ПРЕДОХРАНИТЕЛЬ ДЛЯ ТЕЛЕГРАМА ---
 def safe_edit_message(chat_id, message_id, text, parse_mode='HTML', reply_markup=None):
     """Редактирует сообщение, игнорируя ошибку, если текст не изменился"""
@@ -51,7 +64,7 @@ def safe_edit_message(chat_id, message_id, text, parse_mode='HTML', reply_markup
                               parse_mode=parse_mode, reply_markup=reply_markup)
     except Exception as e:
         if "message is not modified" not in str(e).lower():
-            raise e # Если ошибка серьезная - пробрасываем дальше
+            raise e
 
 def format_as_code(text: str) -> str:
     if not text:
@@ -155,17 +168,20 @@ def handle_api_error(e, chat_id, message_id, original_message, clean_model_name)
 
 @bot.message_handler(commands=['start'])
 def send_welcome(message):
-    if message.from_user.id != ADMIN_ID: return
+    if message.from_user.id not in ADMIN_IDS: return
+    log_admin_action(message.from_user.id, "Команда /start")
     bot.reply_to(message, "👋 Привет, Админ!\nВыбери модель Gemini:", reply_markup=get_models_keyboard())
 
 @bot.message_handler(commands=['gemini'])
 def change_model(message):
-    if message.from_user.id != ADMIN_ID: return
+    if message.from_user.id not in ADMIN_IDS: return
+    log_admin_action(message.from_user.id, "Команда /gemini")
     bot.reply_to(message, "Выберите модель:", reply_markup=get_models_keyboard())
 
 @bot.message_handler(commands=['changekey'])
 def change_key_cmd(message):
-    if message.from_user.id != ADMIN_ID: return
+    if message.from_user.id not in ADMIN_IDS: return
+    log_admin_action(message.from_user.id, "Команда /changekey")
     markup = InlineKeyboardMarkup()
     markup.add(
         InlineKeyboardButton(text="🔑 KEY 1" + (" (Активен)" if CURRENT_KEY_NUM == 1 else ""), callback_data="key_1"),
@@ -175,7 +191,9 @@ def change_key_cmd(message):
 
 @bot.message_handler(content_types=['document'])
 def handle_document(message):
-    if message.from_user.id != ADMIN_ID: return
+    if message.from_user.id not in ADMIN_IDS: return
+    log_admin_action(message.from_user.id, f"Загрузил документ: {message.document.file_name}")
+    
     global CURRENT_CHAT_ID
     CURRENT_CHAT_ID = message.chat.id
     
@@ -202,7 +220,8 @@ def handle_document(message):
 
 @bot.callback_query_handler(func=lambda call: True)
 def handle_query(call):
-    if call.from_user.id != ADMIN_ID: return
+    if call.from_user.id not in ADMIN_IDS: return
+    log_admin_action(call.from_user.id, f"Callback: {call.data}")
     
     global CURRENT_MODEL, PENDING_RETRY_MESSAGE, CURRENT_KEY_NUM, AVAILABLE_MODELS
     data = call.data
@@ -342,9 +361,11 @@ def handle_query(call):
 
 @bot.message_handler(content_types=['voice', 'text'])
 def handle_message(message):
-    if message.from_user.id != ADMIN_ID:
+    if message.from_user.id not in ADMIN_IDS:
         bot.reply_to(message, "⛔ Доступ запрещен.")
         return
+
+    log_admin_action(message.from_user.id, f"Сообщение: {message.content_type}")
 
     global CURRENT_CHAT_ID
     CURRENT_CHAT_ID = message.chat.id
@@ -361,6 +382,7 @@ def handle_message(message):
     if not is_voice:
         if text.startswith('!'):
             cmd = text[1:].strip()
+            log_admin_action(message.from_user.id, f"Прямая команда: {cmd}")
             bot.send_message(message.chat.id, f"⚡ Выполняю напрямую:\n<code>{html.escape(cmd)}</code>", parse_mode='HTML')
             result = execute_bash(cmd)
             bot.reply_to(message, format_as_code(result), parse_mode='HTML')
@@ -427,5 +449,5 @@ def handle_message(message):
         handle_api_error(e, message.chat.id, msg_wait.message_id, message, clean_model_name)
 
 if __name__ == '__main__':
-    print("AI-Админ запущен. Ожидание команд...")
+    print(f"AI-Админ запущен. Допущено админов: {len(ADMIN_IDS)}. Ожидание команд...")
     bot.polling(none_stop=True)
