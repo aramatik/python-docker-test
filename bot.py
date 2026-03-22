@@ -5,6 +5,7 @@ from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
 import google.generativeai as genai
 import html
 import re
+import shlex
 
 # Загружаем ключи
 TG_TOKEN = os.getenv("TG_TOKEN")
@@ -28,6 +29,8 @@ genai.configure(api_key=API_KEY_1)
 CURRENT_KEY_NUM = 1
 
 AVAILABLE_MODELS = []
+PRIORITY_MODELS_CACHE = []
+OTHER_MODELS_CACHE = []
 CURRENT_MODEL = None
 chat_agent = None
 model_advisor = None
@@ -95,16 +98,41 @@ def send_file_to_telegram(filepath: str) -> str:
     except Exception as e:
         return f"Ошибка отправки файла: {str(e)}"
 
-def sort_models_list(raw_models):
-    sorted_list = []
-    for priority_name in PRIORITY_MODELS:
-        for actual_model in raw_models:
-            if priority_name.lower() in actual_model.lower() and actual_model not in sorted_list:
-                sorted_list.append(actual_model)
-    for actual_model in raw_models:
-        if actual_model not in sorted_list:
-            sorted_list.append(actual_model)
-    return sorted_list
+def get_models_lists():
+    raw_models = [m.name for m in genai.list_models() if 'generateContent' in m.supported_generation_methods]
+    priority = []
+    other = []
+    for m in raw_models:
+        if any(p.lower() in m.lower() for p in PRIORITY_MODELS):
+            priority.append(m)
+        else:
+            other.append(m)
+    return priority, other
+
+def get_models_keyboard(show_all=False):
+    global PRIORITY_MODELS_CACHE, OTHER_MODELS_CACHE, AVAILABLE_MODELS
+    if not PRIORITY_MODELS_CACHE and not OTHER_MODELS_CACHE:
+        PRIORITY_MODELS_CACHE, OTHER_MODELS_CACHE = get_models_lists()
+        AVAILABLE_MODELS = PRIORITY_MODELS_CACHE + OTHER_MODELS_CACHE
+        
+    markup = InlineKeyboardMarkup()
+    
+    # Сначала всегда выводим приоритетные
+    for model_name in PRIORITY_MODELS_CACHE:
+        clean_name = model_name.replace('models/', '')
+        markup.add(InlineKeyboardButton(text=clean_name, callback_data=f"mod_{model_name}"))
+        
+    # Если нажали "Показать все", выводим остальные
+    if show_all:
+        for model_name in OTHER_MODELS_CACHE:
+            clean_name = model_name.replace('models/', '')
+            markup.add(InlineKeyboardButton(text=clean_name, callback_data=f"mod_{model_name}"))
+    else:
+        # Иначе просто показываем кнопку для раскрытия списка
+        if OTHER_MODELS_CACHE:
+            markup.add(InlineKeyboardButton(text="⬇️ Другие модели", callback_data="show_all_mods"))
+            
+    return markup
 
 def init_models(model_name):
     global chat_agent, model_advisor
@@ -135,18 +163,6 @@ def init_models(model_name):
             model_name=model_name,
             system_instruction="Ты root-админ Debian. Дай только bash-команду (через apt-get, без sudo). Без markdown и пояснений."
         )
-
-def get_models_keyboard():
-    global AVAILABLE_MODELS
-    if not AVAILABLE_MODELS:
-        raw_models = [m.name for m in genai.list_models() if 'generateContent' in m.supported_generation_methods]
-        AVAILABLE_MODELS = sort_models_list(raw_models)
-    
-    markup = InlineKeyboardMarkup()
-    for model_name in AVAILABLE_MODELS:
-        clean_name = model_name.replace('models/', '')
-        markup.add(InlineKeyboardButton(text=clean_name, callback_data=f"mod_{model_name}"))
-    return markup
 
 def handle_api_error(e, chat_id, message_id, original_message, clean_model_name):
     error_text = str(e)
@@ -184,13 +200,87 @@ def change_key_cmd(message):
     if message.from_user.id not in ADMIN_IDS: return
     log_admin_action(message.from_user.id, "Команда /changekey")
     markup = InlineKeyboardMarkup()
-    # Добавлена третья кнопка
     markup.add(
         InlineKeyboardButton(text="🔑 KEY 1" + (" (Активен)" if CURRENT_KEY_NUM == 1 else ""), callback_data="key_1"),
         InlineKeyboardButton(text="🔑 KEY 2" + (" (Активен)" if CURRENT_KEY_NUM == 2 else ""), callback_data="key_2"),
         InlineKeyboardButton(text="🔑 KEY 3" + (" (Активен)" if CURRENT_KEY_NUM == 3 else ""), callback_data="key_3")
     )
     bot.reply_to(message, "Выберите API-ключ для работы:", reply_markup=markup)
+
+# --- НОВАЯ КОМАНДА ПОИСКА ---
+@bot.message_handler(commands=['search'])
+def search_cmd(message):
+    if message.from_user.id not in ADMIN_IDS: return
+    log_admin_action(message.from_user.id, "Команда /search")
+    msg = bot.reply_to(message, "Введите поисковый запрос (можно использовать несколько слов):")
+    bot.register_next_step_handler(msg, process_search_query)
+
+def process_search_query(message):
+    if message.from_user.id not in ADMIN_IDS: return
+    
+    query = message.text.strip()
+    if not query:
+        bot.reply_to(message, "Пустой запрос. Поиск отменен.")
+        return
+        
+    log_admin_action(message.from_user.id, f"Поиск: {query}")
+    
+    # Умная разбивка (позволяет искать точные фразы, если взять их в "кавычки")
+    try:
+        words = shlex.split(query)
+    except ValueError:
+        words = query.split()
+        
+    if not words:
+        return
+
+    # Строим bash команду с защитой ввода (shlex.quote) и регистронезависимым поиском (-i)
+    # Ошибки (например, если папка пуста) отправляем в /dev/null
+    cmd = f"grep -i {shlex.quote(words[0])} /app/downloads/база/*.csv 2>/dev/null"
+    for word in words[1:]:
+        cmd += f" | grep -i {shlex.quote(word)}"
+    cmd += " | sed 'G'"
+    
+    msg_wait = bot.send_message(message.chat.id, f"🔍 Ищу в базе: <code>{' | '.join(words)}</code>...", parse_mode='HTML')
+    
+    try:
+        # Запускаем команду
+        result = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=60)
+        output = result.stdout.strip()
+        
+        if not output:
+            safe_edit_message(message.chat.id, msg_wait.message_id, "🤷‍♂️ По вашему запросу ничего не найдено.")
+            return
+            
+        bot.delete_message(message.chat.id, msg_wait.message_id)
+        
+        # Разбиваем вывод на строки, чтобы не резать слова на полуслове
+        lines = output.split('\n')
+        chunks = []
+        current_chunk = ""
+        
+        # Лимит телеграма 4096 символов. Берем с запасом 4000
+        for line in lines:
+            if len(current_chunk) + len(line) + 1 > 4000:
+                chunks.append(current_chunk)
+                current_chunk = line + '\n'
+            else:
+                current_chunk += line + '\n'
+                
+        if current_chunk:
+            chunks.append(current_chunk)
+            
+        # Отправляем максимум 5 сообщений
+        for chunk in chunks[:5]:
+            bot.send_message(message.chat.id, f"<pre>{html.escape(chunk.strip())}</pre>", parse_mode='HTML')
+            
+        if len(chunks) > 5:
+            bot.send_message(message.chat.id, f"⚠️ <b>Внимание:</b> Показано 5 сообщений из {len(chunks)}. Остальной текст обрезан, так как результат слишком большой. Попробуйте сузить параметры поиска.", parse_mode='HTML')
+            
+    except subprocess.TimeoutExpired:
+        safe_edit_message(message.chat.id, msg_wait.message_id, "❌ Ошибка: Превышено время ожидания поиска (более 60 секунд).")
+    except Exception as e:
+        safe_edit_message(message.chat.id, msg_wait.message_id, f"❌ Ошибка поиска: {html.escape(str(e))}")
 
 @bot.message_handler(content_types=['document'])
 def handle_document(message):
@@ -226,13 +316,18 @@ def handle_query(call):
     if call.from_user.id not in ADMIN_IDS: return
     log_admin_action(call.from_user.id, f"Callback: {call.data}")
     
-    global CURRENT_MODEL, PENDING_RETRY_MESSAGE, CURRENT_KEY_NUM, AVAILABLE_MODELS
+    global CURRENT_MODEL, PENDING_RETRY_MESSAGE, CURRENT_KEY_NUM, PRIORITY_MODELS_CACHE, OTHER_MODELS_CACHE, AVAILABLE_MODELS
     data = call.data
     
+    if data == "show_all_mods":
+        safe_edit_message(call.message.chat.id, call.message.message_id, 
+                          "Выберите модель (Полный список):", 
+                          reply_markup=get_models_keyboard(show_all=True))
+        return
+
     if data.startswith("key_"):
         key_num = int(data.split("_")[1])
         
-        # Определяем, какой ключ был выбран
         if key_num == 1:
             target_key = API_KEY_1
         elif key_num == 2:
@@ -248,7 +343,11 @@ def handle_query(call):
             
         CURRENT_KEY_NUM = key_num
         genai.configure(api_key=target_key)
-        AVAILABLE_MODELS = [] 
+        
+        # Сбрасываем кэш моделей при смене ключа
+        PRIORITY_MODELS_CACHE = []
+        OTHER_MODELS_CACHE = []
+        AVAILABLE_MODELS = []
         CURRENT_MODEL = None
         
         safe_edit_message(call.message.chat.id, call.message.message_id, 
