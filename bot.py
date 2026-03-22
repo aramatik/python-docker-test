@@ -227,6 +227,23 @@ def change_key_cmd(message):
     )
     bot.reply_to(message, "Выберите API-ключ для работы:", reply_markup=markup)
 
+@bot.message_handler(commands=['clear'])
+def clear_cmd(message):
+    if message.from_user.id not in ADMIN_IDS: return
+    log_admin_action(message.from_user.id, "Команда /clear")
+    
+    global chat_agent, CURRENT_MODEL
+    
+    if not CURRENT_MODEL:
+        bot.reply_to(message, "⚠️ Модель еще не выбрана. Память пуста.")
+        return
+        
+    try:
+        init_models(CURRENT_MODEL)
+        bot.reply_to(message, "🧹 Контекст и память ИИ успешно очищены!")
+    except Exception as e:
+        bot.reply_to(message, f"❌ Ошибка очистки памяти: {e}")
+
 @bot.message_handler(commands=['search'])
 def search_cmd(message):
     if message.from_user.id not in ADMIN_IDS: return
@@ -295,14 +312,13 @@ def process_search_query(message):
                 current_chunk += header
                 
             for match in matches:
-                line = f"{html.escape(match)}\n"
+                # Добавлен \n\n для создания пустой строки между результатами
+                line = f"{html.escape(match)}\n\n" 
                 if len(current_chunk) + len(line) > 4000:
                     formatted_chunks.append(current_chunk)
                     current_chunk = line
                 else:
                     current_chunk += line
-            
-            current_chunk += "\n" # Пустая строка между файлами
             
         if current_chunk.strip():
             formatted_chunks.append(current_chunk)
@@ -598,4 +614,4 @@ def handle_message(message):
 if __name__ == '__main__':
     print(f"AI-Админ запущен. Допущено админов: {len(ADMIN_IDS)}. Ожидание команд...")
     bot.polling(none_stop=True)
-    
+                          
