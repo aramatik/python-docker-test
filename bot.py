@@ -6,6 +6,7 @@ import google.generativeai as genai
 import html
 import re
 import shlex
+from collections import defaultdict
 
 # Загружаем ключи
 TG_TOKEN = os.getenv("TG_TOKEN")
@@ -105,28 +106,20 @@ def get_models_lists():
     other = []
     used_models = set()
     
-    # 1. Строго по списку для сохранения порядка
     for p in PRIORITY_MODELS:
-        # Корректируем sep-2025 в 09-2025 для совместимости с API
         search_str = p.lower().replace("sep-2025", "09-2025")
         best_match = None
         
         for m in raw_models:
-            if m in used_models:
-                continue
-                
+            if m in used_models: continue
             clean_m = m.replace('models/', '').lower()
             
-            # Точное совпадение (с учетом -it суффикса для моделей gemma)
             if clean_m == search_str or clean_m == f"{search_str}-it":
                 best_match = m
-                break # Нашли идеальное совпадение, прерываем цикл
-                
-            # Частичное совпадение (защита от мусора типа tts/image)
+                break
             elif search_str in clean_m:
                 if "tts" in clean_m and "tts" not in search_str: continue
                 if "image" in clean_m and "image" not in search_str: continue
-                
                 if not best_match:
                     best_match = m
                     
@@ -134,7 +127,6 @@ def get_models_lists():
             priority.append(best_match)
             used_models.add(best_match)
             
-    # 2. Все остальные модели отправляем в скрытый список
     for m in raw_models:
         if m not in used_models:
             other.append(m)
@@ -143,19 +135,15 @@ def get_models_lists():
 
 def get_models_keyboard(show_all=False):
     global PRIORITY_MODELS_CACHE, OTHER_MODELS_CACHE, AVAILABLE_MODELS
-    # Обновляем кэш списков при первом запуске
     if not PRIORITY_MODELS_CACHE and not OTHER_MODELS_CACHE:
         PRIORITY_MODELS_CACHE, OTHER_MODELS_CACHE = get_models_lists()
         AVAILABLE_MODELS = PRIORITY_MODELS_CACHE + OTHER_MODELS_CACHE
         
     markup = InlineKeyboardMarkup()
-    
-    # Выводим приоритетные модели строго в заданном порядке
     for model_name in PRIORITY_MODELS_CACHE:
         clean_name = model_name.replace('models/', '')
         markup.add(InlineKeyboardButton(text=clean_name, callback_data=f"mod_{model_name}"))
         
-    # Если нажата кнопка показа всех, выводим остальные
     if show_all:
         for model_name in OTHER_MODELS_CACHE:
             clean_name = model_name.replace('models/', '')
@@ -264,10 +252,10 @@ def process_search_query(message):
     if not words:
         return
 
-    cmd = f"grep -i {shlex.quote(words[0])} /app/downloads/база/*.csv 2>/dev/null"
+    # Добавлен флаг -H для принудительного вывода имени файла
+    cmd = f"grep -iH {shlex.quote(words[0])} /app/downloads/база/*.csv 2>/dev/null"
     for word in words[1:]:
         cmd += f" | grep -i {shlex.quote(word)}"
-    cmd += " | sed 'G'"
     
     msg_wait = bot.send_message(message.chat.id, f"🔍 Ищу в базе: <code>{' | '.join(words)}</code>...", parse_mode='HTML')
     
@@ -281,25 +269,50 @@ def process_search_query(message):
             
         bot.delete_message(message.chat.id, msg_wait.message_id)
         
-        lines = output.split('\n')
-        chunks = []
-        current_chunk = ""
-        
-        for line in lines:
-            if len(current_chunk) + len(line) + 1 > 4000:
-                chunks.append(current_chunk)
-                current_chunk = line + '\n'
+        # Группируем результаты по именам файлов
+        grouped_results = defaultdict(list)
+        for line in output.split('\n'):
+            if not line.strip(): continue
+            parts = line.split(':', 1)
+            if len(parts) == 2:
+                filepath, match_text = parts
+                filename = os.path.basename(filepath)
+                grouped_results[filename].append(match_text)
             else:
-                current_chunk += line + '\n'
+                grouped_results["Другое"].append(line)
+
+        # Умная разбивка на сообщения с лимитом 4000 символов
+        formatted_chunks = []
+        current_chunk = ""
+
+        for filename, matches in grouped_results.items():
+            header = f"📁 <b>{html.escape(filename)}:</b>\n"
+            
+            if len(current_chunk) + len(header) > 4000:
+                formatted_chunks.append(current_chunk)
+                current_chunk = header
+            else:
+                current_chunk += header
                 
-        if current_chunk:
-            chunks.append(current_chunk)
+            for match in matches:
+                line = f"{html.escape(match)}\n"
+                if len(current_chunk) + len(line) > 4000:
+                    formatted_chunks.append(current_chunk)
+                    current_chunk = line
+                else:
+                    current_chunk += line
             
-        for chunk in chunks[:5]:
-            bot.send_message(message.chat.id, f"<pre>{html.escape(chunk.strip())}</pre>", parse_mode='HTML')
+            current_chunk += "\n" # Пустая строка между файлами
             
-        if len(chunks) > 5:
-            bot.send_message(message.chat.id, f"⚠️ <b>Внимание:</b> Показано 5 сообщений из {len(chunks)}. Остальной текст обрезан, так как результат слишком большой. Попробуйте сузить параметры поиска.", parse_mode='HTML')
+        if current_chunk.strip():
+            formatted_chunks.append(current_chunk)
+            
+        # Отправляем максимум 5 сообщений
+        for chunk in formatted_chunks[:5]:
+            bot.send_message(message.chat.id, f"<pre>{chunk.strip()}</pre>", parse_mode='HTML')
+            
+        if len(formatted_chunks) > 5:
+            bot.send_message(message.chat.id, f"⚠️ <b>Внимание:</b> Показано 5 сообщений из {len(formatted_chunks)}. Остальной текст обрезан. Попробуйте сузить параметры поиска.", parse_mode='HTML')
             
     except subprocess.TimeoutExpired:
         safe_edit_message(message.chat.id, msg_wait.message_id, "❌ Ошибка: Превышено время ожидания поиска (более 60 секунд).")
@@ -585,4 +598,4 @@ def handle_message(message):
 if __name__ == '__main__':
     print(f"AI-Админ запущен. Допущено админов: {len(ADMIN_IDS)}. Ожидание команд...")
     bot.polling(none_stop=True)
-            
+    
