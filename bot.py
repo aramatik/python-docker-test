@@ -38,6 +38,7 @@ CURRENT_CHAT_ID = None
 PENDING_RETRY_MESSAGE = None
 PENDING_FILES = {}
 
+# Ваш идеальный порядок:
 PRIORITY_MODELS = [
     "gemini-2.5-flash",
     "gemini-flash-latest",
@@ -102,33 +103,64 @@ def get_models_lists():
     raw_models = [m.name for m in genai.list_models() if 'generateContent' in m.supported_generation_methods]
     priority = []
     other = []
+    used_models = set()
+    
+    # 1. Строго по списку для сохранения порядка
+    for p in PRIORITY_MODELS:
+        # Корректируем sep-2025 в 09-2025 для совместимости с API
+        search_str = p.lower().replace("sep-2025", "09-2025")
+        best_match = None
+        
+        for m in raw_models:
+            if m in used_models:
+                continue
+                
+            clean_m = m.replace('models/', '').lower()
+            
+            # Точное совпадение (с учетом -it суффикса для моделей gemma)
+            if clean_m == search_str or clean_m == f"{search_str}-it":
+                best_match = m
+                break # Нашли идеальное совпадение, прерываем цикл
+                
+            # Частичное совпадение (защита от мусора типа tts/image)
+            elif search_str in clean_m:
+                if "tts" in clean_m and "tts" not in search_str: continue
+                if "image" in clean_m and "image" not in search_str: continue
+                
+                if not best_match:
+                    best_match = m
+                    
+        if best_match:
+            priority.append(best_match)
+            used_models.add(best_match)
+            
+    # 2. Все остальные модели отправляем в скрытый список
     for m in raw_models:
-        if any(p.lower() in m.lower() for p in PRIORITY_MODELS):
-            priority.append(m)
-        else:
+        if m not in used_models:
             other.append(m)
+            
     return priority, other
 
 def get_models_keyboard(show_all=False):
     global PRIORITY_MODELS_CACHE, OTHER_MODELS_CACHE, AVAILABLE_MODELS
+    # Обновляем кэш списков при первом запуске
     if not PRIORITY_MODELS_CACHE and not OTHER_MODELS_CACHE:
         PRIORITY_MODELS_CACHE, OTHER_MODELS_CACHE = get_models_lists()
         AVAILABLE_MODELS = PRIORITY_MODELS_CACHE + OTHER_MODELS_CACHE
         
     markup = InlineKeyboardMarkup()
     
-    # Сначала всегда выводим приоритетные
+    # Выводим приоритетные модели строго в заданном порядке
     for model_name in PRIORITY_MODELS_CACHE:
         clean_name = model_name.replace('models/', '')
         markup.add(InlineKeyboardButton(text=clean_name, callback_data=f"mod_{model_name}"))
         
-    # Если нажали "Показать все", выводим остальные
+    # Если нажата кнопка показа всех, выводим остальные
     if show_all:
         for model_name in OTHER_MODELS_CACHE:
             clean_name = model_name.replace('models/', '')
             markup.add(InlineKeyboardButton(text=clean_name, callback_data=f"mod_{model_name}"))
     else:
-        # Иначе просто показываем кнопку для раскрытия списка
         if OTHER_MODELS_CACHE:
             markup.add(InlineKeyboardButton(text="⬇️ Другие модели", callback_data="show_all_mods"))
             
@@ -207,7 +239,6 @@ def change_key_cmd(message):
     )
     bot.reply_to(message, "Выберите API-ключ для работы:", reply_markup=markup)
 
-# --- НОВАЯ КОМАНДА ПОИСКА ---
 @bot.message_handler(commands=['search'])
 def search_cmd(message):
     if message.from_user.id not in ADMIN_IDS: return
@@ -225,7 +256,6 @@ def process_search_query(message):
         
     log_admin_action(message.from_user.id, f"Поиск: {query}")
     
-    # Умная разбивка (позволяет искать точные фразы, если взять их в "кавычки")
     try:
         words = shlex.split(query)
     except ValueError:
@@ -234,8 +264,6 @@ def process_search_query(message):
     if not words:
         return
 
-    # Строим bash команду с защитой ввода (shlex.quote) и регистронезависимым поиском (-i)
-    # Ошибки (например, если папка пуста) отправляем в /dev/null
     cmd = f"grep -i {shlex.quote(words[0])} /app/downloads/база/*.csv 2>/dev/null"
     for word in words[1:]:
         cmd += f" | grep -i {shlex.quote(word)}"
@@ -244,7 +272,6 @@ def process_search_query(message):
     msg_wait = bot.send_message(message.chat.id, f"🔍 Ищу в базе: <code>{' | '.join(words)}</code>...", parse_mode='HTML')
     
     try:
-        # Запускаем команду
         result = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=60)
         output = result.stdout.strip()
         
@@ -254,12 +281,10 @@ def process_search_query(message):
             
         bot.delete_message(message.chat.id, msg_wait.message_id)
         
-        # Разбиваем вывод на строки, чтобы не резать слова на полуслове
         lines = output.split('\n')
         chunks = []
         current_chunk = ""
         
-        # Лимит телеграма 4096 символов. Берем с запасом 4000
         for line in lines:
             if len(current_chunk) + len(line) + 1 > 4000:
                 chunks.append(current_chunk)
@@ -270,7 +295,6 @@ def process_search_query(message):
         if current_chunk:
             chunks.append(current_chunk)
             
-        # Отправляем максимум 5 сообщений
         for chunk in chunks[:5]:
             bot.send_message(message.chat.id, f"<pre>{html.escape(chunk.strip())}</pre>", parse_mode='HTML')
             
@@ -344,7 +368,6 @@ def handle_query(call):
         CURRENT_KEY_NUM = key_num
         genai.configure(api_key=target_key)
         
-        # Сбрасываем кэш моделей при смене ключа
         PRIORITY_MODELS_CACHE = []
         OTHER_MODELS_CACHE = []
         AVAILABLE_MODELS = []
@@ -562,3 +585,4 @@ def handle_message(message):
 if __name__ == '__main__':
     print(f"AI-Админ запущен. Допущено админов: {len(ADMIN_IDS)}. Ожидание команд...")
     bot.polling(none_stop=True)
+            
