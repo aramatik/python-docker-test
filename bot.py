@@ -38,6 +38,7 @@ model_advisor = None
 CURRENT_CHAT_ID = None
 PENDING_RETRY_MESSAGE = None
 PENDING_FILES = {}
+PENDING_SEARCH_RESULTS = {} # Новое хранилище для полных результатов поиска
 
 # Ваш идеальный порядок:
 PRIORITY_MODELS = [
@@ -269,7 +270,6 @@ def process_search_query(message):
     if not words:
         return
 
-    # Добавлен флаг -H для принудительного вывода имени файла
     cmd = f"grep -iH {shlex.quote(words[0])} /app/downloads/база/*.csv 2>/dev/null"
     for word in words[1:]:
         cmd += f" | grep -i {shlex.quote(word)}"
@@ -286,7 +286,6 @@ def process_search_query(message):
             
         bot.delete_message(message.chat.id, msg_wait.message_id)
         
-        # Группируем результаты по именам файлов
         grouped_results = defaultdict(list)
         for line in output.split('\n'):
             if not line.strip(): continue
@@ -298,12 +297,18 @@ def process_search_query(message):
             else:
                 grouped_results["Другое"].append(line)
 
-        # Умная разбивка на сообщения с лимитом 4000 символов
         formatted_chunks = []
         current_chunk = ""
 
+        # Формируем чистый текст для потенциального файла .txt
+        clean_text_for_file = f"Результаты поиска по запросу: {' '.join(words)}\n"
+        clean_text_for_file += "=" * 50 + "\n\n"
+
         for filename, matches in grouped_results.items():
             header = f"📁 <b>{html.escape(filename)}:</b>\n"
+            
+            # Добавляем в чистый текст без тегов
+            clean_text_for_file += f"=== {filename} ===\n\n"
             
             if len(current_chunk) + len(header) > 4000:
                 formatted_chunks.append(current_chunk)
@@ -312,13 +317,16 @@ def process_search_query(message):
                 current_chunk += header
                 
             for match in matches:
-                # Добавлен \n\n для создания пустой строки между результатами
+                clean_text_for_file += f"{match}\n\n"
+                
                 line = f"{html.escape(match)}\n\n" 
                 if len(current_chunk) + len(line) > 4000:
                     formatted_chunks.append(current_chunk)
                     current_chunk = line
                 else:
                     current_chunk += line
+            
+            clean_text_for_file += "\n"
             
         if current_chunk.strip():
             formatted_chunks.append(current_chunk)
@@ -328,7 +336,19 @@ def process_search_query(message):
             bot.send_message(message.chat.id, f"<pre>{chunk.strip()}</pre>", parse_mode='HTML')
             
         if len(formatted_chunks) > 5:
-            bot.send_message(message.chat.id, f"⚠️ <b>Внимание:</b> Показано 5 сообщений из {len(formatted_chunks)}. Остальной текст обрезан. Попробуйте сузить параметры поиска.", parse_mode='HTML')
+            # Сохраняем полный текст в память бота
+            PENDING_SEARCH_RESULTS[message.chat.id] = clean_text_for_file
+            
+            markup = InlineKeyboardMarkup()
+            markup.add(InlineKeyboardButton(text="📥 Скачать всё (.txt)", callback_data="download_search_txt"))
+            
+            bot.send_message(
+                message.chat.id, 
+                f"⚠️ <b>Внимание:</b> Показано 5 сообщений из {len(formatted_chunks)}. Остальной текст обрезан.\n\n"
+                f"Вы можете скачать полные результаты поиска отдельным файлом:", 
+                parse_mode='HTML',
+                reply_markup=markup
+            )
             
     except subprocess.TimeoutExpired:
         safe_edit_message(message.chat.id, msg_wait.message_id, "❌ Ошибка: Превышено время ожидания поиска (более 60 секунд).")
@@ -372,6 +392,35 @@ def handle_query(call):
     global CURRENT_MODEL, PENDING_RETRY_MESSAGE, CURRENT_KEY_NUM, PRIORITY_MODELS_CACHE, OTHER_MODELS_CACHE, AVAILABLE_MODELS
     data = call.data
     
+    # Обработка новой кнопки скачивания .txt
+    if data == "download_search_txt":
+        full_text = PENDING_SEARCH_RESULTS.get(call.message.chat.id)
+        if not full_text:
+            bot.answer_callback_query(call.id, "❌ Результаты поиска устарели или не найдены в памяти.", show_alert=True)
+            return
+            
+        safe_edit_message(call.message.chat.id, call.message.message_id, "⏳ Формирую файл...")
+        
+        # Создаем временный файл
+        temp_filename = f"search_results_temp_{call.message.chat.id}.txt"
+        try:
+            with open(temp_filename, "w", encoding="utf-8") as f:
+                f.write(full_text)
+                
+            with open(temp_filename, "rb") as f:
+                bot.send_document(call.message.chat.id, f, caption="📁 Полные результаты поиска")
+                
+            safe_edit_message(call.message.chat.id, call.message.message_id, "✅ Файл с полными результатами успешно отправлен.")
+        except Exception as e:
+            safe_edit_message(call.message.chat.id, call.message.message_id, f"❌ Ошибка создания/отправки файла: {str(e)}")
+        finally:
+            # Обязательно удаляем файл с сервера
+            if os.path.exists(temp_filename):
+                os.remove(temp_filename)
+            # Очищаем память
+            PENDING_SEARCH_RESULTS.pop(call.message.chat.id, None)
+        return
+
     if data == "show_all_mods":
         safe_edit_message(call.message.chat.id, call.message.message_id, 
                           "Выберите модель (Полный список):", 
@@ -614,4 +663,3 @@ def handle_message(message):
 if __name__ == '__main__':
     print(f"AI-Админ запущен. Допущено админов: {len(ADMIN_IDS)}. Ожидание команд...")
     bot.polling(none_stop=True)
-                          
