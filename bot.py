@@ -38,7 +38,7 @@ model_advisor = None
 CURRENT_CHAT_ID = None
 PENDING_RETRY_MESSAGE = None
 PENDING_FILES = {}
-PENDING_SEARCH_RESULTS = {} # Новое хранилище для полных результатов поиска
+PENDING_SEARCH_RESULTS = {}
 
 # Ваш идеальный порядок:
 PRIORITY_MODELS = [
@@ -300,14 +300,11 @@ def process_search_query(message):
         formatted_chunks = []
         current_chunk = ""
 
-        # Формируем чистый текст для потенциального файла .txt
         clean_text_for_file = f"Результаты поиска по запросу: {' '.join(words)}\n"
         clean_text_for_file += "=" * 50 + "\n\n"
 
         for filename, matches in grouped_results.items():
             header = f"📁 <b>{html.escape(filename)}:</b>\n"
-            
-            # Добавляем в чистый текст без тегов
             clean_text_for_file += f"=== {filename} ===\n\n"
             
             if len(current_chunk) + len(header) > 4000:
@@ -331,12 +328,10 @@ def process_search_query(message):
         if current_chunk.strip():
             formatted_chunks.append(current_chunk)
             
-        # Отправляем максимум 5 сообщений
         for chunk in formatted_chunks[:5]:
             bot.send_message(message.chat.id, f"<pre>{chunk.strip()}</pre>", parse_mode='HTML')
             
         if len(formatted_chunks) > 5:
-            # Сохраняем полный текст в память бота
             PENDING_SEARCH_RESULTS[message.chat.id] = clean_text_for_file
             
             markup = InlineKeyboardMarkup()
@@ -392,7 +387,6 @@ def handle_query(call):
     global CURRENT_MODEL, PENDING_RETRY_MESSAGE, CURRENT_KEY_NUM, PRIORITY_MODELS_CACHE, OTHER_MODELS_CACHE, AVAILABLE_MODELS
     data = call.data
     
-    # Обработка новой кнопки скачивания .txt
     if data == "download_search_txt":
         full_text = PENDING_SEARCH_RESULTS.get(call.message.chat.id)
         if not full_text:
@@ -401,7 +395,6 @@ def handle_query(call):
             
         safe_edit_message(call.message.chat.id, call.message.message_id, "⏳ Формирую файл...")
         
-        # Создаем временный файл
         temp_filename = f"search_results_temp_{call.message.chat.id}.txt"
         try:
             with open(temp_filename, "w", encoding="utf-8") as f:
@@ -414,10 +407,8 @@ def handle_query(call):
         except Exception as e:
             safe_edit_message(call.message.chat.id, call.message.message_id, f"❌ Ошибка создания/отправки файла: {str(e)}")
         finally:
-            # Обязательно удаляем файл с сервера
             if os.path.exists(temp_filename):
                 os.remove(temp_filename)
-            # Очищаем память
             PENDING_SEARCH_RESULTS.pop(call.message.chat.id, None)
         return
 
@@ -571,10 +562,11 @@ def handle_query(call):
             PENDING_FILES.pop(call.message.chat.id, None)
             return
 
-@bot.message_handler(content_types=['voice', 'text'])
+# Обновленный обработчик, теперь принимает и фото
+@bot.message_handler(content_types=['voice', 'text', 'photo'])
 def handle_message(message):
+    # Теперь просто возвращаемся без ответа
     if message.from_user.id not in ADMIN_IDS:
-        bot.reply_to(message, "⛔ Доступ запрещен.")
         return
 
     log_admin_action(message.from_user.id, f"Сообщение: {message.content_type}")
@@ -588,10 +580,14 @@ def handle_message(message):
 
     clean_model_name = CURRENT_MODEL.replace('models/', '')
     is_gemma = "gemma" in clean_model_name.lower()
+    
     is_voice = message.content_type == 'voice'
-    text = message.text.strip() if message.text else ""
+    is_photo = message.content_type == 'photo'
+    
+    # Склеиваем текст или подпись к файлу
+    text = (message.text or message.caption or "").strip()
 
-    if not is_voice:
+    if not is_voice and not is_photo:
         if text.startswith('!'):
             cmd = text[1:].strip()
             log_admin_action(message.from_user.id, f"Прямая команда: {cmd}")
@@ -618,18 +614,40 @@ def handle_message(message):
         if is_voice:
             file_info = bot.get_file(message.voice.file_id)
             downloaded_file = bot.download_file(file_info.file_path)
-            voice_path = "temp_voice.ogg"
+            # Имя файла привязано к ID сообщения, чтобы избежать конфликтов при одновременной работе
+            voice_path = f"temp_voice_{message.message_id}.ogg"
+            
             with open(voice_path, 'wb') as new_file:
                 new_file.write(downloaded_file)
             
             audio_file = genai.upload_file(path=voice_path, mime_type="audio/ogg")
             
             if is_gemma:
-                 response = chat_agent.send_message("Я получил аудиофайл, но я модель Gemma и не умею слушать звук.")
+                 response = chat_agent.send_message("Я получил аудиофайл, но я текстовая модель Gemma и не умею слушать звук.")
             else:
                  response = chat_agent.send_message([audio_file, "Слушай аудио и выполни команду."])
                  
             os.remove(voice_path)
+            
+        elif is_photo:
+            # Берем фото в самом высоком разрешении (последнее в списке)
+            file_info = bot.get_file(message.photo[-1].file_id)
+            downloaded_file = bot.download_file(file_info.file_path)
+            photo_path = f"temp_photo_{message.message_id}.jpg"
+            
+            with open(photo_path, 'wb') as new_file:
+                new_file.write(downloaded_file)
+                
+            img_file = genai.upload_file(path=photo_path)
+            
+            if is_gemma:
+                response = chat_agent.send_message("Я получил изображение, но я текстовая модель Gemma и не умею смотреть картинки.")
+            else:
+                prompt = text if text else "Проанализируй это изображение."
+                response = chat_agent.send_message([img_file, prompt])
+                
+            os.remove(photo_path)
+            
         else:
             response = chat_agent.send_message(text)
             
@@ -663,3 +681,4 @@ def handle_message(message):
 if __name__ == '__main__':
     print(f"AI-Админ запущен. Допущено админов: {len(ADMIN_IDS)}. Ожидание команд...")
     bot.polling(none_stop=True)
+        
