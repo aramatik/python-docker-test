@@ -5,11 +5,10 @@ from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
 import google.generativeai as genai
 import html
 import re
-import shlex
-from collections import defaultdict
 
-# Импортируем наши функции форматирования из отдельного файла
+# Импортируем наши внешние модули
 from markdown import split_text_safely, md_to_html
+from search import parse_search_query, run_grep_search, format_search_results
 
 # Загружаем ключи
 TG_TOKEN = os.getenv("TG_TOKEN")
@@ -274,7 +273,7 @@ def clear_cmd(message):
 def search_cmd(message):
     if message.from_user.id not in ADMIN_IDS: return
     log_admin_action(message.from_user.id, "Команда /search")
-    msg = bot.reply_to(message, "Введите поисковый запрос (можно использовать несколько слов):")
+    msg = bot.reply_to(message, "Введите поисковый запрос (фразы в [квадратных скобках] ищутся целиком):")
     bot.register_next_step_handler(msg, process_search_query)
 
 def process_search_query(message):
@@ -286,22 +285,16 @@ def process_search_query(message):
         return
         
     log_admin_action(message.from_user.id, f"Поиск: {query}")
-    try:
-        words = shlex.split(query)
-    except ValueError:
-        words = query.split()
-        
-    if not words: return
-
-    cmd = f"grep -iH {shlex.quote(words[0])} /app/downloads/база/*.csv 2>/dev/null"
-    for word in words[1:]:
-        cmd += f" | grep -i {shlex.quote(word)}"
     
-    msg_wait = bot.send_message(message.chat.id, f"🔍 Ищу в базе: <code>{' | '.join(words)}</code>...", parse_mode='HTML')
+    # Используем вынесенный парсер
+    terms = parse_search_query(query)
+    if not terms: return
+    
+    msg_wait = bot.send_message(message.chat.id, f"🔍 Ищу в базе: <code>{' | '.join(terms)}</code>...", parse_mode='HTML')
     
     try:
-        result = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=60)
-        output = result.stdout.strip()
+        # Выполняем grep поиск через внешний модуль
+        output = run_grep_search(terms)
         
         if not output:
             safe_edit_message(message.chat.id, msg_wait.message_id, "🤷‍♂️ По вашему запросу ничего не найдено.")
@@ -309,45 +302,8 @@ def process_search_query(message):
             
         bot.delete_message(message.chat.id, msg_wait.message_id)
         
-        grouped_results = defaultdict(list)
-        for line in output.split('\n'):
-            if not line.strip(): continue
-            parts = line.split(':', 1)
-            if len(parts) == 2:
-                filepath, match_text = parts
-                filename = os.path.basename(filepath)
-                grouped_results[filename].append(match_text)
-            else:
-                grouped_results["Другое"].append(line)
-
-        formatted_chunks = []
-        current_chunk = ""
-
-        clean_text_for_file = f"Результаты поиска по запросу: {' '.join(words)}\n"
-        clean_text_for_file += "=" * 50 + "\n\n"
-
-        for filename, matches in grouped_results.items():
-            header = f"📁 <b>{html.escape(filename)}:</b>\n"
-            clean_text_for_file += f"=== {filename} ===\n\n"
-            
-            if len(current_chunk) + len(header) > 4000:
-                formatted_chunks.append(current_chunk)
-                current_chunk = header
-            else:
-                current_chunk += header
-                
-            for match in matches:
-                clean_text_for_file += f"{match}\n\n"
-                line = f"{html.escape(match)}\n\n" 
-                if len(current_chunk) + len(line) > 4000:
-                    formatted_chunks.append(current_chunk)
-                    current_chunk = line
-                else:
-                    current_chunk += line
-            clean_text_for_file += "\n"
-            
-        if current_chunk.strip():
-            formatted_chunks.append(current_chunk)
+        # Форматируем результаты
+        formatted_chunks, clean_text_for_file = format_search_results(output, terms)
             
         for chunk in formatted_chunks[:5]:
             bot.send_message(message.chat.id, f"<pre>{chunk.strip()}</pre>", parse_mode='HTML')
@@ -437,11 +393,8 @@ def handle_query(call):
         genai.configure(api_key=target_key)
         PRIORITY_MODELS_CACHE, OTHER_MODELS_CACHE, AVAILABLE_MODELS, CURRENT_MODEL = [], [], [], None
         
-        # Удаляем сообщение с меню ключей
-        try:
-            bot.delete_message(call.message.chat.id, call.message.message_id)
-        except Exception:
-            pass
+        try: bot.delete_message(call.message.chat.id, call.message.message_id)
+        except Exception: pass
             
         bot.send_message(call.message.chat.id, f"✅ Активен <b>KEY {key_num}</b>.\nВызовите /gemini для выбора модели.", parse_mode='HTML')
         return
@@ -454,13 +407,9 @@ def handle_query(call):
             clean_name = CURRENT_MODEL.replace('models/', '')
             mode_text = "(Режим Чатбота)" if "gemma" in clean_name.lower() else "(Режим Админа)"
             
-            # Полностью удаляем сообщение с кнопками моделей
-            try:
-                bot.delete_message(call.message.chat.id, call.message.message_id)
-            except Exception:
-                pass
+            try: bot.delete_message(call.message.chat.id, call.message.message_id)
+            except Exception: pass
                 
-            # Отправляем новое сообщение в самый низ
             bot.send_message(call.message.chat.id, f"✅ Выбрана модель: <b>{clean_name}</b> {mode_text}", parse_mode='HTML')
             
             if PENDING_RETRY_MESSAGE:
@@ -633,6 +582,7 @@ def handle_message(message):
             
         full_text = response.text
         
+        # Интеллектуальная разбивка и форматирование (Анти-MESSAGE_TOO_LONG)
         if is_gemma:
             bot.delete_message(chat_id=message.chat.id, message_id=msg_wait.message_id)
             prefix = f"<b>{clean_model_name} (Чат):</b>\n\n"
