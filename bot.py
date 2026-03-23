@@ -8,6 +8,9 @@ import re
 import shlex
 from collections import defaultdict
 
+# Импортируем наши функции форматирования из нового файла
+from markdown import split_text_safely, md_to_html
+
 # Загружаем ключи
 TG_TOKEN = os.getenv("TG_TOKEN")
 API_KEY_1 = os.getenv("GEMINI_API_KEY")
@@ -63,9 +66,9 @@ def log_admin_action(user_id, action):
     """Логирует действия админов в консоль"""
     print(f"[ADMIN {user_id}] {action}")
 
-# --- УМНЫЙ ПРЕДОХРАНИТЕЛЬ ДЛЯ ТЕЛЕГРАМА ---
+# --- ФУНКЦИИ ВЫВОДА ---
+
 def safe_edit_message(chat_id, message_id, text, parse_mode='HTML', reply_markup=None):
-    """Редактирует сообщение, игнорируя ошибку, если текст не изменился"""
     try:
         bot.edit_message_text(chat_id=chat_id, message_id=message_id, text=text, 
                               parse_mode=parse_mode, reply_markup=reply_markup)
@@ -73,12 +76,32 @@ def safe_edit_message(chat_id, message_id, text, parse_mode='HTML', reply_markup
         if "message is not modified" not in str(e).lower():
             raise e
 
-def format_as_code(text: str) -> str:
-    if not text:
-        return '<pre><code class="language-bash">Команда выполнена (нет вывода).</code></pre>'
-    clean_text = text.replace("```bash", "").replace("```html", "").replace("```", "").strip()
-    escaped_text = html.escape(clean_text[:4000])
-    return f'<pre><code class="language-bash">{escaped_text}</code></pre>'
+def send_long_text(chat_id, text, first_msg_id=None, is_code=False, prefix=""):
+    """Отправляет или обновляет сообщение с учетом лимитов Telegram и разметки"""
+    if not text: return
+    text = text.replace('\r\n', '\n')
+    chunks = split_text_safely(text, max_len=3500)
+    
+    for i, chunk in enumerate(chunks):
+        if is_code:
+            formatted = f'<pre><code class="language-bash">{html.escape(chunk.strip())}</code></pre>'
+        else:
+            formatted_chunk = md_to_html(chunk)
+            formatted = f"{prefix}{formatted_chunk}" if i == 0 else formatted_chunk
+            
+        if i == 0 and first_msg_id:
+            try:
+                safe_edit_message(chat_id, first_msg_id, formatted, parse_mode='HTML')
+            except Exception:
+                # Фолбэк на сырой текст, если HTML кривой
+                safe_edit_message(chat_id, first_msg_id, f"{prefix}{chunk.strip()}" if i==0 else chunk.strip())
+        else:
+            try:
+                bot.send_message(chat_id, formatted, parse_mode='HTML')
+            except Exception:
+                bot.send_message(chat_id, chunk.strip())
+
+# --- БАЗОВЫЕ ИНСТРУМЕНТЫ АГЕНТА ---
 
 def execute_bash(command: str) -> str:
     print(f"Выполнение: {command}")
@@ -100,6 +123,8 @@ def send_file_to_telegram(filepath: str) -> str:
         return f"Успех: Файл {filepath} отправлен."
     except Exception as e:
         return f"Ошибка отправки файла: {str(e)}"
+
+# --- ЛОГИКА МОДЕЛЕЙ ---
 
 def get_models_lists():
     raw_models = [m.name for m in genai.list_models() if 'generateContent' in m.supported_generation_methods]
@@ -204,6 +229,8 @@ def handle_api_error(e, chat_id, message_id, original_message, clean_model_name)
     else:
         safe_edit_message(chat_id, message_id, f"❌ Ошибка ИИ: {html.escape(error_text)}")
 
+# --- ОБРАБОТЧИКИ КОМАНД ---
+
 @bot.message_handler(commands=['start'])
 def send_welcome(message):
     if message.from_user.id not in ADMIN_IDS: return
@@ -232,7 +259,6 @@ def change_key_cmd(message):
 def clear_cmd(message):
     if message.from_user.id not in ADMIN_IDS: return
     log_admin_action(message.from_user.id, "Команда /clear")
-    
     global chat_agent, CURRENT_MODEL
     
     if not CURRENT_MODEL:
@@ -261,14 +287,12 @@ def process_search_query(message):
         return
         
     log_admin_action(message.from_user.id, f"Поиск: {query}")
-    
     try:
         words = shlex.split(query)
     except ValueError:
         words = query.split()
         
-    if not words:
-        return
+    if not words: return
 
     cmd = f"grep -iH {shlex.quote(words[0])} /app/downloads/база/*.csv 2>/dev/null"
     for word in words[1:]:
@@ -315,14 +339,12 @@ def process_search_query(message):
                 
             for match in matches:
                 clean_text_for_file += f"{match}\n\n"
-                
                 line = f"{html.escape(match)}\n\n" 
                 if len(current_chunk) + len(line) > 4000:
                     formatted_chunks.append(current_chunk)
                     current_chunk = line
                 else:
                     current_chunk += line
-            
             clean_text_for_file += "\n"
             
         if current_chunk.strip():
@@ -333,10 +355,8 @@ def process_search_query(message):
             
         if len(formatted_chunks) > 5:
             PENDING_SEARCH_RESULTS[message.chat.id] = clean_text_for_file
-            
             markup = InlineKeyboardMarkup()
             markup.add(InlineKeyboardButton(text="📥 Скачать всё (.txt)", callback_data="download_search_txt"))
-            
             bot.send_message(
                 message.chat.id, 
                 f"⚠️ <b>Внимание:</b> Показано 5 сообщений из {len(formatted_chunks)}. Остальной текст обрезан.\n\n"
@@ -349,6 +369,8 @@ def process_search_query(message):
         safe_edit_message(message.chat.id, msg_wait.message_id, "❌ Ошибка: Превышено время ожидания поиска (более 60 секунд).")
     except Exception as e:
         safe_edit_message(message.chat.id, msg_wait.message_id, f"❌ Ошибка поиска: {html.escape(str(e))}")
+
+# --- ФАЙЛЫ И CALLBACKS ---
 
 @bot.message_handler(content_types=['document'])
 def handle_document(message):
@@ -369,13 +391,8 @@ def handle_document(message):
     }
     
     markup = InlineKeyboardMarkup()
-    markup.row(
-        InlineKeyboardButton("✅ Да", callback_data="file_yes"),
-        InlineKeyboardButton("❌ Нет", callback_data="file_no")
-    )
-    markup.row(
-        InlineKeyboardButton("🧠 Обработать ИИ", callback_data="file_ai")
-    )
+    markup.row(InlineKeyboardButton("✅ Да", callback_data="file_yes"), InlineKeyboardButton("❌ Нет", callback_data="file_no"))
+    markup.row(InlineKeyboardButton("🧠 Обработать ИИ", callback_data="file_ai"))
     
     bot.reply_to(message, f"📥 Загрузить файл <b>{html.escape(file_name)}</b> на сервер?", reply_markup=markup, parse_mode='HTML')
 
@@ -390,60 +407,37 @@ def handle_query(call):
     if data == "download_search_txt":
         full_text = PENDING_SEARCH_RESULTS.get(call.message.chat.id)
         if not full_text:
-            bot.answer_callback_query(call.id, "❌ Результаты поиска устарели или не найдены в памяти.", show_alert=True)
+            bot.answer_callback_query(call.id, "❌ Результаты поиска устарели.", show_alert=True)
             return
             
         safe_edit_message(call.message.chat.id, call.message.message_id, "⏳ Формирую файл...")
-        
         temp_filename = f"search_results_temp_{call.message.chat.id}.txt"
         try:
-            with open(temp_filename, "w", encoding="utf-8") as f:
-                f.write(full_text)
-                
-            with open(temp_filename, "rb") as f:
-                bot.send_document(call.message.chat.id, f, caption="📁 Полные результаты поиска")
-                
-            safe_edit_message(call.message.chat.id, call.message.message_id, "✅ Файл с полными результатами успешно отправлен.")
+            with open(temp_filename, "w", encoding="utf-8") as f: f.write(full_text)
+            with open(temp_filename, "rb") as f: bot.send_document(call.message.chat.id, f, caption="📁 Полные результаты поиска")
+            safe_edit_message(call.message.chat.id, call.message.message_id, "✅ Файл успешно отправлен.")
         except Exception as e:
-            safe_edit_message(call.message.chat.id, call.message.message_id, f"❌ Ошибка создания/отправки файла: {str(e)}")
+            safe_edit_message(call.message.chat.id, call.message.message_id, f"❌ Ошибка файла: {str(e)}")
         finally:
-            if os.path.exists(temp_filename):
-                os.remove(temp_filename)
+            if os.path.exists(temp_filename): os.remove(temp_filename)
             PENDING_SEARCH_RESULTS.pop(call.message.chat.id, None)
         return
 
     if data == "show_all_mods":
-        safe_edit_message(call.message.chat.id, call.message.message_id, 
-                          "Выберите модель (Полный список):", 
-                          reply_markup=get_models_keyboard(show_all=True))
+        safe_edit_message(call.message.chat.id, call.message.message_id, "Выберите модель:", reply_markup=get_models_keyboard(show_all=True))
         return
 
     if data.startswith("key_"):
         key_num = int(data.split("_")[1])
-        
-        if key_num == 1:
-            target_key = API_KEY_1
-        elif key_num == 2:
-            target_key = API_KEY_2
-        elif key_num == 3:
-            target_key = API_KEY_3
-        else:
-            target_key = None
-            
+        target_key = API_KEY_1 if key_num == 1 else (API_KEY_2 if key_num == 2 else API_KEY_3)
         if not target_key:
-            bot.answer_callback_query(call.id, f"❌ KEY {key_num} не задан в переменных!", show_alert=True)
+            bot.answer_callback_query(call.id, f"❌ KEY {key_num} не задан!", show_alert=True)
             return
             
         CURRENT_KEY_NUM = key_num
         genai.configure(api_key=target_key)
-        
-        PRIORITY_MODELS_CACHE = []
-        OTHER_MODELS_CACHE = []
-        AVAILABLE_MODELS = []
-        CURRENT_MODEL = None
-        
-        safe_edit_message(call.message.chat.id, call.message.message_id, 
-                          f"✅ Активен <b>KEY {key_num}</b>.\nТеперь выберите модель /gemini")
+        PRIORITY_MODELS_CACHE, OTHER_MODELS_CACHE, AVAILABLE_MODELS, CURRENT_MODEL = [], [], [], None
+        safe_edit_message(call.message.chat.id, call.message.message_id, f"✅ Активен <b>KEY {key_num}</b>.\nВыберите модель /gemini")
         return
 
     if data.startswith("mod_"):
@@ -452,109 +446,87 @@ def handle_query(call):
         try:
             init_models(CURRENT_MODEL)
             clean_name = CURRENT_MODEL.replace('models/', '')
-            
-            is_gemma = "gemma" in clean_name.lower()
-            mode_text = "(Режим Чатбота)" if is_gemma else "(Режим Админа)"
-            
-            safe_edit_message(call.message.chat.id, call.message.message_id, 
-                              f"✅ Выбрана модель: <b>{clean_name}</b> {mode_text}")
+            mode_text = "(Режим Чатбота)" if "gemma" in clean_name.lower() else "(Режим Админа)"
+            safe_edit_message(call.message.chat.id, call.message.message_id, f"✅ Выбрана модель: <b>{clean_name}</b> {mode_text}")
             
             if PENDING_RETRY_MESSAGE:
                 msg_to_retry = PENDING_RETRY_MESSAGE
                 PENDING_RETRY_MESSAGE = None 
                 bot.send_message(call.message.chat.id, f"🔄 Повторяю прерванный запрос на <b>{clean_name}</b>...", parse_mode='HTML')
                 handle_message(msg_to_retry) 
-                
         except Exception as e:
             bot.answer_callback_query(call.id, f"Ошибка инициализации: {e}")
         return
 
     if data in ["file_yes", "file_no", "file_ai"]:
         file_info_dict = PENDING_FILES.get(call.message.chat.id)
-        
         if data == "file_no":
-            safe_edit_message(call.message.chat.id, call.message.message_id, "❌ Операция с файлом отменена.")
+            safe_edit_message(call.message.chat.id, call.message.message_id, "❌ Отменено.")
             PENDING_FILES.pop(call.message.chat.id, None)
             return
             
         if not file_info_dict:
-            bot.answer_callback_query(call.id, "❌ Файл устарел или не найден в памяти.", show_alert=True)
+            bot.answer_callback_query(call.id, "❌ Файл устарел.", show_alert=True)
             return
 
         if data == "file_yes":
-            safe_edit_message(call.message.chat.id, call.message.message_id, "⏳ Сохраняю файл на сервер...")
+            safe_edit_message(call.message.chat.id, call.message.message_id, "⏳ Сохраняю...")
             try:
                 file_info = bot.get_file(file_info_dict['file_id'])
                 downloaded_file = bot.download_file(file_info.file_path)
-                
-                download_dir = "/app/downloads"
-                os.makedirs(download_dir, exist_ok=True)
-                
-                save_path = os.path.join(download_dir, file_info_dict['file_name'])
-                with open(save_path, 'wb') as new_file:
-                    new_file.write(downloaded_file)
-                    
-                safe_edit_message(
-                    call.message.chat.id, 
-                    call.message.message_id, 
-                    f"✅ Файл <b>{html.escape(file_info_dict['file_name'])}</b> успешно сохранен!\n\n"
-                    f"📁 Путь в боте: <code>{html.escape(save_path)}</code>\n"
-                    f"📁 Путь на сервере: <code>/root/ai_files/{html.escape(file_info_dict['file_name'])}</code>"
-                )
+                os.makedirs("/app/downloads", exist_ok=True)
+                save_path = os.path.join("/app/downloads", file_info_dict['file_name'])
+                with open(save_path, 'wb') as new_file: new_file.write(downloaded_file)
+                safe_edit_message(call.message.chat.id, call.message.message_id, f"✅ Файл сохранен:\n<code>{html.escape(save_path)}</code>")
             except Exception as e:
-                safe_edit_message(call.message.chat.id, call.message.message_id, f"❌ Ошибка загрузки: {e}")
-            
+                safe_edit_message(call.message.chat.id, call.message.message_id, f"❌ Ошибка: {e}")
             PENDING_FILES.pop(call.message.chat.id, None)
             return
             
         if data == "file_ai":
             if not CURRENT_MODEL:
-                bot.answer_callback_query(call.id, "⚠️ Сначала выберите модель (/gemini)!", show_alert=True)
+                bot.answer_callback_query(call.id, "⚠️ Выберите модель (/gemini)!", show_alert=True)
                 return
                 
             clean_name = CURRENT_MODEL.replace('models/', '')
             is_gemma = "gemma" in clean_name.lower()
-            
-            safe_edit_message(call.message.chat.id, call.message.message_id, f"<b>{clean_name}:</b>\n🧠 Читаю и анализирую файл...")
-            msg_wait = bot.send_message(call.message.chat.id, "🤖 Ожидайте вывода...")
+            safe_edit_message(call.message.chat.id, call.message.message_id, f"<b>{clean_name}:</b>\n🧠 Читаю файл...")
+            msg_wait = bot.send_message(call.message.chat.id, "🤖 Ожидайте...")
             
             try:
                 file_info = bot.get_file(file_info_dict['file_id'])
-                downloaded_file = bot.download_file(file_info.file_path)
                 temp_file_name = f"temp_ai_{file_info_dict['file_name']}"
-                
-                with open(temp_file_name, 'wb') as new_file:
-                    new_file.write(downloaded_file)
+                with open(temp_file_name, 'wb') as new_file: new_file.write(bot.download_file(file_info.file_path))
                 
                 mime = file_info_dict['mime_type']
                 gemini_file = genai.upload_file(path=temp_file_name, mime_type=mime) if mime else genai.upload_file(path=temp_file_name)
                 
                 if is_gemma:
-                     response = chat_agent.send_message("Я получил файл, но как модель Gemma я пока не умею напрямую читать файлы через этот интерфейс.")
+                     response = chat_agent.send_message("Я текстовая модель Gemma, я пока не умею читать файлы.")
                 else:
-                     response = chat_agent.send_message([gemini_file, "Проанализируй этот файл. Расскажи, что в нём (сделай саммари текста или объясни код). Если есть инструкции к действию - выполни их."])
-                
+                     response = chat_agent.send_message([gemini_file, "Проанализируй этот файл. Расскажи, что в нём, либо выполни инструкции."])
                 os.remove(temp_file_name)
                 
                 full_text = response.text
                 if is_gemma:
-                    try:
-                        safe_edit_message(call.message.chat.id, call.message.message_id, f"*{clean_name} (Чат):*\n\n{full_text}", parse_mode='Markdown')
-                    except:
-                        safe_edit_message(call.message.chat.id, call.message.message_id, f"<b>{clean_name} (Чат):</b>\n\n{html.escape(full_text)}")
                     bot.delete_message(chat_id=call.message.chat.id, message_id=msg_wait.message_id)
+                    send_long_text(call.message.chat.id, full_text, first_msg_id=call.message.message_id, prefix=f"<b>{clean_name} (Чат):</b>\n\n")
                 else:
                     if "===SPLIT===" in full_text:
                         parts = full_text.split("===SPLIT===", 1)
-                        comment = parts[0].strip()
-                        raw_out = parts[1].strip()
+                        comment, raw_out = parts[0].strip(), parts[1].strip()
                     else:
-                        comment = ""
-                        raw_out = full_text.strip()
+                        comment, raw_out = "", full_text.strip()
                         
-                    first_text = f"<b>{clean_name}:</b>" + (f"\n\n{html.escape(comment)}" if comment else "")
-                    safe_edit_message(call.message.chat.id, call.message.message_id, first_text)
-                    safe_edit_message(call.message.chat.id, msg_wait.message_id, format_as_code(raw_out))
+                    if comment:
+                        send_long_text(call.message.chat.id, comment, first_msg_id=call.message.message_id, prefix=f"<b>{clean_name}:</b>\n\n")
+                    else:
+                        safe_edit_message(call.message.chat.id, call.message.message_id, f"<b>{clean_name}:</b>")
+                        
+                    if raw_out:
+                        send_long_text(call.message.chat.id, raw_out, first_msg_id=msg_wait.message_id, is_code=True)
+                    else:
+                        safe_edit_message(call.message.chat.id, msg_wait.message_id, "<i>Вывод пуст.</i>")
                     
             except Exception as e:
                 handle_api_error(e, call.message.chat.id, msg_wait.message_id, None, clean_name)
@@ -562,12 +534,12 @@ def handle_query(call):
             PENDING_FILES.pop(call.message.chat.id, None)
             return
 
-# Обновленный обработчик, теперь принимает и фото
+# --- ГЛАВНЫЙ ОБРАБОТЧИК СООБЩЕНИЙ ---
+
 @bot.message_handler(content_types=['voice', 'text', 'photo'])
 def handle_message(message):
-    # Теперь просто возвращаемся без ответа
     if message.from_user.id not in ADMIN_IDS:
-        return
+        return # Полное игнорирование неизвестных
 
     log_admin_action(message.from_user.id, f"Сообщение: {message.content_type}")
 
@@ -584,7 +556,7 @@ def handle_message(message):
     is_voice = message.content_type == 'voice'
     is_photo = message.content_type == 'photo'
     
-    # Склеиваем текст или подпись к файлу
+    # Берем текст из самого сообщения ИЛИ из подписи к фото
     text = (message.text or message.caption or "").strip()
 
     if not is_voice and not is_photo:
@@ -593,7 +565,7 @@ def handle_message(message):
             log_admin_action(message.from_user.id, f"Прямая команда: {cmd}")
             bot.send_message(message.chat.id, f"⚡ Выполняю напрямую:\n<code>{html.escape(cmd)}</code>", parse_mode='HTML')
             result = execute_bash(cmd)
-            bot.reply_to(message, format_as_code(result), parse_mode='HTML')
+            send_long_text(message.chat.id, result, is_code=True)
             return
 
         if text.startswith('#'):
@@ -602,7 +574,7 @@ def handle_message(message):
             msg_wait = bot.send_message(message.chat.id, "🧠 Думаю...")
             try:
                 response = model_advisor.generate_content(task)
-                safe_edit_message(message.chat.id, msg_wait.message_id, format_as_code(response.text))
+                send_long_text(message.chat.id, response.text, first_msg_id=msg_wait.message_id, is_code=True)
             except Exception as e:
                 handle_api_error(e, message.chat.id, msg_wait.message_id, message, clean_model_name)
             return
@@ -613,30 +585,24 @@ def handle_message(message):
     try:
         if is_voice:
             file_info = bot.get_file(message.voice.file_id)
-            downloaded_file = bot.download_file(file_info.file_path)
-            # Имя файла привязано к ID сообщения, чтобы избежать конфликтов при одновременной работе
             voice_path = f"temp_voice_{message.message_id}.ogg"
-            
             with open(voice_path, 'wb') as new_file:
-                new_file.write(downloaded_file)
+                new_file.write(bot.download_file(file_info.file_path))
             
             audio_file = genai.upload_file(path=voice_path, mime_type="audio/ogg")
             
             if is_gemma:
-                 response = chat_agent.send_message("Я получил аудиофайл, но я текстовая модель Gemma и не умею слушать звук.")
+                 response = chat_agent.send_message("Я получил аудио, но я текстовая модель Gemma и не умею слушать звук.")
             else:
                  response = chat_agent.send_message([audio_file, "Слушай аудио и выполни команду."])
                  
             os.remove(voice_path)
             
         elif is_photo:
-            # Берем фото в самом высоком разрешении (последнее в списке)
             file_info = bot.get_file(message.photo[-1].file_id)
-            downloaded_file = bot.download_file(file_info.file_path)
             photo_path = f"temp_photo_{message.message_id}.jpg"
-            
             with open(photo_path, 'wb') as new_file:
-                new_file.write(downloaded_file)
+                new_file.write(bot.download_file(file_info.file_path))
                 
             img_file = genai.upload_file(path=photo_path)
             
@@ -653,32 +619,32 @@ def handle_message(message):
             
         full_text = response.text
         
+        # Интеллектуальная разбивка и форматирование (Анти-MESSAGE_TOO_LONG)
         if is_gemma:
-            try:
-                safe_edit_message(message.chat.id, msg_first.message_id, f"*{clean_model_name} (Чат):*\n\n{full_text}", parse_mode='Markdown')
-            except Exception:
-                safe_edit_message(message.chat.id, msg_first.message_id, f"<b>{clean_model_name} (Чат):</b>\n\n{html.escape(full_text)}")
             bot.delete_message(chat_id=message.chat.id, message_id=msg_wait.message_id)
+            prefix = f"<b>{clean_model_name} (Чат):</b>\n\n"
+            send_long_text(message.chat.id, full_text, first_msg_id=msg_first.message_id, prefix=prefix)
         else:
             if "===SPLIT===" in full_text:
                 parts = full_text.split("===SPLIT===", 1)
-                comment = parts[0].strip()
-                raw_out = parts[1].strip()
+                comment, raw_out = parts[0].strip(), parts[1].strip()
             else:
-                comment = ""
-                raw_out = full_text.strip()
+                comment, raw_out = "", full_text.strip()
                 
-            first_message_text = f"<b>{clean_model_name}:</b>"
+            prefix = f"<b>{clean_model_name}:</b>\n\n"
             if comment:
-                first_message_text += f"\n\n{html.escape(comment)}"
+                send_long_text(message.chat.id, comment, first_msg_id=msg_first.message_id, prefix=prefix)
+            else:
+                safe_edit_message(message.chat.id, msg_first.message_id, f"<b>{clean_model_name}:</b>")
                 
-            safe_edit_message(message.chat.id, msg_first.message_id, first_message_text)
-            safe_edit_message(message.chat.id, msg_wait.message_id, format_as_code(raw_out))
+            if raw_out:
+                send_long_text(message.chat.id, raw_out, first_msg_id=msg_wait.message_id, is_code=True)
+            else:
+                safe_edit_message(message.chat.id, msg_wait.message_id, "<i>Вывод терминала пуст.</i>")
                               
     except Exception as e:
         handle_api_error(e, message.chat.id, msg_wait.message_id, message, clean_model_name)
 
 if __name__ == '__main__':
-    print(f"AI-Админ запущен. Допущено админов: {len(ADMIN_IDS)}. Ожидание команд...")
+    print(f"AI-Админ запущен. Допущено админов: {len(ADMIN_IDS)}. Режим невидимки включен...")
     bot.polling(none_stop=True)
-        
