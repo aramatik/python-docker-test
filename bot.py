@@ -8,7 +8,7 @@ import re
 import shlex
 from collections import defaultdict
 
-# Импортируем наши функции форматирования из нового файла
+# Импортируем наши функции форматирования из отдельного файла
 from markdown import split_text_safely, md_to_html
 
 # Загружаем ключи
@@ -93,7 +93,6 @@ def send_long_text(chat_id, text, first_msg_id=None, is_code=False, prefix=""):
             try:
                 safe_edit_message(chat_id, first_msg_id, formatted, parse_mode='HTML')
             except Exception:
-                # Фолбэк на сырой текст, если HTML кривой
                 safe_edit_message(chat_id, first_msg_id, f"{prefix}{chunk.strip()}" if i==0 else chunk.strip())
         else:
             try:
@@ -193,7 +192,7 @@ def init_models(model_name):
             model_name=model_name,
             tools=[execute_bash, send_file_to_telegram],
             system_instruction=(
-                "Ты root-админ Debian. Инструменты: execute_bash, send_file_to_telegram.\n"
+                "Ты root-админ Ubuntu. Инструменты: execute_bash, send_file_to_telegram.\n"
                 "1. Пакеты: используй apt/apt-get. Ты root, sudo не нужен.\n"
                 "2. Отправка файлов: ТОЛЬКО send_file_to_telegram. Чтение: cat.\n"
                 "3. Ты слышишь аудио и читаешь файлы.\n"
@@ -437,7 +436,14 @@ def handle_query(call):
         CURRENT_KEY_NUM = key_num
         genai.configure(api_key=target_key)
         PRIORITY_MODELS_CACHE, OTHER_MODELS_CACHE, AVAILABLE_MODELS, CURRENT_MODEL = [], [], [], None
-        safe_edit_message(call.message.chat.id, call.message.message_id, f"✅ Активен <b>KEY {key_num}</b>.\nВыберите модель /gemini")
+        
+        # Удаляем сообщение с меню ключей
+        try:
+            bot.delete_message(call.message.chat.id, call.message.message_id)
+        except Exception:
+            pass
+            
+        bot.send_message(call.message.chat.id, f"✅ Активен <b>KEY {key_num}</b>.\nВызовите /gemini для выбора модели.", parse_mode='HTML')
         return
 
     if data.startswith("mod_"):
@@ -447,7 +453,15 @@ def handle_query(call):
             init_models(CURRENT_MODEL)
             clean_name = CURRENT_MODEL.replace('models/', '')
             mode_text = "(Режим Чатбота)" if "gemma" in clean_name.lower() else "(Режим Админа)"
-            safe_edit_message(call.message.chat.id, call.message.message_id, f"✅ Выбрана модель: <b>{clean_name}</b> {mode_text}")
+            
+            # Полностью удаляем сообщение с кнопками моделей
+            try:
+                bot.delete_message(call.message.chat.id, call.message.message_id)
+            except Exception:
+                pass
+                
+            # Отправляем новое сообщение в самый низ
+            bot.send_message(call.message.chat.id, f"✅ Выбрана модель: <b>{clean_name}</b> {mode_text}", parse_mode='HTML')
             
             if PENDING_RETRY_MESSAGE:
                 msg_to_retry = PENDING_RETRY_MESSAGE
@@ -619,7 +633,6 @@ def handle_message(message):
             
         full_text = response.text
         
-        # Интеллектуальная разбивка и форматирование (Анти-MESSAGE_TOO_LONG)
         if is_gemma:
             bot.delete_message(chat_id=message.chat.id, message_id=msg_wait.message_id)
             prefix = f"<b>{clean_model_name} (Чат):</b>\n\n"
