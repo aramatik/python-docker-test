@@ -9,6 +9,7 @@ import re
 # Импортируем наши внешние модули
 from markdown import split_text_safely, md_to_html
 from search import parse_search_query, run_grep_search, format_search_results
+from web_search import search_web # Новый инструмент для агента
 
 # Загружаем ключи
 TG_TOKEN = os.getenv("TG_TOKEN")
@@ -189,12 +190,14 @@ def init_models(model_name):
     else:
         model_agent = genai.GenerativeModel(
             model_name=model_name,
-            tools=[execute_bash, send_file_to_telegram],
+            # Добавили search_web в список инструментов агента
+            tools=[execute_bash, send_file_to_telegram, search_web],
             system_instruction=(
-                "Ты root-админ Ubuntu. Инструменты: execute_bash, send_file_to_telegram.\n"
+                "Ты root-админ Debian. Инструменты: execute_bash, send_file_to_telegram, search_web.\n"
                 "1. Пакеты: используй apt/apt-get. Ты root, sudo не нужен.\n"
                 "2. Отправка файлов: ТОЛЬКО send_file_to_telegram. Чтение: cat.\n"
                 "3. Ты слышишь аудио и читаешь файлы.\n"
+                "4. Гугли актуальную инфу через search_web, если не знаешь ответа.\n"
                 "ФОРМАТ ОТВЕТА СТРОГО:\n"
                 "Комментарии\n"
                 "===SPLIT===\n"
@@ -285,16 +288,17 @@ def process_search_query(message):
         return
         
     log_admin_action(message.from_user.id, f"Поиск: {query}")
-    
-    # Используем вынесенный парсер
-    terms = parse_search_query(query)
-    if not terms: return
-    
-    msg_wait = bot.send_message(message.chat.id, f"🔍 Ищу в базе: <code>{' | '.join(terms)}</code>...", parse_mode='HTML')
+    try:
+        words = parse_search_query(query)
+    except ValueError:
+        words = query.split()
+        
+    if not words: return
+
+    msg_wait = bot.send_message(message.chat.id, f"🔍 Ищу в базе: <code>{' | '.join(words)}</code>...", parse_mode='HTML')
     
     try:
-        # Выполняем grep поиск через внешний модуль
-        output = run_grep_search(terms)
+        output = run_grep_search(words)
         
         if not output:
             safe_edit_message(message.chat.id, msg_wait.message_id, "🤷‍♂️ По вашему запросу ничего не найдено.")
@@ -302,8 +306,7 @@ def process_search_query(message):
             
         bot.delete_message(message.chat.id, msg_wait.message_id)
         
-        # Форматируем результаты
-        formatted_chunks, clean_text_for_file = format_search_results(output, terms)
+        formatted_chunks, clean_text_for_file = format_search_results(output, words)
             
         for chunk in formatted_chunks[:5]:
             bot.send_message(message.chat.id, f"<pre>{chunk.strip()}</pre>", parse_mode='HTML')
