@@ -9,7 +9,7 @@ import re
 # Импортируем наши внешние модули
 from markdown import split_text_safely, md_to_html
 from search import parse_search_query, run_grep_search, format_search_results
-from web_search import search_web # Новый инструмент для агента
+import web_search # Импортируем модуль поиска напрямую
 
 # Загружаем ключи
 TG_TOKEN = os.getenv("TG_TOKEN")
@@ -43,7 +43,9 @@ PENDING_RETRY_MESSAGE = None
 PENDING_FILES = {}
 PENDING_SEARCH_RESULTS = {}
 
-# Ваш идеальный порядок:
+# Глобальный журнал действий ИИ-агента для каждого чата
+ACTION_LOGS = {} 
+
 PRIORITY_MODELS = [
     "gemini-2.5-flash",
     "gemini-flash-latest",
@@ -100,10 +102,13 @@ def send_long_text(chat_id, text, first_msg_id=None, is_code=False, prefix=""):
             except Exception:
                 bot.send_message(chat_id, chunk.strip())
 
-# --- БАЗОВЫЕ ИНСТРУМЕНТЫ АГЕНТА ---
+# --- АГЕНТСКИЕ ИНСТРУМЕНТЫ (TOOLS) С ЛОГИРОВАНИЕМ ---
 
 def execute_bash(command: str) -> str:
+    """Выполняет bash команду на сервере."""
     print(f"Выполнение: {command}")
+    if CURRENT_CHAT_ID:
+        ACTION_LOGS.setdefault(CURRENT_CHAT_ID, []).append(f"💻 Bash: {command}")
     try:
         result = subprocess.run(command, shell=True, capture_output=True, text=True, timeout=30)
         output = result.stdout if result.stdout else result.stderr
@@ -111,8 +116,18 @@ def execute_bash(command: str) -> str:
     except Exception as e:
         return f"Ошибка: {str(e)}"
 
+def search_web_tool(query: str) -> str:
+    """Ищет информацию в интернете."""
+    if CURRENT_CHAT_ID:
+        ACTION_LOGS.setdefault(CURRENT_CHAT_ID, []).append(f"🌐 Поиск: {query}")
+    return web_search.search_web(query)
+
 def send_file_to_telegram(filepath: str) -> str:
+    """Отправляет файл с сервера в Telegram пользователю."""
     global CURRENT_CHAT_ID
+    if CURRENT_CHAT_ID:
+        ACTION_LOGS.setdefault(CURRENT_CHAT_ID, []).append(f"📤 Файл: {filepath}")
+    
     if not CURRENT_CHAT_ID: return "Ошибка: ID чата неизвестен."
     if not os.path.exists(filepath): return f"Ошибка: Файл {filepath} не найден."
     
@@ -188,20 +203,17 @@ def init_models(model_name):
         chat_agent = model_agent.start_chat()
         model_advisor = genai.GenerativeModel(model_name=model_name)
     else:
+        # Убрано требование ===SPLIT===. Теперь это умный агент.
         model_agent = genai.GenerativeModel(
             model_name=model_name,
-            # Добавили search_web в список инструментов агента
-            tools=[execute_bash, send_file_to_telegram, search_web],
+            tools=[execute_bash, send_file_to_telegram, search_web_tool],
             system_instruction=(
-                "Ты root-админ Debian. Инструменты: execute_bash, send_file_to_telegram, search_web.\n"
+                "Ты AI-агент и root-админ Debian. Твои инструменты: execute_bash, send_file_to_telegram, search_web_tool.\n"
                 "1. Пакеты: используй apt/apt-get. Ты root, sudo не нужен.\n"
-                "2. Отправка файлов: ТОЛЬКО send_file_to_telegram. Чтение: cat.\n"
-                "3. Ты слышишь аудио и читаешь файлы.\n"
-                "4. Гугли актуальную инфу через search_web, если не знаешь ответа.\n"
-                "ФОРМАТ ОТВЕТА СТРОГО:\n"
-                "Комментарии\n"
-                "===SPLIT===\n"
-                "Голый вывод терминала (БЕЗ markdown/кавычек)."
+                "2. Файлы: чтение через execute_bash (cat, ls), отправка юзеру через send_file_to_telegram.\n"
+                "3. Инфо из сети: используй search_web_tool, если не знаешь актуального ответа.\n"
+                "Вызывай инструменты (даже несколько раз подряд), анализируй их вывод и давай пользователю финальный текстовый ответ в формате Markdown.\n"
+                "Тебе НЕ НУЖНО имитировать консольный вывод, просто отвечай на языке пользователя."
             )
         )
         chat_agent = model_agent.start_chat(enable_automatic_function_calling=True)
@@ -299,13 +311,11 @@ def process_search_query(message):
     
     try:
         output = run_grep_search(words)
-        
         if not output:
             safe_edit_message(message.chat.id, msg_wait.message_id, "🤷‍♂️ По вашему запросу ничего не найдено.")
             return
             
         bot.delete_message(message.chat.id, msg_wait.message_id)
-        
         formatted_chunks, clean_text_for_file = format_search_results(output, words)
             
         for chunk in formatted_chunks[:5]:
@@ -360,6 +370,7 @@ def handle_query(call):
     log_admin_action(call.from_user.id, f"Callback: {call.data}")
     
     global CURRENT_MODEL, PENDING_RETRY_MESSAGE, CURRENT_KEY_NUM, PRIORITY_MODELS_CACHE, OTHER_MODELS_CACHE, AVAILABLE_MODELS
+    global CURRENT_CHAT_ID
     data = call.data
     
     if data == "download_search_txt":
@@ -456,6 +467,11 @@ def handle_query(call):
                 
             clean_name = CURRENT_MODEL.replace('models/', '')
             is_gemma = "gemma" in clean_name.lower()
+            
+            # Очищаем лог действий перед новой сессией
+            CURRENT_CHAT_ID = call.message.chat.id
+            ACTION_LOGS[CURRENT_CHAT_ID] = []
+            
             safe_edit_message(call.message.chat.id, call.message.message_id, f"<b>{clean_name}:</b>\n🧠 Читаю файл...")
             msg_wait = bot.send_message(call.message.chat.id, "🤖 Ожидайте...")
             
@@ -473,26 +489,18 @@ def handle_query(call):
                      response = chat_agent.send_message([gemini_file, "Проанализируй этот файл. Расскажи, что в нём, либо выполни инструкции."])
                 os.remove(temp_file_name)
                 
-                full_text = response.text
-                if is_gemma:
-                    bot.delete_message(chat_id=call.message.chat.id, message_id=msg_wait.message_id)
-                    send_long_text(call.message.chat.id, full_text, first_msg_id=call.message.message_id, prefix=f"<b>{clean_name} (Чат):</b>\n\n")
-                else:
-                    if "===SPLIT===" in full_text:
-                        parts = full_text.split("===SPLIT===", 1)
-                        comment, raw_out = parts[0].strip(), parts[1].strip()
-                    else:
-                        comment, raw_out = "", full_text.strip()
-                        
-                    if comment:
-                        send_long_text(call.message.chat.id, comment, first_msg_id=call.message.message_id, prefix=f"<b>{clean_name}:</b>\n\n")
-                    else:
-                        safe_edit_message(call.message.chat.id, call.message.message_id, f"<b>{clean_name}:</b>")
-                        
-                    if raw_out:
-                        send_long_text(call.message.chat.id, raw_out, first_msg_id=msg_wait.message_id, is_code=True)
-                    else:
-                        safe_edit_message(call.message.chat.id, msg_wait.message_id, "<i>Вывод пуст.</i>")
+                # Достаем список действий, которые ИИ успел выполнить
+                actions = ACTION_LOGS.get(CURRENT_CHAT_ID, [])
+                log_text = ""
+                if actions:
+                    log_text = "<b>🛠 Выполненные действия:</b>\n"
+                    for act in actions:
+                        log_text += f"• <code>{html.escape(act)}</code>\n"
+                    log_text += "\n"
+                
+                bot.delete_message(chat_id=call.message.chat.id, message_id=msg_wait.message_id)
+                prefix = f"<b>{clean_name}:</b>\n\n{log_text}"
+                send_long_text(call.message.chat.id, response.text, first_msg_id=call.message.message_id, prefix=prefix)
                     
             except Exception as e:
                 handle_api_error(e, call.message.chat.id, msg_wait.message_id, None, clean_name)
@@ -521,8 +529,6 @@ def handle_message(message):
     
     is_voice = message.content_type == 'voice'
     is_photo = message.content_type == 'photo'
-    
-    # Берем текст из самого сообщения ИЛИ из подписи к фото
     text = (message.text or message.caption or "").strip()
 
     if not is_voice and not is_photo:
@@ -544,6 +550,9 @@ def handle_message(message):
             except Exception as e:
                 handle_api_error(e, message.chat.id, msg_wait.message_id, message, clean_model_name)
             return
+
+    # Очищаем лог действий ИИ для этого чата перед запросом
+    ACTION_LOGS[CURRENT_CHAT_ID] = []
 
     msg_first = bot.send_message(message.chat.id, f"<b>{clean_model_name}:</b>", parse_mode='HTML')
     msg_wait = bot.send_message(message.chat.id, "🤖 Обрабатываю запрос...")
@@ -583,30 +592,19 @@ def handle_message(message):
         else:
             response = chat_agent.send_message(text)
             
-        full_text = response.text
+        # Формируем итоговый лог действий
+        actions = ACTION_LOGS.get(CURRENT_CHAT_ID, [])
+        log_text = ""
+        if actions:
+            log_text = "<b>🛠 Выполненные действия:</b>\n"
+            for act in actions:
+                log_text += f"• <code>{html.escape(act)}</code>\n"
+            log_text += "\n"
         
-        # Интеллектуальная разбивка и форматирование (Анти-MESSAGE_TOO_LONG)
-        if is_gemma:
-            bot.delete_message(chat_id=message.chat.id, message_id=msg_wait.message_id)
-            prefix = f"<b>{clean_model_name} (Чат):</b>\n\n"
-            send_long_text(message.chat.id, full_text, first_msg_id=msg_first.message_id, prefix=prefix)
-        else:
-            if "===SPLIT===" in full_text:
-                parts = full_text.split("===SPLIT===", 1)
-                comment, raw_out = parts[0].strip(), parts[1].strip()
-            else:
-                comment, raw_out = "", full_text.strip()
-                
-            prefix = f"<b>{clean_model_name}:</b>\n\n"
-            if comment:
-                send_long_text(message.chat.id, comment, first_msg_id=msg_first.message_id, prefix=prefix)
-            else:
-                safe_edit_message(message.chat.id, msg_first.message_id, f"<b>{clean_model_name}:</b>")
-                
-            if raw_out:
-                send_long_text(message.chat.id, raw_out, first_msg_id=msg_wait.message_id, is_code=True)
-            else:
-                safe_edit_message(message.chat.id, msg_wait.message_id, "<i>Вывод терминала пуст.</i>")
+        bot.delete_message(chat_id=message.chat.id, message_id=msg_wait.message_id)
+        
+        prefix = f"<b>{clean_model_name}:</b>\n\n{log_text}"
+        send_long_text(message.chat.id, response.text, first_msg_id=msg_first.message_id, prefix=prefix)
                               
     except Exception as e:
         handle_api_error(e, message.chat.id, msg_wait.message_id, message, clean_model_name)
