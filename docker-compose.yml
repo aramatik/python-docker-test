@@ -5,9 +5,10 @@ services:
     build: .
     container_name: my_ai_admin
     restart: always
+    extra_hosts:
+      - "host.docker.internal:host-gateway" # <--- ДОБАВИТЬ ЭТО
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
-      # Наш портал: папка на сервере = папка в контейнере
       - /root/ai_files:/app/downloads
     environment:
       - TG_TOKEN=${TG_TOKEN}
@@ -17,3 +18,5 @@ services:
       - ADMIN_ID=${ADMIN_ID}
       - ADMIN2_ID=${ADMIN2_ID}
       - ADMIN3_ID=${ADMIN3_ID}
+      - PORTAINER_WEBHOOK=${PORTAINER_WEBHOOK}
+      
