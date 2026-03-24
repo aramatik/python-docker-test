@@ -12,7 +12,7 @@ import edge_tts
 # Импортируем наши внешние модули
 from markdown import split_text_safely, md_to_html
 from search import parse_search_query, run_grep_search, format_search_results
-import web_search # Теперь он делает всю грязную работу с сетью!
+import web_search
 
 # Загружаем ключи
 TG_TOKEN = os.getenv("TG_TOKEN")
@@ -109,7 +109,6 @@ def send_long_text(chat_id, text, first_msg_id=None, is_code=False, prefix="", r
                 bot.send_message(chat_id, chunk.strip(), reply_markup=current_markup)
 
 def clean_text_for_voice(text: str) -> str:
-    """Удаляет код, ссылки, теги и спецсимволы, оставляя чистый текст для диктора."""
     if not text: return ""
     text = re.sub(r'```.*?```', '', text, flags=re.DOTALL)
     text = re.sub(r'`.*?`', '', text)
@@ -122,7 +121,6 @@ def clean_text_for_voice(text: str) -> str:
     return text.strip()
 
 def generate_and_send_voice(chat_id, text):
-    """Генерирует аудио через Edge TTS. Если текст длинный - шлет несколько голосовых с индикацией."""
     clean_text = clean_text_for_voice(text)
     if not clean_text:
         return
@@ -131,8 +129,7 @@ def generate_and_send_voice(chat_id, text):
     total_chunks = len(voice_chunks)
     
     for i, chunk in enumerate(voice_chunks):
-        if not chunk.strip():
-            continue
+        if not chunk.strip(): continue
             
         mp3_path = f"temp_tts_{chat_id}_{i}.mp3"
         ogg_path = f"temp_tts_{chat_id}_{i}.ogg"
@@ -167,13 +164,15 @@ def generate_and_send_voice(chat_id, text):
             if os.path.exists(ogg_path): os.remove(ogg_path)
 
 # --- АГЕНТСКИЕ ИНСТРУМЕНТЫ (TOOLS) ---
+# ВАЖНО: Docstrings (описания в тройных кавычках) жизненно необходимы для Gemini API!
 
 def execute_bash(command: str) -> str:
+    """Выполняет bash-команду в системе Ubuntu (root) и возвращает вывод терминала."""
+    print(f"\n[TOOL] Выполнение bash: {command}")
     if CURRENT_CHAT_ID:
         ACTION_LOGS.setdefault(CURRENT_CHAT_ID, []).append(("bash", command))
-        # Живое уведомление
         try: bot.send_message(CURRENT_CHAT_ID, f"💻 <b>Выполняю команду:</b>\n<pre><code class=\"language-bash\">{html.escape(command)}</code></pre>", parse_mode='HTML')
-        except: pass
+        except Exception as e: print(f"Ошибка отправки лога в ТГ: {e}")
     try:
         result = subprocess.run(command, shell=True, capture_output=True, text=True, timeout=30)
         output = result.stdout if result.stdout else result.stderr
@@ -182,33 +181,37 @@ def execute_bash(command: str) -> str:
         return f"Ошибка: {str(e)}"
 
 def search_web_tool(query: str) -> str:
+    """Ищет информацию в интернете (DuckDuckGo). Принимает поисковый запрос (query) и возвращает список результатов со ссылками."""
+    print(f"\n[TOOL] Поиск в сети: {query}")
     if CURRENT_CHAT_ID:
         ACTION_LOGS.setdefault(CURRENT_CHAT_ID, []).append(("search", query))
-        # Живое уведомление
         try: bot.send_message(CURRENT_CHAT_ID, f"🌐 <b>Ищу в интернете:</b>\n<code>{html.escape(query)}</code>", parse_mode='HTML')
-        except: pass
+        except Exception as e: print(f"Ошибка отправки лога в ТГ: {e}")
     return web_search.search_web(query)
 
 def read_webpage(url: str) -> str:
+    """Читает текстовое содержимое веб-страницы по указанному URL. Используется для парсинга HTML сайтов."""
+    print(f"\n[TOOL] Чтение сайта: {url}")
     if CURRENT_CHAT_ID:
         ACTION_LOGS.setdefault(CURRENT_CHAT_ID, []).append(("read_web", url))
-        # Живое уведомление
         try: bot.send_message(CURRENT_CHAT_ID, f"📖 <b>Читаю сайт:</b>\n<a href=\"{url}\">{html.escape(url)}</a>", parse_mode='HTML')
-        except: pass
+        except Exception as e: print(f"Ошибка отправки лога в ТГ: {e}")
     return web_search.read_url_content(url)
 
 def download_web_file(url: str, filename: str) -> str:
+    """Скачивает файл из интернета по прямой ссылке url и сохраняет локально на сервер под именем filename."""
+    print(f"\n[TOOL] Скачивание файла: {url} -> {filename}")
     if CURRENT_CHAT_ID:
         ACTION_LOGS.setdefault(CURRENT_CHAT_ID, []).append(("download", f"{url} -> {filename}"))
-        # Живое уведомление
         try: bot.send_message(CURRENT_CHAT_ID, f"⬇️ <b>Скачиваю файл:</b>\nОткуда: <code>{html.escape(url)}</code>\nИмя: <code>{html.escape(filename)}</code>", parse_mode='HTML')
-        except: pass
+        except Exception as e: print(f"Ошибка отправки лога в ТГ: {e}")
     
-    # Формируем путь сохранения на сервере
     filepath = os.path.join("/app/downloads", filename)
     return web_search.download_file(url, filepath)
 
 def send_file_to_telegram(filepath: str) -> str:
+    """Отправляет скачанный локальный файл с сервера пользователю в Telegram."""
+    print(f"\n[TOOL] Отправка файла в чат: {filepath}")
     global CURRENT_CHAT_ID
     if CURRENT_CHAT_ID:
         ACTION_LOGS.setdefault(CURRENT_CHAT_ID, []).append(("file", filepath))
@@ -295,6 +298,7 @@ def init_models(model_name):
                 "3. Скачивание: используй мощный инструмент download_web_file(url, filename) для загрузки файлов по прямым ссылкам. Он обходит защиту от ботов.\n"
                 "4. Отправка: скачанные файлы отправляй пользователю через send_file_to_telegram.\n"
                 "5. Пакеты: используй apt/apt-get. Ты root, sudo не нужен.\n"
+                "ЗАПРЕТ БЕСКОНЕЧНОГО ЦИКЛА: Делай максимум 2-3 попытки поиска/чтения. Если не смог найти прямую ссылку — остановись и сообщи об этом пользователю.\n"
                 "Вызывай инструменты (даже несколько раз подряд), анализируй их вывод и давай пользователю финальный текстовый ответ в формате Markdown.\n"
                 "Тебе НЕ НУЖНО имитировать консольный вывод, просто отвечай на языке пользователя."
             )
@@ -772,4 +776,4 @@ def handle_message(message):
 if __name__ == '__main__':
     print(f"AI-Админ запущен. Допущено админов: {len(ADMIN_IDS)}. Режим невидимки включен...")
     bot.polling(none_stop=True)
-    
+                
