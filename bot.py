@@ -8,7 +8,8 @@ import re
 import shlex
 import asyncio
 import edge_tts
-import urllib.request # Добавили для вебхуков
+import urllib.request
+import ssl # Добавили модуль для работы с HTTPS-сертификатами
 
 # Импортируем наши внешние модули
 from markdown import split_text_safely, md_to_html
@@ -51,7 +52,7 @@ PENDING_SEARCH_RESULTS = {}
 # Глобальные журналы и настройки
 ACTION_LOGS = {} 
 LAST_ACTIONS = {} 
-VOICE_MODE = {} 
+VOICE_MODE = {} # Состояние голосовых ответов для чата: {chat_id: bool}
 
 PRIORITY_MODELS = [
     "gemini-2.5-flash",
@@ -111,6 +112,7 @@ def send_long_text(chat_id, text, first_msg_id=None, is_code=False, prefix="", r
                 bot.send_message(chat_id, chunk.strip(), reply_markup=current_markup)
 
 def clean_text_for_voice(text: str) -> str:
+    """Удаляет код, ссылки, теги и спецсимволы, оставляя чистый текст для диктора."""
     if not text: return ""
     text = re.sub(r'```.*?```', '', text, flags=re.DOTALL)
     text = re.sub(r'`.*?`', '', text)
@@ -123,6 +125,7 @@ def clean_text_for_voice(text: str) -> str:
     return text.strip()
 
 def generate_and_send_voice(chat_id, text):
+    """Генерирует аудио через Edge TTS. Если текст длинный - шлет несколько голосовых с индикацией."""
     clean_text = clean_text_for_voice(text)
     if not clean_text:
         return
@@ -131,7 +134,8 @@ def generate_and_send_voice(chat_id, text):
     total_chunks = len(voice_chunks)
     
     for i, chunk in enumerate(voice_chunks):
-        if not chunk.strip(): continue
+        if not chunk.strip():
+            continue
             
         mp3_path = f"temp_tts_{chat_id}_{i}.mp3"
         ogg_path = f"temp_tts_{chat_id}_{i}.ogg"
@@ -160,8 +164,10 @@ def generate_and_send_voice(chat_id, text):
             print(f"Ошибка синтеза голоса (кусок {i}): {e}")
         finally:
             if msg_wait_voice:
-                try: bot.delete_message(chat_id, msg_wait_voice.message_id)
-                except Exception: pass
+                try:
+                    bot.delete_message(chat_id, msg_wait_voice.message_id)
+                except Exception:
+                    pass
             if os.path.exists(mp3_path): os.remove(mp3_path)
             if os.path.exists(ogg_path): os.remove(ogg_path)
 
@@ -339,7 +345,6 @@ def voice_mode_cmd(message):
     )
     bot.reply_to(message, f"🎙 <b>Голосовой ответ ИИ</b>\n\nСейчас: <b>{status_text}</b>", reply_markup=markup, parse_mode='HTML')
 
-# --- НОВАЯ КОМАНДА REDEPLOY ---
 @bot.message_handler(commands=['redeploy'])
 def redeploy_cmd(message):
     if message.from_user.id not in ADMIN_IDS: return
@@ -457,7 +462,6 @@ def handle_query(call):
     global CURRENT_CHAT_ID
     data = call.data
 
-    # --- ОБРАБОТЧИК REDEPLOY ---
     if data == "redeploy_no":
         safe_edit_message(call.message.chat.id, call.message.message_id, "❌ Обновление отменено.")
         return
@@ -471,10 +475,17 @@ def handle_query(call):
         
         try:
             req = urllib.request.Request(PORTAINER_WEBHOOK, method="POST")
-            urllib.request.urlopen(req, timeout=10)
+            
+            # Отключаем проверку самоподписанного SSL-сертификата Portainer
+            ctx = ssl.create_default_context()
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl.CERT_NONE
+            
+            urllib.request.urlopen(req, timeout=10, context=ctx)
+            
             safe_edit_message(call.message.chat.id, call.message.message_id, "✅ <b>Команда успешно отправлена!</b>\nPortainer скачивает обновления с GitHub. Бот переподключится через минуту 🚀", parse_mode='HTML')
         except Exception as e:
-            safe_edit_message(call.message.chat.id, call.message.message_id, f"❌ Ошибка вебхука: {e}")
+            safe_edit_message(call.message.chat.id, call.message.message_id, f"❌ Ошибка вебхука: {html.escape(str(e))}")
         return
 
     if data == "voice_on":
@@ -490,7 +501,8 @@ def handle_query(call):
     if data == "hide_message":
         try:
             bot.delete_message(call.message.chat.id, call.message.message_id)
-        except Exception: pass
+        except Exception:
+            pass
         return
     
     if data == "show_last_actions":
