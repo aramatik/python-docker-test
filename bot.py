@@ -9,7 +9,7 @@ import re
 # Импортируем наши внешние модули
 from markdown import split_text_safely, md_to_html
 from search import parse_search_query, run_grep_search, format_search_results
-import web_search # Импортируем модуль поиска напрямую
+import web_search
 
 # Загружаем ключи
 TG_TOKEN = os.getenv("TG_TOKEN")
@@ -43,8 +43,9 @@ PENDING_RETRY_MESSAGE = None
 PENDING_FILES = {}
 PENDING_SEARCH_RESULTS = {}
 
-# Глобальный журнал действий ИИ-агента для каждого чата
+# Глобальный журнал действий ИИ-агента
 ACTION_LOGS = {} 
+LAST_ACTIONS = {} # Память для работы кнопки "Выполненные действия"
 
 PRIORITY_MODELS = [
     "gemini-2.5-flash",
@@ -78,13 +79,17 @@ def safe_edit_message(chat_id, message_id, text, parse_mode='HTML', reply_markup
         if "message is not modified" not in str(e).lower():
             raise e
 
-def send_long_text(chat_id, text, first_msg_id=None, is_code=False, prefix=""):
-    """Отправляет или обновляет сообщение с учетом лимитов Telegram и разметки"""
+def send_long_text(chat_id, text, first_msg_id=None, is_code=False, prefix="", reply_markup=None):
+    """Отправляет или обновляет сообщение с учетом лимитов Telegram, разметки и кнопок"""
     if not text: return
     text = text.replace('\r\n', '\n')
     chunks = split_text_safely(text, max_len=3500)
     
     for i, chunk in enumerate(chunks):
+        # Кнопку добавляем только к самому последнему куску текста
+        is_last = (i == len(chunks) - 1)
+        current_markup = reply_markup if is_last else None
+        
         if is_code:
             formatted = f'<pre><code class="language-bash">{html.escape(chunk.strip())}</code></pre>'
         else:
@@ -93,14 +98,14 @@ def send_long_text(chat_id, text, first_msg_id=None, is_code=False, prefix=""):
             
         if i == 0 and first_msg_id:
             try:
-                safe_edit_message(chat_id, first_msg_id, formatted, parse_mode='HTML')
+                safe_edit_message(chat_id, first_msg_id, formatted, parse_mode='HTML', reply_markup=current_markup)
             except Exception:
-                safe_edit_message(chat_id, first_msg_id, f"{prefix}{chunk.strip()}" if i==0 else chunk.strip())
+                safe_edit_message(chat_id, first_msg_id, f"{prefix}{chunk.strip()}" if i==0 else chunk.strip(), reply_markup=current_markup)
         else:
             try:
-                bot.send_message(chat_id, formatted, parse_mode='HTML')
+                bot.send_message(chat_id, formatted, parse_mode='HTML', reply_markup=current_markup)
             except Exception:
-                bot.send_message(chat_id, chunk.strip())
+                bot.send_message(chat_id, chunk.strip(), reply_markup=current_markup)
 
 # --- АГЕНТСКИЕ ИНСТРУМЕНТЫ (TOOLS) С ЛОГИРОВАНИЕМ ---
 
@@ -108,7 +113,7 @@ def execute_bash(command: str) -> str:
     """Выполняет bash команду на сервере."""
     print(f"Выполнение: {command}")
     if CURRENT_CHAT_ID:
-        ACTION_LOGS.setdefault(CURRENT_CHAT_ID, []).append(f"💻 Bash: {command}")
+        ACTION_LOGS.setdefault(CURRENT_CHAT_ID, []).append(("bash", command))
     try:
         result = subprocess.run(command, shell=True, capture_output=True, text=True, timeout=30)
         output = result.stdout if result.stdout else result.stderr
@@ -119,14 +124,14 @@ def execute_bash(command: str) -> str:
 def search_web_tool(query: str) -> str:
     """Ищет информацию в интернете."""
     if CURRENT_CHAT_ID:
-        ACTION_LOGS.setdefault(CURRENT_CHAT_ID, []).append(f"🌐 Поиск: {query}")
+        ACTION_LOGS.setdefault(CURRENT_CHAT_ID, []).append(("search", query))
     return web_search.search_web(query)
 
 def send_file_to_telegram(filepath: str) -> str:
     """Отправляет файл с сервера в Telegram пользователю."""
     global CURRENT_CHAT_ID
     if CURRENT_CHAT_ID:
-        ACTION_LOGS.setdefault(CURRENT_CHAT_ID, []).append(f"📤 Файл: {filepath}")
+        ACTION_LOGS.setdefault(CURRENT_CHAT_ID, []).append(("file", filepath))
     
     if not CURRENT_CHAT_ID: return "Ошибка: ID чата неизвестен."
     if not os.path.exists(filepath): return f"Ошибка: Файл {filepath} не найден."
@@ -203,7 +208,6 @@ def init_models(model_name):
         chat_agent = model_agent.start_chat()
         model_advisor = genai.GenerativeModel(model_name=model_name)
     else:
-        # Убрано требование ===SPLIT===. Теперь это умный агент.
         model_agent = genai.GenerativeModel(
             model_name=model_name,
             tools=[execute_bash, send_file_to_telegram, search_web_tool],
@@ -373,6 +377,33 @@ def handle_query(call):
     global CURRENT_CHAT_ID
     data = call.data
     
+    # --- ОБРАБОТЧИК КНОПКИ ВЫВОДА ДЕЙСТВИЙ ИИ ---
+    if data == "show_last_actions":
+        actions = LAST_ACTIONS.get(call.message.chat.id)
+        if not actions:
+            bot.answer_callback_query(call.id, "❌ Нет данных о последних действиях.", show_alert=True)
+            return
+            
+        log_text = "<b>🛠 Выполненные действия:</b>\n\n"
+        bash_commands = []
+        
+        for act_type, act_val in actions:
+            if act_type == "bash":
+                bash_commands.append(act_val)
+            elif act_type == "search":
+                log_text += f"🌐 <b>Поиск:</b> <i>{html.escape(act_val)}</i>\n"
+            elif act_type == "file":
+                log_text += f"📤 <b>Отправлен файл:</b> <i>{html.escape(act_val)}</i>\n"
+        
+        # Bash команды оборачиваем в блок кода для появления кнопки "Копировать"
+        if bash_commands:
+            bash_str = "\n".join(bash_commands)
+            log_text += f'\n<pre><code class="language-bash">{html.escape(bash_str)}</code></pre>'
+            
+        bot.send_message(call.message.chat.id, log_text.strip(), parse_mode='HTML')
+        bot.answer_callback_query(call.id)
+        return
+
     if data == "download_search_txt":
         full_text = PENDING_SEARCH_RESULTS.get(call.message.chat.id)
         if not full_text:
@@ -468,7 +499,7 @@ def handle_query(call):
             clean_name = CURRENT_MODEL.replace('models/', '')
             is_gemma = "gemma" in clean_name.lower()
             
-            # Очищаем лог действий перед новой сессией
+            # Сбрасываем лог инструментов
             CURRENT_CHAT_ID = call.message.chat.id
             ACTION_LOGS[CURRENT_CHAT_ID] = []
             
@@ -489,18 +520,17 @@ def handle_query(call):
                      response = chat_agent.send_message([gemini_file, "Проанализируй этот файл. Расскажи, что в нём, либо выполни инструкции."])
                 os.remove(temp_file_name)
                 
-                # Достаем список действий, которые ИИ успел выполнить
-                actions = ACTION_LOGS.get(CURRENT_CHAT_ID, [])
-                log_text = ""
-                if actions:
-                    log_text = "<b>🛠 Выполненные действия:</b>\n"
-                    for act in actions:
-                        log_text += f"• <code>{html.escape(act)}</code>\n"
-                    log_text += "\n"
-                
                 bot.delete_message(chat_id=call.message.chat.id, message_id=msg_wait.message_id)
-                prefix = f"<b>{clean_name}:</b>\n\n{log_text}"
-                send_long_text(call.message.chat.id, response.text, first_msg_id=call.message.message_id, prefix=prefix)
+                
+                # Создаем кнопку, если ИИ пользовался инструментами
+                markup = None
+                if ACTION_LOGS.get(CURRENT_CHAT_ID):
+                    LAST_ACTIONS[CURRENT_CHAT_ID] = ACTION_LOGS[CURRENT_CHAT_ID].copy()
+                    markup = InlineKeyboardMarkup()
+                    markup.add(InlineKeyboardButton("🛠 Выполненные действия", callback_data="show_last_actions"))
+                
+                prefix = f"<b>{clean_name}:</b>\n\n"
+                send_long_text(call.message.chat.id, response.text, first_msg_id=call.message.message_id, prefix=prefix, reply_markup=markup)
                     
             except Exception as e:
                 handle_api_error(e, call.message.chat.id, msg_wait.message_id, None, clean_name)
@@ -537,6 +567,7 @@ def handle_message(message):
             log_admin_action(message.from_user.id, f"Прямая команда: {cmd}")
             bot.send_message(message.chat.id, f"⚡ Выполняю напрямую:\n<code>{html.escape(cmd)}</code>", parse_mode='HTML')
             result = execute_bash(cmd)
+            # Прямые команды тоже использую блок кода для вывода
             send_long_text(message.chat.id, result, is_code=True)
             return
 
@@ -592,19 +623,17 @@ def handle_message(message):
         else:
             response = chat_agent.send_message(text)
             
-        # Формируем итоговый лог действий
-        actions = ACTION_LOGS.get(CURRENT_CHAT_ID, [])
-        log_text = ""
-        if actions:
-            log_text = "<b>🛠 Выполненные действия:</b>\n"
-            for act in actions:
-                log_text += f"• <code>{html.escape(act)}</code>\n"
-            log_text += "\n"
-        
         bot.delete_message(chat_id=message.chat.id, message_id=msg_wait.message_id)
         
-        prefix = f"<b>{clean_model_name}:</b>\n\n{log_text}"
-        send_long_text(message.chat.id, response.text, first_msg_id=msg_first.message_id, prefix=prefix)
+        # Создаем кнопку, если ИИ пользовался инструментами
+        markup = None
+        if ACTION_LOGS.get(CURRENT_CHAT_ID):
+            LAST_ACTIONS[CURRENT_CHAT_ID] = ACTION_LOGS[CURRENT_CHAT_ID].copy()
+            markup = InlineKeyboardMarkup()
+            markup.add(InlineKeyboardButton("🛠 Выполненные действия", callback_data="show_last_actions"))
+        
+        prefix = f"<b>{clean_model_name}:</b>\n\n"
+        send_long_text(message.chat.id, response.text, first_msg_id=msg_first.message_id, prefix=prefix, reply_markup=markup)
                               
     except Exception as e:
         handle_api_error(e, message.chat.id, msg_wait.message_id, message, clean_model_name)
