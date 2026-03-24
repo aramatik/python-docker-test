@@ -8,6 +8,9 @@ import re
 import shlex
 import asyncio
 import edge_tts
+import urllib.request
+import ssl
+import shutil # Добавили для безопасного сохранения больших файлов
 
 # Импортируем наши внешние модули
 from markdown import split_text_safely, md_to_html
@@ -109,7 +112,6 @@ def send_long_text(chat_id, text, first_msg_id=None, is_code=False, prefix="", r
                 bot.send_message(chat_id, chunk.strip(), reply_markup=current_markup)
 
 def clean_text_for_voice(text: str) -> str:
-    """Удаляет код, ссылки, теги и спецсимволы, оставляя чистый текст для диктора."""
     if not text: return ""
     text = re.sub(r'```.*?```', '', text, flags=re.DOTALL)
     text = re.sub(r'`.*?`', '', text)
@@ -122,7 +124,6 @@ def clean_text_for_voice(text: str) -> str:
     return text.strip()
 
 def generate_and_send_voice(chat_id, text):
-    """Генерирует аудио через Edge TTS. Если текст длинный - шлет несколько голосовых с индикацией."""
     clean_text = clean_text_for_voice(text)
     if not clean_text:
         return
@@ -131,8 +132,7 @@ def generate_and_send_voice(chat_id, text):
     total_chunks = len(voice_chunks)
     
     for i, chunk in enumerate(voice_chunks):
-        if not chunk.strip():
-            continue
+        if not chunk.strip(): continue
             
         mp3_path = f"temp_tts_{chat_id}_{i}.mp3"
         ogg_path = f"temp_tts_{chat_id}_{i}.ogg"
@@ -161,10 +161,8 @@ def generate_and_send_voice(chat_id, text):
             print(f"Ошибка синтеза голоса (кусок {i}): {e}")
         finally:
             if msg_wait_voice:
-                try:
-                    bot.delete_message(chat_id, msg_wait_voice.message_id)
-                except Exception:
-                    pass
+                try: bot.delete_message(chat_id, msg_wait_voice.message_id)
+                except Exception: pass
             if os.path.exists(mp3_path): os.remove(mp3_path)
             if os.path.exists(ogg_path): os.remove(ogg_path)
 
@@ -185,6 +183,57 @@ def search_web_tool(query: str) -> str:
     if CURRENT_CHAT_ID:
         ACTION_LOGS.setdefault(CURRENT_CHAT_ID, []).append(("search", query))
     return web_search.search_web(query)
+
+def read_webpage(url: str) -> str:
+    """Инструмент для парсинга текстового содержимого сайтов."""
+    if CURRENT_CHAT_ID:
+        ACTION_LOGS.setdefault(CURRENT_CHAT_ID, []).append(("read_web", url))
+    try:
+        req = urllib.request.Request(url, headers={
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8'
+        })
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        
+        with urllib.request.urlopen(req, timeout=15, context=ctx) as response:
+            html_content = response.read().decode('utf-8', errors='ignore')
+            
+        # Грубая, но эффективная очистка HTML от скриптов и тегов
+        text = re.sub(r'<style.*?</style>', '', html_content, flags=re.DOTALL|re.IGNORECASE)
+        text = re.sub(r'<script.*?</script>', '', text, flags=re.DOTALL|re.IGNORECASE)
+        text = re.sub(r'<[^>]+>', ' ', text)
+        text = re.sub(r'\s+', ' ', text).strip()
+        
+        # Возвращаем первые 5000 символов, чтобы не забить контекст ИИ
+        return text[:5000] if text else "Сайт пуст или блокирует парсинг."
+    except Exception as e:
+        return f"Ошибка чтения сайта: {str(e)}"
+
+def download_web_file(url: str, filename: str) -> str:
+    """Мощный загрузчик с User-Agent браузера."""
+    if CURRENT_CHAT_ID:
+        ACTION_LOGS.setdefault(CURRENT_CHAT_ID, []).append(("download", f"{url} -> {filename}"))
+    try:
+        req = urllib.request.Request(url, headers={
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+            'Accept-Language': 'ru-RU,ru;q=0.8,en-US;q=0.5,en;q=0.3',
+        })
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+
+        os.makedirs("/app/downloads", exist_ok=True)
+        filepath = os.path.join("/app/downloads", filename)
+
+        with urllib.request.urlopen(req, timeout=30, context=ctx) as response, open(filepath, 'wb') as out_file:
+            shutil.copyfileobj(response, out_file)
+
+        return f"Успех! Файл сохранен по пути: {filepath}\nМожешь отправить его пользователю через send_file_to_telegram."
+    except Exception as e:
+        return f"Ошибка скачивания: {str(e)}"
 
 def send_file_to_telegram(filepath: str) -> str:
     global CURRENT_CHAT_ID
@@ -265,12 +314,16 @@ def init_models(model_name):
     else:
         model_agent = genai.GenerativeModel(
             model_name=model_name,
-            tools=[execute_bash, send_file_to_telegram, search_web_tool],
+            # ДОБАВИЛИ НОВЫЕ ИНСТРУМЕНТЫ СЮДА:
+            tools=[execute_bash, send_file_to_telegram, search_web_tool, read_webpage, download_web_file],
+            # ПРОКАЧАЛИ СИСТЕМНЫЙ ПРОМПТ
             system_instruction=(
-                "Ты AI-агент и root-админ Ubuntu. Твои инструменты: execute_bash, send_file_to_telegram, search_web_tool.\n"
-                "1. Пакеты: используй apt/apt-get. Ты root, sudo не нужен.\n"
-                "2. Файлы: чтение через execute_bash (cat, ls), отправка юзеру через send_file_to_telegram.\n"
-                "3. Инфо из сети: используй search_web_tool, если не знаешь актуального ответа.\n"
+                "Ты AI-агент и root-админ Ubuntu. Твои инструменты: execute_bash, send_file_to_telegram, search_web_tool, read_webpage, download_web_file.\n"
+                "1. Поиск: используй search_web_tool. Ты МОЖЕШЬ использовать операторы: site:example.com, ext:pdf, filetype:sh, \"точная фраза\".\n"
+                "2. Парсинг: если поиск нашел интересную страницу, используй read_webpage(url), чтобы прочитать её текст и найти прямую ссылку на скачивание или информацию.\n"
+                "3. Скачивание: используй мощный инструмент download_web_file(url, filename) для загрузки файлов по прямым ссылкам. Он обходит защиту от ботов.\n"
+                "4. Отправка: скачанные файлы отправляй пользователю через send_file_to_telegram.\n"
+                "5. Пакеты: используй apt/apt-get. Ты root, sudo не нужен.\n"
                 "Вызывай инструменты (даже несколько раз подряд), анализируй их вывод и давай пользователю финальный текстовый ответ в формате Markdown.\n"
                 "Тебе НЕ НУЖНО имитировать консольный вывод, просто отвечай на языке пользователя."
             )
@@ -478,6 +531,10 @@ def handle_query(call):
                 bash_commands.append(act_val)
             elif act_type == "search":
                 log_text += f"🌐 <b>Поиск:</b> <i>{html.escape(act_val)}</i>\n"
+            elif act_type == "read_web": # Добавили вывод в лог
+                log_text += f"📖 <b>Чтение сайта:</b> <i>{html.escape(act_val)}</i>\n"
+            elif act_type == "download": # Добавили вывод в лог
+                log_text += f"⬇️ <b>Скачивание:</b> <i>{html.escape(act_val)}</i>\n"
             elif act_type == "file":
                 log_text += f"📤 <b>Отправлен файл:</b> <i>{html.escape(act_val)}</i>\n"
         
@@ -746,4 +803,4 @@ def handle_message(message):
 if __name__ == '__main__':
     print(f"AI-Админ запущен. Допущено админов: {len(ADMIN_IDS)}. Режим невидимки включен...")
     bot.polling(none_stop=True)
-            
+    
