@@ -10,7 +10,7 @@ RUN apt-get update && apt-get install -y \
 COPY requirements.txt .
 
 # Добавили установку edge-tts
-RUN pip install --no-cache-dir -r requirements.txt ddgs edge-tts
+RUN pip install --no-cache-dir -r requirements.txt duckduckgo-search edge-tts
 
 COPY . .
 
