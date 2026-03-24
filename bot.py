@@ -8,6 +8,7 @@ import re
 import shlex
 import asyncio
 import edge_tts
+import urllib.request # Добавили для вебхуков
 
 # Импортируем наши внешние модули
 from markdown import split_text_safely, md_to_html
@@ -19,6 +20,7 @@ TG_TOKEN = os.getenv("TG_TOKEN")
 API_KEY_1 = os.getenv("GEMINI_API_KEY")
 API_KEY_2 = os.getenv("GEMINI2_API_KEY")
 API_KEY_3 = os.getenv("GEMINI3_API_KEY")
+PORTAINER_WEBHOOK = os.getenv("PORTAINER_WEBHOOK") # Ссылка для редеплоя
 
 # Безопасно собираем все ID админов в множество
 ADMIN_IDS = set()
@@ -49,7 +51,7 @@ PENDING_SEARCH_RESULTS = {}
 # Глобальные журналы и настройки
 ACTION_LOGS = {} 
 LAST_ACTIONS = {} 
-VOICE_MODE = {} # Состояние голосовых ответов для чата: {chat_id: bool}
+VOICE_MODE = {} 
 
 PRIORITY_MODELS = [
     "gemini-2.5-flash",
@@ -109,7 +111,6 @@ def send_long_text(chat_id, text, first_msg_id=None, is_code=False, prefix="", r
                 bot.send_message(chat_id, chunk.strip(), reply_markup=current_markup)
 
 def clean_text_for_voice(text: str) -> str:
-    """Удаляет код, ссылки, теги и спецсимволы, оставляя чистый текст для диктора."""
     if not text: return ""
     text = re.sub(r'```.*?```', '', text, flags=re.DOTALL)
     text = re.sub(r'`.*?`', '', text)
@@ -122,21 +123,23 @@ def clean_text_for_voice(text: str) -> str:
     return text.strip()
 
 def generate_and_send_voice(chat_id, text):
-    """Генерирует аудио через Edge TTS. Если текст длинный - шлет несколько голосовых."""
     clean_text = clean_text_for_voice(text)
     if not clean_text:
         return
         
     voice_chunks = split_text_safely(clean_text, max_len=2000)
+    total_chunks = len(voice_chunks)
     
     for i, chunk in enumerate(voice_chunks):
-        if not chunk.strip():
-            continue
+        if not chunk.strip(): continue
             
         mp3_path = f"temp_tts_{chat_id}_{i}.mp3"
         ogg_path = f"temp_tts_{chat_id}_{i}.ogg"
+        msg_wait_voice = None
         
         try:
+            part_text = f" [часть {i+1}/{total_chunks}]" if total_chunks > 1 else ""
+            msg_wait_voice = bot.send_message(chat_id, f"🎙 <i>Отправка голосового сообщения{part_text}...</i>", parse_mode='HTML')
             bot.send_chat_action(chat_id, 'record_voice')
             
             async def _generate():
@@ -156,6 +159,9 @@ def generate_and_send_voice(chat_id, text):
         except Exception as e:
             print(f"Ошибка синтеза голоса (кусок {i}): {e}")
         finally:
+            if msg_wait_voice:
+                try: bot.delete_message(chat_id, msg_wait_voice.message_id)
+                except Exception: pass
             if os.path.exists(mp3_path): os.remove(mp3_path)
             if os.path.exists(ogg_path): os.remove(ogg_path)
 
@@ -333,6 +339,19 @@ def voice_mode_cmd(message):
     )
     bot.reply_to(message, f"🎙 <b>Голосовой ответ ИИ</b>\n\nСейчас: <b>{status_text}</b>", reply_markup=markup, parse_mode='HTML')
 
+# --- НОВАЯ КОМАНДА REDEPLOY ---
+@bot.message_handler(commands=['redeploy'])
+def redeploy_cmd(message):
+    if message.from_user.id not in ADMIN_IDS: return
+    log_admin_action(message.from_user.id, "Команда /redeploy")
+    
+    markup = InlineKeyboardMarkup()
+    markup.row(
+        InlineKeyboardButton("✅ Да, обновить", callback_data="redeploy_yes"),
+        InlineKeyboardButton("❌ Отмена", callback_data="redeploy_no")
+    )
+    bot.reply_to(message, "⚠️ <b>Внимание!</b>\nВы уверены, что хотите запустить Pull & Redeploy из GitHub?\nБот будет недоступен пару минут во время пересборки.", reply_markup=markup, parse_mode='HTML')
+
 @bot.message_handler(commands=['clear'])
 def clear_cmd(message):
     if message.from_user.id not in ADMIN_IDS: return
@@ -438,6 +457,26 @@ def handle_query(call):
     global CURRENT_CHAT_ID
     data = call.data
 
+    # --- ОБРАБОТЧИК REDEPLOY ---
+    if data == "redeploy_no":
+        safe_edit_message(call.message.chat.id, call.message.message_id, "❌ Обновление отменено.")
+        return
+
+    if data == "redeploy_yes":
+        if not PORTAINER_WEBHOOK:
+            safe_edit_message(call.message.chat.id, call.message.message_id, "❌ <b>Ошибка:</b> Не задана переменная PORTAINER_WEBHOOK!\nДобавьте ссылку из Portainer в docker-compose.yml", parse_mode='HTML')
+            return
+            
+        safe_edit_message(call.message.chat.id, call.message.message_id, "⏳ Отправляю команду в Portainer на обновление (Pull & Redeploy)...")
+        
+        try:
+            req = urllib.request.Request(PORTAINER_WEBHOOK, method="POST")
+            urllib.request.urlopen(req, timeout=10)
+            safe_edit_message(call.message.chat.id, call.message.message_id, "✅ <b>Команда успешно отправлена!</b>\nPortainer скачивает обновления с GitHub. Бот переподключится через минуту 🚀", parse_mode='HTML')
+        except Exception as e:
+            safe_edit_message(call.message.chat.id, call.message.message_id, f"❌ Ошибка вебхука: {e}")
+        return
+
     if data == "voice_on":
         VOICE_MODE[call.message.chat.id] = True
         safe_edit_message(call.message.chat.id, call.message.message_id, "🟢 Голосовой режим <b>ВКЛЮЧЕН</b>.\nИИ будет озвучивать свои ответы.", parse_mode='HTML')
@@ -451,8 +490,7 @@ def handle_query(call):
     if data == "hide_message":
         try:
             bot.delete_message(call.message.chat.id, call.message.message_id)
-        except Exception:
-            pass
+        except Exception: pass
         return
     
     if data == "show_last_actions":
@@ -642,6 +680,7 @@ def handle_message(message):
         elif cmd == '/gemini': change_model(message)
         elif cmd == '/changekey': change_key_cmd(message)
         elif cmd == '/start': send_welcome(message)
+        elif cmd == '/redeploy': redeploy_cmd(message)
         else: bot.reply_to(message, "⚠️ Неизвестная команда. ИИ игнорирует сообщения со слэшем (/).")
         return
 
@@ -692,8 +731,7 @@ def handle_message(message):
             if is_gemma:
                  response = chat_agent.send_message("Я получил аудио, но я текстовая модель Gemma и не умею слушать звук.")
             else:
-                 # Улучшенный, жесткий промпт, чтобы ИИ не "ленился" и не включал заглушки
-                 base_prompt = "Обязательно прослушай этот аудиофайл. Если в нём звучит команда или задача для сервера — выполни её. Если это вопрос — ответь на него."
+                 base_prompt = "Обязательно прослушай этот аудиофайл. Если в нём звучит команда или задача для сервера — выполни её. Если это обычный разговор или вопрос — просто ответь на него."
                  prompt = f"{text}\n\n{base_prompt}" if text else base_prompt
                  response = chat_agent.send_message([audio_file, prompt])
                  
@@ -738,4 +776,3 @@ def handle_message(message):
 if __name__ == '__main__':
     print(f"AI-Админ запущен. Допущено админов: {len(ADMIN_IDS)}. Режим невидимки включен...")
     bot.polling(none_stop=True)
-            
