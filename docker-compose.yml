@@ -18,5 +18,3 @@ services:
       - ADMIN_ID=${ADMIN_ID}
       - ADMIN2_ID=${ADMIN2_ID}
       - ADMIN3_ID=${ADMIN3_ID}
-      - PORTAINER_WEBHOOK=${PORTAINER_WEBHOOK}
-      
