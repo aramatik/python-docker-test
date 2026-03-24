@@ -377,6 +377,14 @@ def handle_query(call):
     global CURRENT_CHAT_ID
     data = call.data
     
+    # --- ОБРАБОТЧИК КНОПКИ СКРЫТИЯ СООБЩЕНИЯ ---
+    if data == "hide_message":
+        try:
+            bot.delete_message(call.message.chat.id, call.message.message_id)
+        except Exception:
+            pass
+        return
+    
     # --- ОБРАБОТЧИК КНОПКИ ВЫВОДА ДЕЙСТВИЙ ИИ ---
     if data == "show_last_actions":
         actions = LAST_ACTIONS.get(call.message.chat.id)
@@ -395,12 +403,15 @@ def handle_query(call):
             elif act_type == "file":
                 log_text += f"📤 <b>Отправлен файл:</b> <i>{html.escape(act_val)}</i>\n"
         
-        # Bash команды оборачиваем в блок кода для появления кнопки "Копировать"
         if bash_commands:
             bash_str = "\n".join(bash_commands)
             log_text += f'\n<pre><code class="language-bash">{html.escape(bash_str)}</code></pre>'
             
-        bot.send_message(call.message.chat.id, log_text.strip(), parse_mode='HTML')
+        # Добавляем кнопку "Скрыть"
+        hide_markup = InlineKeyboardMarkup()
+        hide_markup.add(InlineKeyboardButton("❌ Скрыть", callback_data="hide_message"))
+            
+        bot.send_message(call.message.chat.id, log_text.strip(), parse_mode='HTML', reply_markup=hide_markup)
         bot.answer_callback_query(call.id)
         return
 
@@ -529,7 +540,7 @@ def handle_query(call):
                     markup = InlineKeyboardMarkup()
                     markup.add(InlineKeyboardButton("🛠 Выполненные действия", callback_data="show_last_actions"))
                 
-                prefix = f"<b>{clean_name}:</b>\n\n"
+                prefix = f"<b>{clean_model_name}:</b>\n\n"
                 send_long_text(call.message.chat.id, response.text, first_msg_id=call.message.message_id, prefix=prefix, reply_markup=markup)
                     
             except Exception as e:
