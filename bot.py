@@ -392,7 +392,7 @@ def handle_query(call):
             bot.answer_callback_query(call.id, "❌ Нет данных о последних действиях.", show_alert=True)
             return
             
-        log_text = "<b>🛠 Выполненные действия:</b>\n\n"
+        log_text = ""
         bash_commands = []
         
         for act_type, act_val in actions:
@@ -405,7 +405,11 @@ def handle_query(call):
         
         if bash_commands:
             bash_str = "\n".join(bash_commands)
-            log_text += f'\n<pre><code class="language-bash">{html.escape(bash_str)}</code></pre>'
+            # Если есть другой текст (поиск/файл), делаем отступ перед bash, иначе выводим сразу
+            if log_text:
+                log_text += f'\n<pre><code class="language-bash">{html.escape(bash_str)}</code></pre>'
+            else:
+                log_text += f'<pre><code class="language-bash">{html.escape(bash_str)}</code></pre>'
             
         # Добавляем кнопку "Скрыть"
         hide_markup = InlineKeyboardMarkup()
