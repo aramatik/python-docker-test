@@ -109,45 +109,70 @@ def send_long_text(chat_id, text, first_msg_id=None, is_code=False, prefix="", r
                 bot.send_message(chat_id, chunk.strip(), reply_markup=current_markup)
 
 def clean_text_for_voice(text: str) -> str:
-    """Удаляет код, теги и спецсимволы, оставляя чистый текст для нейросети."""
+    """Удаляет код, ссылки, теги и спецсимволы, оставляя чистый текст для диктора."""
     if not text: return ""
+    # Вырезаем многострочные блоки кода
     text = re.sub(r'```.*?```', '', text, flags=re.DOTALL)
+    # Вырезаем короткий инлайн-код
     text = re.sub(r'`.*?`', '', text)
+    # Вырезаем любые ссылки (начинающиеся с http, https или www)
+    text = re.sub(r'https?://\S+|www\.\S+', '', text)
+    # Вырезаем HTML-теги
     text = re.sub(r'<[^>]*>', '', text)
-    text = re.sub(r'[*#_~]', '', text)
+    # Вырезаем спецсимволы и Markdown-разметку (включая скобки и собачки)
+    text = re.sub(r'[*#_~()\[\]{}<>@|\\/]', '', text)
+    
+    # Заменяем переносы строк на точки, чтобы диктор делал естественные паузы
+    text = text.replace('\n', '. ')
+    # Убираем дублирующиеся точки и лишние пробелы
+    text = re.sub(r'\.{2,}', '.', text)
+    text = re.sub(r'\s{2,}', ' ', text)
+    
     return text.strip()
 
 def generate_and_send_voice(chat_id, text):
-    """Генерирует нейросетевое аудио через Edge TTS и отправляет в Telegram."""
+    """Генерирует аудио через Edge TTS. Если текст длинный - шлет несколько голосовых."""
     clean_text = clean_text_for_voice(text)
     if not clean_text:
         return
         
-    clean_text = clean_text[:3000] # Ограничение длины
-    mp3_path = f"temp_tts_{chat_id}.mp3"
-    ogg_path = f"temp_tts_{chat_id}.ogg"
+    # Разбиваем очищенный текст на куски по ~2000 символов (используем нашу функцию разбивки)
+    voice_chunks = split_text_safely(clean_text, max_len=2000)
     
-    try:
-        # Асинхронная генерация речи (голос Светланы, женский, русский)
-        async def _generate():
-            communicate = edge_tts.Communicate(clean_text, "ru-RU-SvetlanaNeural")
-            await communicate.save(mp3_path)
+    for i, chunk in enumerate(voice_chunks):
+        if not chunk.strip():
+            continue
             
-        asyncio.run(_generate())
+        # Уникальные имена файлов для каждого куска
+        mp3_path = f"temp_tts_{chat_id}_{i}.mp3"
+        ogg_path = f"temp_tts_{chat_id}_{i}.ogg"
         
-        # Конвертация в OGG Opus для Telegram
-        if os.path.exists(mp3_path):
-            ffmpeg_cmd = f"ffmpeg -i {mp3_path} -c:a libopus -b:a 32k -v quiet -y {ogg_path}"
-            subprocess.run(ffmpeg_cmd, shell=True, timeout=60)
+        try:
+            # Анимация "Записывает голосовое сообщение..."
+            bot.send_chat_action(chat_id, 'record_voice')
             
-            if os.path.exists(ogg_path):
-                with open(ogg_path, 'rb') as voice_file:
-                    bot.send_voice(chat_id, voice_file)
-    except Exception as e:
-        print(f"Ошибка синтеза голоса (Edge TTS): {e}")
-    finally:
-        if os.path.exists(mp3_path): os.remove(mp3_path)
-        if os.path.exists(ogg_path): os.remove(ogg_path)
+            # Асинхронная генерация речи
+            async def _generate():
+                communicate = edge_tts.Communicate(chunk, "ru-RU-SvetlanaNeural")
+                await communicate.save(mp3_path)
+                
+            asyncio.run(_generate())
+            
+            # Конвертация и отправка
+            if os.path.exists(mp3_path):
+                ffmpeg_cmd = f"ffmpeg -i {mp3_path} -c:a libopus -b:a 32k -v quiet -y {ogg_path}"
+                subprocess.run(ffmpeg_cmd, shell=True, timeout=60)
+                
+                if os.path.exists(ogg_path):
+                    with open(ogg_path, 'rb') as voice_file:
+                        bot.send_voice(chat_id, voice_file)
+                        
+        except Exception as e:
+            print(f"Ошибка синтеза голоса (кусок {i}): {e}")
+        finally:
+            # Очистка временных файлов
+            if os.path.exists(mp3_path): os.remove(mp3_path)
+            if os.path.exists(ogg_path): os.remove(ogg_path)
 
 # --- АГЕНТСКИЕ ИНСТРУМЕНТЫ (TOOLS) ---
 
@@ -603,7 +628,6 @@ def handle_query(call):
                 send_long_text(call.message.chat.id, response.text, first_msg_id=call.message.message_id, prefix=prefix, reply_markup=markup)
                 
                 if VOICE_MODE.get(call.message.chat.id):
-                    bot.send_chat_action(call.message.chat.id, 'record_voice')
                     generate_and_send_voice(call.message.chat.id, response.text)
                     
             except Exception as e:
@@ -719,7 +743,6 @@ def handle_message(message):
         send_long_text(message.chat.id, response.text, first_msg_id=msg_first.message_id, prefix=prefix, reply_markup=markup)
         
         if VOICE_MODE.get(message.chat.id):
-            bot.send_chat_action(message.chat.id, 'record_voice')
             generate_and_send_voice(message.chat.id, response.text)
                               
     except Exception as e:
@@ -728,3 +751,4 @@ def handle_message(message):
 if __name__ == '__main__':
     print(f"AI-Админ запущен. Допущено админов: {len(ADMIN_IDS)}. Режим невидимки включен...")
     bot.polling(none_stop=True)
+        
