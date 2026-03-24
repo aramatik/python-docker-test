@@ -8,8 +8,6 @@ import re
 import shlex
 import asyncio
 import edge_tts
-import urllib.request
-import ssl # Добавили модуль для работы с HTTPS-сертификатами
 
 # Импортируем наши внешние модули
 from markdown import split_text_safely, md_to_html
@@ -21,7 +19,6 @@ TG_TOKEN = os.getenv("TG_TOKEN")
 API_KEY_1 = os.getenv("GEMINI_API_KEY")
 API_KEY_2 = os.getenv("GEMINI2_API_KEY")
 API_KEY_3 = os.getenv("GEMINI3_API_KEY")
-PORTAINER_WEBHOOK = os.getenv("PORTAINER_WEBHOOK") # Ссылка для редеплоя
 
 # Безопасно собираем все ID админов в множество
 ADMIN_IDS = set()
@@ -345,18 +342,6 @@ def voice_mode_cmd(message):
     )
     bot.reply_to(message, f"🎙 <b>Голосовой ответ ИИ</b>\n\nСейчас: <b>{status_text}</b>", reply_markup=markup, parse_mode='HTML')
 
-@bot.message_handler(commands=['redeploy'])
-def redeploy_cmd(message):
-    if message.from_user.id not in ADMIN_IDS: return
-    log_admin_action(message.from_user.id, "Команда /redeploy")
-    
-    markup = InlineKeyboardMarkup()
-    markup.row(
-        InlineKeyboardButton("✅ Да, обновить", callback_data="redeploy_yes"),
-        InlineKeyboardButton("❌ Отмена", callback_data="redeploy_no")
-    )
-    bot.reply_to(message, "⚠️ <b>Внимание!</b>\nВы уверены, что хотите запустить Pull & Redeploy из GitHub?\nБот будет недоступен пару минут во время пересборки.", reply_markup=markup, parse_mode='HTML')
-
 @bot.message_handler(commands=['clear'])
 def clear_cmd(message):
     if message.from_user.id not in ADMIN_IDS: return
@@ -461,32 +446,6 @@ def handle_query(call):
     global CURRENT_MODEL, PENDING_RETRY_MESSAGE, CURRENT_KEY_NUM, PRIORITY_MODELS_CACHE, OTHER_MODELS_CACHE, AVAILABLE_MODELS
     global CURRENT_CHAT_ID
     data = call.data
-
-    if data == "redeploy_no":
-        safe_edit_message(call.message.chat.id, call.message.message_id, "❌ Обновление отменено.")
-        return
-
-    if data == "redeploy_yes":
-        if not PORTAINER_WEBHOOK:
-            safe_edit_message(call.message.chat.id, call.message.message_id, "❌ <b>Ошибка:</b> Не задана переменная PORTAINER_WEBHOOK!\nДобавьте ссылку из Portainer в docker-compose.yml", parse_mode='HTML')
-            return
-            
-        safe_edit_message(call.message.chat.id, call.message.message_id, "⏳ Отправляю команду в Portainer на обновление (Pull & Redeploy)...")
-        
-        try:
-            req = urllib.request.Request(PORTAINER_WEBHOOK, method="POST")
-            
-            # Отключаем проверку самоподписанного SSL-сертификата Portainer
-            ctx = ssl.create_default_context()
-            ctx.check_hostname = False
-            ctx.verify_mode = ssl.CERT_NONE
-            
-            urllib.request.urlopen(req, timeout=10, context=ctx)
-            
-            safe_edit_message(call.message.chat.id, call.message.message_id, "✅ <b>Команда успешно отправлена!</b>\nPortainer скачивает обновления с GitHub. Бот переподключится через минуту 🚀", parse_mode='HTML')
-        except Exception as e:
-            safe_edit_message(call.message.chat.id, call.message.message_id, f"❌ Ошибка вебхука: {html.escape(str(e))}")
-        return
 
     if data == "voice_on":
         VOICE_MODE[call.message.chat.id] = True
@@ -692,7 +651,6 @@ def handle_message(message):
         elif cmd == '/gemini': change_model(message)
         elif cmd == '/changekey': change_key_cmd(message)
         elif cmd == '/start': send_welcome(message)
-        elif cmd == '/redeploy': redeploy_cmd(message)
         else: bot.reply_to(message, "⚠️ Неизвестная команда. ИИ игнорирует сообщения со слэшем (/).")
         return
 
@@ -788,3 +746,4 @@ def handle_message(message):
 if __name__ == '__main__':
     print(f"AI-Админ запущен. Допущено админов: {len(ADMIN_IDS)}. Режим невидимки включен...")
     bot.polling(none_stop=True)
+            
