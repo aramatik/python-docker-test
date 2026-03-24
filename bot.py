@@ -44,10 +44,10 @@ PENDING_RETRY_MESSAGE = None
 PENDING_FILES = {}
 PENDING_SEARCH_RESULTS = {}
 
-# Глобальные настройки для каждого чата
+# Глобальные журналы и настройки
 ACTION_LOGS = {} 
 LAST_ACTIONS = {} 
-VOICE_MODE = {} # Состояние голосовых ответов: {chat_id: bool}
+VOICE_MODE = {} # Состояние голосовых ответов для чата: {chat_id: bool}
 
 PRIORITY_MODELS = [
     "gemini-2.5-flash",
@@ -110,15 +110,10 @@ def send_long_text(chat_id, text, first_msg_id=None, is_code=False, prefix="", r
 def clean_text_for_voice(text: str) -> str:
     """Удаляет код, теги и спецсимволы, чтобы RHVoice читал только нормальный текст."""
     if not text: return ""
-    # Вырезаем многострочные блоки кода (ИИ не должен читать bash построчно)
     text = re.sub(r'```.*?```', '', text, flags=re.DOTALL)
-    # Вырезаем HTML теги, если они есть
     text = re.sub(r'<[^>]*>', '', text)
-    # Убираем символы разметки markdown
     text = re.sub(r'[*#_`~]', '', text)
-    # Заменяем переносы на точки для нормальных пауз в речи
     text = text.replace('\n', '. ')
-    # Убираем множественные пробелы и точки
     text = re.sub(r'\.{2,}', '.', text)
     text = re.sub(r'\s{2,}', ' ', text)
     return text.strip()
@@ -129,38 +124,29 @@ def generate_and_send_voice(chat_id, text):
     if not clean_text:
         return
         
-    # Ограничиваем длину текста для голоса, чтобы не зависнуть
-    clean_text = clean_text[:2000]
-    
+    clean_text = clean_text[:2000] # Защита от слишком долгих генераций
     wav_path = f"temp_tts_{chat_id}.wav"
     ogg_path = f"temp_tts_{chat_id}.ogg"
     
     try:
-        # Экранируем текст для безопасной передачи в bash
         safe_text = shlex.quote(clean_text)
-        
-        # Запускаем синтез речи (используем голос 'anna', он включен в rhvoice-russian)
         tts_cmd = f"echo {safe_text} | RHVoice-test -p anna -o {wav_path}"
         subprocess.run(tts_cmd, shell=True, timeout=60, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         
         if os.path.exists(wav_path):
-            # Конвертируем WAV в OGG (кодек Opus, битрейт 32k)
             ffmpeg_cmd = f"ffmpeg -i {wav_path} -c:a libopus -b:a 32k -v quiet -y {ogg_path}"
             subprocess.run(ffmpeg_cmd, shell=True, timeout=60)
             
-            # Отправляем в Telegram как голосовое сообщение
             if os.path.exists(ogg_path):
                 with open(ogg_path, 'rb') as voice_file:
                     bot.send_voice(chat_id, voice_file)
     except Exception as e:
         print(f"Ошибка синтеза голоса: {e}")
     finally:
-        # Убираем за собой
         if os.path.exists(wav_path): os.remove(wav_path)
         if os.path.exists(ogg_path): os.remove(ogg_path)
 
-
-# --- АГЕНТСКИЕ ИНСТРУМЕНТЫ (TOOLS) С ЛОГИРОВАНИЕМ ---
+# --- АГЕНТСКИЕ ИНСТРУМЕНТЫ (TOOLS) ---
 
 def execute_bash(command: str) -> str:
     print(f"Выполнение: {command}")
@@ -343,6 +329,7 @@ def clear_cmd(message):
     if not CURRENT_MODEL:
         bot.reply_to(message, "⚠️ Модель еще не выбрана. Память пуста.")
         return
+        
     try:
         init_models(CURRENT_MODEL)
         bot.reply_to(message, "🧹 Контекст и память ИИ успешно очищены!")
@@ -358,6 +345,7 @@ def search_cmd(message):
 
 def process_search_query(message):
     if message.from_user.id not in ADMIN_IDS: return
+    
     query = message.text.strip()
     if not query:
         bot.reply_to(message, "Пустой запрос. Поиск отменен.")
@@ -436,7 +424,7 @@ def handle_query(call):
     global CURRENT_MODEL, PENDING_RETRY_MESSAGE, CURRENT_KEY_NUM, PRIORITY_MODELS_CACHE, OTHER_MODELS_CACHE, AVAILABLE_MODELS
     global CURRENT_CHAT_ID
     data = call.data
-    
+
     # --- ОБРАБОТЧИКИ ГОЛОСОВОГО РЕЖИМА ---
     if data == "voice_on":
         VOICE_MODE[call.message.chat.id] = True
@@ -447,7 +435,7 @@ def handle_query(call):
         VOICE_MODE[call.message.chat.id] = False
         safe_edit_message(call.message.chat.id, call.message.message_id, "🔴 Голосовой режим <b>ВЫКЛЮЧЕН</b>.", parse_mode='HTML')
         return
-
+    
     # --- ОБРАБОТЧИК КНОПКИ СКРЫТИЯ СООБЩЕНИЯ ---
     if data == "hide_message":
         try:
@@ -614,7 +602,6 @@ def handle_query(call):
                 prefix = f"<b>{clean_model_name}:</b>\n\n"
                 send_long_text(call.message.chat.id, response.text, first_msg_id=call.message.message_id, prefix=prefix, reply_markup=markup)
                 
-                # Если включен голос - отправляем аудио
                 if VOICE_MODE.get(call.message.chat.id):
                     bot.send_chat_action(call.message.chat.id, 'record_voice')
                     generate_and_send_voice(call.message.chat.id, response.text)
@@ -685,7 +672,9 @@ def handle_message(message):
             if is_gemma:
                  response = chat_agent.send_message("Я получил аудио, но я текстовая модель Gemma и не умею слушать звук.")
             else:
-                 response = chat_agent.send_message([audio_file, "Слушай аудио и выполни команду."])
+                 # Даем ИИ возможность просто общаться, а не заставляем выполнять команды
+                 prompt = text if text else "Прослушай это голосовое сообщение и ответь на него."
+                 response = chat_agent.send_message([audio_file, prompt])
                  
             os.remove(voice_path)
             
