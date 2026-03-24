@@ -5,6 +5,7 @@ from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
 import google.generativeai as genai
 import html
 import re
+import shlex
 
 # Импортируем наши внешние модули
 from markdown import split_text_safely, md_to_html
@@ -43,9 +44,10 @@ PENDING_RETRY_MESSAGE = None
 PENDING_FILES = {}
 PENDING_SEARCH_RESULTS = {}
 
-# Глобальный журнал действий ИИ-агента
+# Глобальные настройки для каждого чата
 ACTION_LOGS = {} 
-LAST_ACTIONS = {} # Память для работы кнопки "Выполненные действия"
+LAST_ACTIONS = {} 
+VOICE_MODE = {} # Состояние голосовых ответов: {chat_id: bool}
 
 PRIORITY_MODELS = [
     "gemini-2.5-flash",
@@ -69,7 +71,7 @@ def log_admin_action(user_id, action):
     """Логирует действия админов в консоль"""
     print(f"[ADMIN {user_id}] {action}")
 
-# --- ФУНКЦИИ ВЫВОДА ---
+# --- ФУНКЦИИ ВЫВОДА И ГОЛОСА ---
 
 def safe_edit_message(chat_id, message_id, text, parse_mode='HTML', reply_markup=None):
     try:
@@ -80,13 +82,11 @@ def safe_edit_message(chat_id, message_id, text, parse_mode='HTML', reply_markup
             raise e
 
 def send_long_text(chat_id, text, first_msg_id=None, is_code=False, prefix="", reply_markup=None):
-    """Отправляет или обновляет сообщение с учетом лимитов Telegram, разметки и кнопок"""
     if not text: return
     text = text.replace('\r\n', '\n')
     chunks = split_text_safely(text, max_len=3500)
     
     for i, chunk in enumerate(chunks):
-        # Кнопку добавляем только к самому последнему куску текста
         is_last = (i == len(chunks) - 1)
         current_markup = reply_markup if is_last else None
         
@@ -107,10 +107,62 @@ def send_long_text(chat_id, text, first_msg_id=None, is_code=False, prefix="", r
             except Exception:
                 bot.send_message(chat_id, chunk.strip(), reply_markup=current_markup)
 
+def clean_text_for_voice(text: str) -> str:
+    """Удаляет код, теги и спецсимволы, чтобы RHVoice читал только нормальный текст."""
+    if not text: return ""
+    # Вырезаем многострочные блоки кода (ИИ не должен читать bash построчно)
+    text = re.sub(r'```.*?```', '', text, flags=re.DOTALL)
+    # Вырезаем HTML теги, если они есть
+    text = re.sub(r'<[^>]*>', '', text)
+    # Убираем символы разметки markdown
+    text = re.sub(r'[*#_`~]', '', text)
+    # Заменяем переносы на точки для нормальных пауз в речи
+    text = text.replace('\n', '. ')
+    # Убираем множественные пробелы и точки
+    text = re.sub(r'\.{2,}', '.', text)
+    text = re.sub(r'\s{2,}', ' ', text)
+    return text.strip()
+
+def generate_and_send_voice(chat_id, text):
+    """Генерирует аудио через RHVoice, конвертирует в OGG Opus и отправляет."""
+    clean_text = clean_text_for_voice(text)
+    if not clean_text:
+        return
+        
+    # Ограничиваем длину текста для голоса, чтобы не зависнуть
+    clean_text = clean_text[:2000]
+    
+    wav_path = f"temp_tts_{chat_id}.wav"
+    ogg_path = f"temp_tts_{chat_id}.ogg"
+    
+    try:
+        # Экранируем текст для безопасной передачи в bash
+        safe_text = shlex.quote(clean_text)
+        
+        # Запускаем синтез речи (используем голос 'anna', он включен в rhvoice-russian)
+        tts_cmd = f"echo {safe_text} | RHVoice-test -p anna -o {wav_path}"
+        subprocess.run(tts_cmd, shell=True, timeout=60, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        
+        if os.path.exists(wav_path):
+            # Конвертируем WAV в OGG (кодек Opus, битрейт 32k)
+            ffmpeg_cmd = f"ffmpeg -i {wav_path} -c:a libopus -b:a 32k -v quiet -y {ogg_path}"
+            subprocess.run(ffmpeg_cmd, shell=True, timeout=60)
+            
+            # Отправляем в Telegram как голосовое сообщение
+            if os.path.exists(ogg_path):
+                with open(ogg_path, 'rb') as voice_file:
+                    bot.send_voice(chat_id, voice_file)
+    except Exception as e:
+        print(f"Ошибка синтеза голоса: {e}")
+    finally:
+        # Убираем за собой
+        if os.path.exists(wav_path): os.remove(wav_path)
+        if os.path.exists(ogg_path): os.remove(ogg_path)
+
+
 # --- АГЕНТСКИЕ ИНСТРУМЕНТЫ (TOOLS) С ЛОГИРОВАНИЕМ ---
 
 def execute_bash(command: str) -> str:
-    """Выполняет bash команду на сервере."""
     print(f"Выполнение: {command}")
     if CURRENT_CHAT_ID:
         ACTION_LOGS.setdefault(CURRENT_CHAT_ID, []).append(("bash", command))
@@ -122,13 +174,11 @@ def execute_bash(command: str) -> str:
         return f"Ошибка: {str(e)}"
 
 def search_web_tool(query: str) -> str:
-    """Ищет информацию в интернете."""
     if CURRENT_CHAT_ID:
         ACTION_LOGS.setdefault(CURRENT_CHAT_ID, []).append(("search", query))
     return web_search.search_web(query)
 
 def send_file_to_telegram(filepath: str) -> str:
-    """Отправляет файл с сервера в Telegram пользователю."""
     global CURRENT_CHAT_ID
     if CURRENT_CHAT_ID:
         ACTION_LOGS.setdefault(CURRENT_CHAT_ID, []).append(("file", filepath))
@@ -154,11 +204,9 @@ def get_models_lists():
     for p in PRIORITY_MODELS:
         search_str = p.lower().replace("sep-2025", "09-2025")
         best_match = None
-        
         for m in raw_models:
             if m in used_models: continue
             clean_m = m.replace('models/', '').lower()
-            
             if clean_m == search_str or clean_m == f"{search_str}-it":
                 best_match = m
                 break
@@ -167,7 +215,6 @@ def get_models_lists():
                 if "image" in clean_m and "image" not in search_str: continue
                 if not best_match:
                     best_match = m
-                    
         if best_match:
             priority.append(best_match)
             used_models.add(best_match)
@@ -272,6 +319,21 @@ def change_key_cmd(message):
     )
     bot.reply_to(message, "Выберите API-ключ для работы:", reply_markup=markup)
 
+@bot.message_handler(commands=['voice'])
+def voice_mode_cmd(message):
+    if message.from_user.id not in ADMIN_IDS: return
+    log_admin_action(message.from_user.id, "Команда /voice")
+    
+    is_active = VOICE_MODE.get(message.chat.id, False)
+    status_text = "ВКЛЮЧЕН 🟢" if is_active else "ВЫКЛЮЧЕН 🔴"
+    
+    markup = InlineKeyboardMarkup()
+    markup.row(
+        InlineKeyboardButton("🟢 Включить", callback_data="voice_on"),
+        InlineKeyboardButton("🔴 Выключить", callback_data="voice_off")
+    )
+    bot.reply_to(message, f"🎙 <b>Голосовой ответ ИИ</b>\n\nСейчас: <b>{status_text}</b>", reply_markup=markup, parse_mode='HTML')
+
 @bot.message_handler(commands=['clear'])
 def clear_cmd(message):
     if message.from_user.id not in ADMIN_IDS: return
@@ -281,7 +343,6 @@ def clear_cmd(message):
     if not CURRENT_MODEL:
         bot.reply_to(message, "⚠️ Модель еще не выбрана. Память пуста.")
         return
-        
     try:
         init_models(CURRENT_MODEL)
         bot.reply_to(message, "🧹 Контекст и память ИИ успешно очищены!")
@@ -297,7 +358,6 @@ def search_cmd(message):
 
 def process_search_query(message):
     if message.from_user.id not in ADMIN_IDS: return
-    
     query = message.text.strip()
     if not query:
         bot.reply_to(message, "Пустой запрос. Поиск отменен.")
@@ -377,6 +437,17 @@ def handle_query(call):
     global CURRENT_CHAT_ID
     data = call.data
     
+    # --- ОБРАБОТЧИКИ ГОЛОСОВОГО РЕЖИМА ---
+    if data == "voice_on":
+        VOICE_MODE[call.message.chat.id] = True
+        safe_edit_message(call.message.chat.id, call.message.message_id, "🟢 Голосовой режим <b>ВКЛЮЧЕН</b>.\nИИ будет озвучивать свои ответы.", parse_mode='HTML')
+        return
+        
+    if data == "voice_off":
+        VOICE_MODE[call.message.chat.id] = False
+        safe_edit_message(call.message.chat.id, call.message.message_id, "🔴 Голосовой режим <b>ВЫКЛЮЧЕН</b>.", parse_mode='HTML')
+        return
+
     # --- ОБРАБОТЧИК КНОПКИ СКРЫТИЯ СООБЩЕНИЯ ---
     if data == "hide_message":
         try:
@@ -405,13 +476,11 @@ def handle_query(call):
         
         if bash_commands:
             bash_str = "\n".join(bash_commands)
-            # Если есть другой текст (поиск/файл), делаем отступ перед bash, иначе выводим сразу
             if log_text:
                 log_text += f'\n<pre><code class="language-bash">{html.escape(bash_str)}</code></pre>'
             else:
                 log_text += f'<pre><code class="language-bash">{html.escape(bash_str)}</code></pre>'
             
-        # Добавляем кнопку "Скрыть"
         hide_markup = InlineKeyboardMarkup()
         hide_markup.add(InlineKeyboardButton("❌ Скрыть", callback_data="hide_message"))
             
@@ -514,7 +583,6 @@ def handle_query(call):
             clean_name = CURRENT_MODEL.replace('models/', '')
             is_gemma = "gemma" in clean_name.lower()
             
-            # Сбрасываем лог инструментов
             CURRENT_CHAT_ID = call.message.chat.id
             ACTION_LOGS[CURRENT_CHAT_ID] = []
             
@@ -537,7 +605,6 @@ def handle_query(call):
                 
                 bot.delete_message(chat_id=call.message.chat.id, message_id=msg_wait.message_id)
                 
-                # Создаем кнопку, если ИИ пользовался инструментами
                 markup = None
                 if ACTION_LOGS.get(CURRENT_CHAT_ID):
                     LAST_ACTIONS[CURRENT_CHAT_ID] = ACTION_LOGS[CURRENT_CHAT_ID].copy()
@@ -546,6 +613,11 @@ def handle_query(call):
                 
                 prefix = f"<b>{clean_model_name}:</b>\n\n"
                 send_long_text(call.message.chat.id, response.text, first_msg_id=call.message.message_id, prefix=prefix, reply_markup=markup)
+                
+                # Если включен голос - отправляем аудио
+                if VOICE_MODE.get(call.message.chat.id):
+                    bot.send_chat_action(call.message.chat.id, 'record_voice')
+                    generate_and_send_voice(call.message.chat.id, response.text)
                     
             except Exception as e:
                 handle_api_error(e, call.message.chat.id, msg_wait.message_id, None, clean_name)
@@ -582,7 +654,6 @@ def handle_message(message):
             log_admin_action(message.from_user.id, f"Прямая команда: {cmd}")
             bot.send_message(message.chat.id, f"⚡ Выполняю напрямую:\n<code>{html.escape(cmd)}</code>", parse_mode='HTML')
             result = execute_bash(cmd)
-            # Прямые команды тоже использую блок кода для вывода
             send_long_text(message.chat.id, result, is_code=True)
             return
 
@@ -597,7 +668,6 @@ def handle_message(message):
                 handle_api_error(e, message.chat.id, msg_wait.message_id, message, clean_model_name)
             return
 
-    # Очищаем лог действий ИИ для этого чата перед запросом
     ACTION_LOGS[CURRENT_CHAT_ID] = []
 
     msg_first = bot.send_message(message.chat.id, f"<b>{clean_model_name}:</b>", parse_mode='HTML')
@@ -640,7 +710,6 @@ def handle_message(message):
             
         bot.delete_message(chat_id=message.chat.id, message_id=msg_wait.message_id)
         
-        # Создаем кнопку, если ИИ пользовался инструментами
         markup = None
         if ACTION_LOGS.get(CURRENT_CHAT_ID):
             LAST_ACTIONS[CURRENT_CHAT_ID] = ACTION_LOGS[CURRENT_CHAT_ID].copy()
@@ -649,6 +718,11 @@ def handle_message(message):
         
         prefix = f"<b>{clean_model_name}:</b>\n\n"
         send_long_text(message.chat.id, response.text, first_msg_id=msg_first.message_id, prefix=prefix, reply_markup=markup)
+        
+        # Если включен голос - отправляем аудио
+        if VOICE_MODE.get(message.chat.id):
+            bot.send_chat_action(message.chat.id, 'record_voice')
+            generate_and_send_voice(message.chat.id, response.text)
                               
     except Exception as e:
         handle_api_error(e, message.chat.id, msg_wait.message_id, message, clean_model_name)
