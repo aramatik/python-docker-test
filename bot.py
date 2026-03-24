@@ -676,5 +676,100 @@ def handle_message(message):
         elif cmd == '/clear': clear_cmd(message)
         elif cmd == '/gemini': change_model(message)
         elif cmd == '/changekey': change_key_cmd(message)
-        elif cmd
+        elif cmd == '/start': send_welcome(message)
+        else: bot.reply_to(message, "⚠️ Неизвестная команда. ИИ игнорирует сообщения со слэшем (/).")
+        return
+
+    if not CURRENT_MODEL:
+        bot.reply_to(message, "⚠️ Сначала выберите модель (/gemini)", reply_markup=get_models_keyboard())
+        return
+
+    clean_model_name = CURRENT_MODEL.replace('models/', '')
+    is_gemma = "gemma" in clean_model_name.lower()
+    
+    is_voice = message.content_type == 'voice'
+    is_photo = message.content_type == 'photo'
+
+    if not is_voice and not is_photo:
+        if text.startswith('!'):
+            cmd = text[1:].strip()
+            log_admin_action(message.from_user.id, f"Прямая команда: {cmd}")
+            bot.send_message(message.chat.id, f"⚡ Выполняю напрямую:\n<code>{html.escape(cmd)}</code>", parse_mode='HTML')
+            result = execute_bash(cmd)
+            send_long_text(message.chat.id, result, is_code=True)
+            return
+
+        if text.startswith('#'):
+            task = text[1:].strip()
+            msg_first = bot.send_message(message.chat.id, f"<b>{clean_model_name}:</b>", parse_mode='HTML')
+            msg_wait = bot.send_message(message.chat.id, "🧠 Думаю...")
+            try:
+                response = model_advisor.generate_content(task)
+                send_long_text(message.chat.id, response.text, first_msg_id=msg_wait.message_id, is_code=True)
+            except Exception as e:
+                handle_api_error(e, message.chat.id, msg_wait.message_id, message, clean_model_name)
+            return
+
+    ACTION_LOGS[CURRENT_CHAT_ID] = []
+
+    msg_first = bot.send_message(message.chat.id, f"<b>{clean_model_name}:</b>", parse_mode='HTML')
+    msg_wait = bot.send_message(message.chat.id, "🤖 Обрабатываю запрос...")
+
+    try:
+        if is_voice:
+            file_info = bot.get_file(message.voice.file_id)
+            voice_path = f"temp_voice_{message.message_id}.ogg"
+            with open(voice_path, 'wb') as new_file:
+                new_file.write(bot.download_file(file_info.file_path))
+            
+            audio_file = genai.upload_file(path=voice_path, mime_type="audio/ogg")
+            
+            if is_gemma:
+                 response = chat_agent.send_message("Я получил аудио, но я текстовая модель Gemma и не умею слушать звук.")
+            else:
+                 base_prompt = "Обязательно прослушай этот аудиофайл. Если в нём звучит команда или задача для сервера — выполни её. Если это обычный разговор или вопрос — просто ответь на него."
+                 prompt = f"{text}\n\n{base_prompt}" if text else base_prompt
+                 response = chat_agent.send_message([audio_file, prompt])
+                 
+            os.remove(voice_path)
+            
+        elif is_photo:
+            file_info = bot.get_file(message.photo[-1].file_id)
+            photo_path = f"temp_photo_{message.message_id}.jpg"
+            with open(photo_path, 'wb') as new_file:
+                new_file.write(bot.download_file(file_info.file_path))
+                
+            img_file = genai.upload_file(path=photo_path)
+            
+            if is_gemma:
+                response = chat_agent.send_message("Я получил изображение, но я текстовая модель Gemma и не умею смотреть картинки.")
+            else:
+                prompt = text if text else "Проанализируй это изображение."
+                response = chat_agent.send_message([img_file, prompt])
+                
+            os.remove(photo_path)
+            
+        else:
+            response = chat_agent.send_message(text)
+            
+        bot.delete_message(chat_id=message.chat.id, message_id=msg_wait.message_id)
         
+        markup = None
+        if ACTION_LOGS.get(CURRENT_CHAT_ID):
+            LAST_ACTIONS[CURRENT_CHAT_ID] = ACTION_LOGS[CURRENT_CHAT_ID].copy()
+            markup = InlineKeyboardMarkup()
+            markup.add(InlineKeyboardButton("🛠 Выполненные действия", callback_data="show_last_actions"))
+        
+        prefix = f"<b>{clean_model_name}:</b>\n\n"
+        send_long_text(message.chat.id, response.text, first_msg_id=msg_first.message_id, prefix=prefix, reply_markup=markup)
+        
+        if VOICE_MODE.get(message.chat.id):
+            generate_and_send_voice(message.chat.id, response.text)
+                              
+    except Exception as e:
+        handle_api_error(e, message.chat.id, msg_wait.message_id, message, clean_model_name)
+
+if __name__ == '__main__':
+    print(f"AI-Админ запущен. Допущено админов: {len(ADMIN_IDS)}. Режим невидимки включен...")
+    bot.polling(none_stop=True)
+    
