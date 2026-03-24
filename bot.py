@@ -48,7 +48,7 @@ PENDING_SEARCH_RESULTS = {}
 
 # Глобальные журналы и настройки
 ACTION_LOGS = {}
-LAST_ACTIONS = {}
+LAST_ACTIONS = {} # Теперь хранит логи по message_id: {message_id: list}
 VOICE_MODE = {}  # Состояние голосовых ответов для чата: {chat_id: bool}
 
 # Статусные сообщения ИИ (для live-редактирования) {chat_id: message_id}
@@ -229,7 +229,6 @@ def execute_bash(command: str) -> str:
     print(f"Выполнение: {command}")
     if CURRENT_CHAT_ID:
         ACTION_LOGS.setdefault(CURRENT_CHAT_ID, []).append(("bash", command))
-        # Live-статус: показываем что именно выполняется
         short_cmd = command if len(command) <= 80 else command[:77] + "…"
         set_status(CURRENT_CHAT_ID, f"⚙️ <b>Выполняю команду:</b>\n<code>{html.escape(short_cmd)}</code>")
     try:
@@ -249,7 +248,6 @@ def search_web_tool(query: str) -> str:
     """
     if CURRENT_CHAT_ID:
         ACTION_LOGS.setdefault(CURRENT_CHAT_ID, []).append(("search", query))
-        # Live-статус: показываем поисковый запрос
         short_q = query if len(query) <= 80 else query[:77] + "…"
         set_status(CURRENT_CHAT_ID, f"🔍 <b>Ищу в интернете:</b>\n<i>{html.escape(short_q)}</i>")
     return web_search.search_web(query)
@@ -258,7 +256,6 @@ def download_file_tool(url: str) -> str:
     """
     Скачивает файл по прямой ссылке с правильными заголовками и User-Agent.
     Сохраняет файл в /app/downloads/ и возвращает путь к нему.
-    Используй для скачивания файлов по прямым ссылкам (PDF, архивы, скрипты и т.д.)
     """
     if CURRENT_CHAT_ID:
         ACTION_LOGS.setdefault(CURRENT_CHAT_ID, []).append(("download", url))
@@ -489,7 +486,7 @@ def process_search_query(message):
         if len(formatted_chunks) > 5:
             PENDING_SEARCH_RESULTS[message.chat.id] = clean_text_for_file
             markup = InlineKeyboardMarkup()
-            markup.add(InlineKeyboardButton(text="📥 Скачать всё (.txt)", callback_data="download_search_txt"))
+            markup.add(InlineKeyboardButton("📥 Скачать всё (.txt)", callback_data="download_search_txt"))
             bot.send_message(
                 message.chat.id,
                 f"⚠️ <b>Внимание:</b> Показано 5 сообщений из {len(formatted_chunks)}. Остальной текст обрезан.\n\n"
@@ -558,10 +555,16 @@ def handle_query(call):
             pass
         return
 
-    if data == "show_last_actions":
-        actions = LAST_ACTIONS.get(call.message.chat.id)
+    # НОВАЯ ЛОГИКА ОТОБРАЖЕНИЯ ПО MESSAGE_ID
+    if data.startswith("show_acts_"):
+        try:
+            target_msg_id = int(data.split("_")[2])
+            actions = LAST_ACTIONS.get(target_msg_id)
+        except Exception:
+            actions = None
+
         if not actions:
-            bot.answer_callback_query(call.id, "❌ Нет данных о последних действиях.", show_alert=True)
+            bot.answer_callback_query(call.id, "❌ Данные об этих действиях устарели (бот был перезапущен).", show_alert=True)
             return
 
         log_text = ""
@@ -711,9 +714,10 @@ def handle_query(call):
 
                 markup = None
                 if ACTION_LOGS.get(CURRENT_CHAT_ID):
-                    LAST_ACTIONS[CURRENT_CHAT_ID] = ACTION_LOGS[CURRENT_CHAT_ID].copy()
+                    # СОХРАНЯЕМ ЛОГИ ПО ID СООБЩЕНИЯ
+                    LAST_ACTIONS[call.message.message_id] = ACTION_LOGS[CURRENT_CHAT_ID].copy()
                     markup = InlineKeyboardMarkup()
-                    markup.add(InlineKeyboardButton("🛠 Выполненные действия", callback_data="show_last_actions"))
+                    markup.add(InlineKeyboardButton("🛠 Выполненные действия", callback_data=f"show_acts_{call.message.message_id}"))
 
                 clean_model_name = CURRENT_MODEL.replace('models/', '')
                 prefix = f"<b>{clean_model_name}:</b>\n\n"
@@ -842,9 +846,10 @@ def handle_message(message):
 
         markup = None
         if ACTION_LOGS.get(CURRENT_CHAT_ID):
-            LAST_ACTIONS[CURRENT_CHAT_ID] = ACTION_LOGS[CURRENT_CHAT_ID].copy()
+            # СОХРАНЯЕМ ЛОГИ ПО ID СООБЩЕНИЯ (конкретно к тому, где будет висеть кнопка)
+            LAST_ACTIONS[msg_first.message_id] = ACTION_LOGS[CURRENT_CHAT_ID].copy()
             markup = InlineKeyboardMarkup()
-            markup.add(InlineKeyboardButton("🛠 Выполненные действия", callback_data="show_last_actions"))
+            markup.add(InlineKeyboardButton("🛠 Выполненные действия", callback_data=f"show_acts_{msg_first.message_id}"))
 
         prefix = f"<b>{clean_model_name}:</b>\n\n"
         send_long_text(message.chat.id, response.text, first_msg_id=msg_first.message_id, prefix=prefix, reply_markup=markup)
@@ -860,4 +865,3 @@ def handle_message(message):
 if __name__ == '__main__':
     print(f"AI-Админ запущен. Допущено админов: {len(ADMIN_IDS)}. Режим невидимки включен...")
     bot.polling(none_stop=True)
-            
