@@ -111,23 +111,14 @@ def send_long_text(chat_id, text, first_msg_id=None, is_code=False, prefix="", r
 def clean_text_for_voice(text: str) -> str:
     """Удаляет код, ссылки, теги и спецсимволы, оставляя чистый текст для диктора."""
     if not text: return ""
-    # Вырезаем многострочные блоки кода
     text = re.sub(r'```.*?```', '', text, flags=re.DOTALL)
-    # Вырезаем короткий инлайн-код
     text = re.sub(r'`.*?`', '', text)
-    # Вырезаем любые ссылки (начинающиеся с http, https или www)
     text = re.sub(r'https?://\S+|www\.\S+', '', text)
-    # Вырезаем HTML-теги
     text = re.sub(r'<[^>]*>', '', text)
-    # Вырезаем спецсимволы и Markdown-разметку (включая скобки и собачки)
     text = re.sub(r'[*#_~()\[\]{}<>@|\\/]', '', text)
-    
-    # Заменяем переносы строк на точки, чтобы диктор делал естественные паузы
     text = text.replace('\n', '. ')
-    # Убираем дублирующиеся точки и лишние пробелы
     text = re.sub(r'\.{2,}', '.', text)
     text = re.sub(r'\s{2,}', ' ', text)
-    
     return text.strip()
 
 def generate_and_send_voice(chat_id, text):
@@ -136,29 +127,24 @@ def generate_and_send_voice(chat_id, text):
     if not clean_text:
         return
         
-    # Разбиваем очищенный текст на куски по ~2000 символов (используем нашу функцию разбивки)
     voice_chunks = split_text_safely(clean_text, max_len=2000)
     
     for i, chunk in enumerate(voice_chunks):
         if not chunk.strip():
             continue
             
-        # Уникальные имена файлов для каждого куска
         mp3_path = f"temp_tts_{chat_id}_{i}.mp3"
         ogg_path = f"temp_tts_{chat_id}_{i}.ogg"
         
         try:
-            # Анимация "Записывает голосовое сообщение..."
             bot.send_chat_action(chat_id, 'record_voice')
             
-            # Асинхронная генерация речи
             async def _generate():
                 communicate = edge_tts.Communicate(chunk, "ru-RU-SvetlanaNeural")
                 await communicate.save(mp3_path)
                 
             asyncio.run(_generate())
             
-            # Конвертация и отправка
             if os.path.exists(mp3_path):
                 ffmpeg_cmd = f"ffmpeg -i {mp3_path} -c:a libopus -b:a 32k -v quiet -y {ogg_path}"
                 subprocess.run(ffmpeg_cmd, shell=True, timeout=60)
@@ -170,7 +156,6 @@ def generate_and_send_voice(chat_id, text):
         except Exception as e:
             print(f"Ошибка синтеза голоса (кусок {i}): {e}")
         finally:
-            # Очистка временных файлов
             if os.path.exists(mp3_path): os.remove(mp3_path)
             if os.path.exists(ogg_path): os.remove(ogg_path)
 
@@ -273,7 +258,7 @@ def init_models(model_name):
             model_name=model_name,
             tools=[execute_bash, send_file_to_telegram, search_web_tool],
             system_instruction=(
-                "Ты AI-агент и root-админ Debian. Твои инструменты: execute_bash, send_file_to_telegram, search_web_tool.\n"
+                "Ты AI-агент и root-админ Ubuntu. Твои инструменты: execute_bash, send_file_to_telegram, search_web_tool.\n"
                 "1. Пакеты: используй apt/apt-get. Ты root, sudo не нужен.\n"
                 "2. Файлы: чтение через execute_bash (cat, ls), отправка юзеру через send_file_to_telegram.\n"
                 "3. Инфо из сети: используй search_web_tool, если не знаешь актуального ответа.\n"
@@ -285,7 +270,7 @@ def init_models(model_name):
         
         model_advisor = genai.GenerativeModel(
             model_name=model_name,
-            system_instruction="Ты root-админ Debian. Дай только bash-команду (через apt-get, без sudo). Без markdown и пояснений."
+            system_instruction="Ты root-админ Ubuntu. Дай только bash-команду (через apt-get, без sudo). Без markdown и пояснений."
         )
 
 def handle_api_error(e, chat_id, message_id, original_message, clean_model_name):
@@ -707,7 +692,9 @@ def handle_message(message):
             if is_gemma:
                  response = chat_agent.send_message("Я получил аудио, но я текстовая модель Gemma и не умею слушать звук.")
             else:
-                 prompt = text if text else "Прослушай это голосовое сообщение и ответь на него."
+                 # Улучшенный, жесткий промпт, чтобы ИИ не "ленился" и не включал заглушки
+                 base_prompt = "Обязательно прослушай этот аудиофайл. Если в нём звучит команда или задача для сервера — выполни её. Если это вопрос — ответь на него."
+                 prompt = f"{text}\n\n{base_prompt}" if text else base_prompt
                  response = chat_agent.send_message([audio_file, prompt])
                  
             os.remove(voice_path)
@@ -751,4 +738,4 @@ def handle_message(message):
 if __name__ == '__main__':
     print(f"AI-Админ запущен. Допущено админов: {len(ADMIN_IDS)}. Режим невидимки включен...")
     bot.polling(none_stop=True)
-        
+            
