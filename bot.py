@@ -111,8 +111,9 @@ def clean_text_for_voice(text: str) -> str:
     """Удаляет код, теги и спецсимволы, чтобы RHVoice читал только нормальный текст."""
     if not text: return ""
     text = re.sub(r'```.*?```', '', text, flags=re.DOTALL)
+    text = re.sub(r'`.*?`', '', text)
     text = re.sub(r'<[^>]*>', '', text)
-    text = re.sub(r'[*#_`~]', '', text)
+    text = re.sub(r'[*#_~]', '', text)
     text = text.replace('\n', '. ')
     text = re.sub(r'\.{2,}', '.', text)
     text = re.sub(r'\s{2,}', ' ', text)
@@ -617,13 +618,30 @@ def handle_query(call):
 @bot.message_handler(content_types=['voice', 'text', 'photo'])
 def handle_message(message):
     if message.from_user.id not in ADMIN_IDS:
-        return # Полное игнорирование неизвестных
+        return 
 
     log_admin_action(message.from_user.id, f"Сообщение: {message.content_type}")
 
     global CURRENT_CHAT_ID
     CURRENT_CHAT_ID = message.chat.id
     
+    text = (message.text or message.caption or "").strip()
+
+    # --- РУЧНОЙ ПЕРЕХВАТ КОМАНД ---
+    # Если это сообщение начинается со слэша, Telegram по какой-то причине мог
+    # пропустить его мимо декораторов (например, из-за опечатки пользователя).
+    # Мы перехватываем его здесь, чтобы ни в коем случае не отдавать ИИ.
+    if text.startswith('/'):
+        cmd = text.split()[0].lower()
+        if cmd == '/voice': voice_mode_cmd(message)
+        elif cmd == '/search': search_cmd(message)
+        elif cmd == '/clear': clear_cmd(message)
+        elif cmd == '/gemini': change_model(message)
+        elif cmd == '/changekey': change_key_cmd(message)
+        elif cmd == '/start': send_welcome(message)
+        else: bot.reply_to(message, "⚠️ Неизвестная команда. ИИ игнорирует сообщения со слэшем (/).")
+        return
+
     if not CURRENT_MODEL:
         bot.reply_to(message, "⚠️ Сначала выберите модель (/gemini)", reply_markup=get_models_keyboard())
         return
@@ -633,7 +651,6 @@ def handle_message(message):
     
     is_voice = message.content_type == 'voice'
     is_photo = message.content_type == 'photo'
-    text = (message.text or message.caption or "").strip()
 
     if not is_voice and not is_photo:
         if text.startswith('!'):
@@ -672,9 +689,9 @@ def handle_message(message):
             if is_gemma:
                  response = chat_agent.send_message("Я получил аудио, но я текстовая модель Gemma и не умею слушать звук.")
             else:
-                 # Даем ИИ возможность просто общаться, а не заставляем выполнять команды
-                 prompt = text if text else "Прослушай это голосовое сообщение и ответь на него."
-                 response = chat_agent.send_message([audio_file, prompt])
+                 # Отправляем аудиофайл нативно. Если есть текст (подпись), добавляем его.
+                 content = [audio_file, text] if text else [audio_file]
+                 response = chat_agent.send_message(content)
                  
             os.remove(voice_path)
             
@@ -689,8 +706,8 @@ def handle_message(message):
             if is_gemma:
                 response = chat_agent.send_message("Я получил изображение, но я текстовая модель Gemma и не умею смотреть картинки.")
             else:
-                prompt = text if text else "Проанализируй это изображение."
-                response = chat_agent.send_message([img_file, prompt])
+                content = [img_file, text] if text else [img_file]
+                response = chat_agent.send_message(content)
                 
             os.remove(photo_path)
             
@@ -708,7 +725,6 @@ def handle_message(message):
         prefix = f"<b>{clean_model_name}:</b>\n\n"
         send_long_text(message.chat.id, response.text, first_msg_id=msg_first.message_id, prefix=prefix, reply_markup=markup)
         
-        # Если включен голос - отправляем аудио
         if VOICE_MODE.get(message.chat.id):
             bot.send_chat_action(message.chat.id, 'record_voice')
             generate_and_send_voice(message.chat.id, response.text)
