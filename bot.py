@@ -8,14 +8,11 @@ import re
 import shlex
 import asyncio
 import edge_tts
-import urllib.request
-import ssl
-import shutil # Добавили для безопасного сохранения больших файлов
 
 # Импортируем наши внешние модули
 from markdown import split_text_safely, md_to_html
 from search import parse_search_query, run_grep_search, format_search_results
-import web_search
+import web_search # Теперь он делает всю грязную работу с сетью!
 
 # Загружаем ключи
 TG_TOKEN = os.getenv("TG_TOKEN")
@@ -112,6 +109,7 @@ def send_long_text(chat_id, text, first_msg_id=None, is_code=False, prefix="", r
                 bot.send_message(chat_id, chunk.strip(), reply_markup=current_markup)
 
 def clean_text_for_voice(text: str) -> str:
+    """Удаляет код, ссылки, теги и спецсимволы, оставляя чистый текст для диктора."""
     if not text: return ""
     text = re.sub(r'```.*?```', '', text, flags=re.DOTALL)
     text = re.sub(r'`.*?`', '', text)
@@ -124,6 +122,7 @@ def clean_text_for_voice(text: str) -> str:
     return text.strip()
 
 def generate_and_send_voice(chat_id, text):
+    """Генерирует аудио через Edge TTS. Если текст длинный - шлет несколько голосовых с индикацией."""
     clean_text = clean_text_for_voice(text)
     if not clean_text:
         return
@@ -132,7 +131,8 @@ def generate_and_send_voice(chat_id, text):
     total_chunks = len(voice_chunks)
     
     for i, chunk in enumerate(voice_chunks):
-        if not chunk.strip(): continue
+        if not chunk.strip():
+            continue
             
         mp3_path = f"temp_tts_{chat_id}_{i}.mp3"
         ogg_path = f"temp_tts_{chat_id}_{i}.ogg"
@@ -169,9 +169,11 @@ def generate_and_send_voice(chat_id, text):
 # --- АГЕНТСКИЕ ИНСТРУМЕНТЫ (TOOLS) ---
 
 def execute_bash(command: str) -> str:
-    print(f"Выполнение: {command}")
     if CURRENT_CHAT_ID:
         ACTION_LOGS.setdefault(CURRENT_CHAT_ID, []).append(("bash", command))
+        # Живое уведомление
+        try: bot.send_message(CURRENT_CHAT_ID, f"💻 <b>Выполняю команду:</b>\n<pre><code class=\"language-bash\">{html.escape(command)}</code></pre>", parse_mode='HTML')
+        except: pass
     try:
         result = subprocess.run(command, shell=True, capture_output=True, text=True, timeout=30)
         output = result.stdout if result.stdout else result.stderr
@@ -182,58 +184,29 @@ def execute_bash(command: str) -> str:
 def search_web_tool(query: str) -> str:
     if CURRENT_CHAT_ID:
         ACTION_LOGS.setdefault(CURRENT_CHAT_ID, []).append(("search", query))
+        # Живое уведомление
+        try: bot.send_message(CURRENT_CHAT_ID, f"🌐 <b>Ищу в интернете:</b>\n<code>{html.escape(query)}</code>", parse_mode='HTML')
+        except: pass
     return web_search.search_web(query)
 
 def read_webpage(url: str) -> str:
-    """Инструмент для парсинга текстового содержимого сайтов."""
     if CURRENT_CHAT_ID:
         ACTION_LOGS.setdefault(CURRENT_CHAT_ID, []).append(("read_web", url))
-    try:
-        req = urllib.request.Request(url, headers={
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8'
-        })
-        ctx = ssl.create_default_context()
-        ctx.check_hostname = False
-        ctx.verify_mode = ssl.CERT_NONE
-        
-        with urllib.request.urlopen(req, timeout=15, context=ctx) as response:
-            html_content = response.read().decode('utf-8', errors='ignore')
-            
-        # Грубая, но эффективная очистка HTML от скриптов и тегов
-        text = re.sub(r'<style.*?</style>', '', html_content, flags=re.DOTALL|re.IGNORECASE)
-        text = re.sub(r'<script.*?</script>', '', text, flags=re.DOTALL|re.IGNORECASE)
-        text = re.sub(r'<[^>]+>', ' ', text)
-        text = re.sub(r'\s+', ' ', text).strip()
-        
-        # Возвращаем первые 5000 символов, чтобы не забить контекст ИИ
-        return text[:5000] if text else "Сайт пуст или блокирует парсинг."
-    except Exception as e:
-        return f"Ошибка чтения сайта: {str(e)}"
+        # Живое уведомление
+        try: bot.send_message(CURRENT_CHAT_ID, f"📖 <b>Читаю сайт:</b>\n<a href=\"{url}\">{html.escape(url)}</a>", parse_mode='HTML')
+        except: pass
+    return web_search.read_url_content(url)
 
 def download_web_file(url: str, filename: str) -> str:
-    """Мощный загрузчик с User-Agent браузера."""
     if CURRENT_CHAT_ID:
         ACTION_LOGS.setdefault(CURRENT_CHAT_ID, []).append(("download", f"{url} -> {filename}"))
-    try:
-        req = urllib.request.Request(url, headers={
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-            'Accept-Language': 'ru-RU,ru;q=0.8,en-US;q=0.5,en;q=0.3',
-        })
-        ctx = ssl.create_default_context()
-        ctx.check_hostname = False
-        ctx.verify_mode = ssl.CERT_NONE
-
-        os.makedirs("/app/downloads", exist_ok=True)
-        filepath = os.path.join("/app/downloads", filename)
-
-        with urllib.request.urlopen(req, timeout=30, context=ctx) as response, open(filepath, 'wb') as out_file:
-            shutil.copyfileobj(response, out_file)
-
-        return f"Успех! Файл сохранен по пути: {filepath}\nМожешь отправить его пользователю через send_file_to_telegram."
-    except Exception as e:
-        return f"Ошибка скачивания: {str(e)}"
+        # Живое уведомление
+        try: bot.send_message(CURRENT_CHAT_ID, f"⬇️ <b>Скачиваю файл:</b>\nОткуда: <code>{html.escape(url)}</code>\nИмя: <code>{html.escape(filename)}</code>", parse_mode='HTML')
+        except: pass
+    
+    # Формируем путь сохранения на сервере
+    filepath = os.path.join("/app/downloads", filename)
+    return web_search.download_file(url, filepath)
 
 def send_file_to_telegram(filepath: str) -> str:
     global CURRENT_CHAT_ID
@@ -314,9 +287,7 @@ def init_models(model_name):
     else:
         model_agent = genai.GenerativeModel(
             model_name=model_name,
-            # ДОБАВИЛИ НОВЫЕ ИНСТРУМЕНТЫ СЮДА:
             tools=[execute_bash, send_file_to_telegram, search_web_tool, read_webpage, download_web_file],
-            # ПРОКАЧАЛИ СИСТЕМНЫЙ ПРОМПТ
             system_instruction=(
                 "Ты AI-агент и root-админ Ubuntu. Твои инструменты: execute_bash, send_file_to_telegram, search_web_tool, read_webpage, download_web_file.\n"
                 "1. Поиск: используй search_web_tool. Ты МОЖЕШЬ использовать операторы: site:example.com, ext:pdf, filetype:sh, \"точная фраза\".\n"
@@ -511,10 +482,8 @@ def handle_query(call):
         return
     
     if data == "hide_message":
-        try:
-            bot.delete_message(call.message.chat.id, call.message.message_id)
-        except Exception:
-            pass
+        try: bot.delete_message(call.message.chat.id, call.message.message_id)
+        except Exception: pass
         return
     
     if data == "show_last_actions":
@@ -531,9 +500,9 @@ def handle_query(call):
                 bash_commands.append(act_val)
             elif act_type == "search":
                 log_text += f"🌐 <b>Поиск:</b> <i>{html.escape(act_val)}</i>\n"
-            elif act_type == "read_web": # Добавили вывод в лог
+            elif act_type == "read_web":
                 log_text += f"📖 <b>Чтение сайта:</b> <i>{html.escape(act_val)}</i>\n"
-            elif act_type == "download": # Добавили вывод в лог
+            elif act_type == "download":
                 log_text += f"⬇️ <b>Скачивание:</b> <i>{html.escape(act_val)}</i>\n"
             elif act_type == "file":
                 log_text += f"📤 <b>Отправлен файл:</b> <i>{html.escape(act_val)}</i>\n"
@@ -707,100 +676,5 @@ def handle_message(message):
         elif cmd == '/clear': clear_cmd(message)
         elif cmd == '/gemini': change_model(message)
         elif cmd == '/changekey': change_key_cmd(message)
-        elif cmd == '/start': send_welcome(message)
-        else: bot.reply_to(message, "⚠️ Неизвестная команда. ИИ игнорирует сообщения со слэшем (/).")
-        return
-
-    if not CURRENT_MODEL:
-        bot.reply_to(message, "⚠️ Сначала выберите модель (/gemini)", reply_markup=get_models_keyboard())
-        return
-
-    clean_model_name = CURRENT_MODEL.replace('models/', '')
-    is_gemma = "gemma" in clean_model_name.lower()
-    
-    is_voice = message.content_type == 'voice'
-    is_photo = message.content_type == 'photo'
-
-    if not is_voice and not is_photo:
-        if text.startswith('!'):
-            cmd = text[1:].strip()
-            log_admin_action(message.from_user.id, f"Прямая команда: {cmd}")
-            bot.send_message(message.chat.id, f"⚡ Выполняю напрямую:\n<code>{html.escape(cmd)}</code>", parse_mode='HTML')
-            result = execute_bash(cmd)
-            send_long_text(message.chat.id, result, is_code=True)
-            return
-
-        if text.startswith('#'):
-            task = text[1:].strip()
-            msg_first = bot.send_message(message.chat.id, f"<b>{clean_model_name}:</b>", parse_mode='HTML')
-            msg_wait = bot.send_message(message.chat.id, "🧠 Думаю...")
-            try:
-                response = model_advisor.generate_content(task)
-                send_long_text(message.chat.id, response.text, first_msg_id=msg_wait.message_id, is_code=True)
-            except Exception as e:
-                handle_api_error(e, message.chat.id, msg_wait.message_id, message, clean_model_name)
-            return
-
-    ACTION_LOGS[CURRENT_CHAT_ID] = []
-
-    msg_first = bot.send_message(message.chat.id, f"<b>{clean_model_name}:</b>", parse_mode='HTML')
-    msg_wait = bot.send_message(message.chat.id, "🤖 Обрабатываю запрос...")
-
-    try:
-        if is_voice:
-            file_info = bot.get_file(message.voice.file_id)
-            voice_path = f"temp_voice_{message.message_id}.ogg"
-            with open(voice_path, 'wb') as new_file:
-                new_file.write(bot.download_file(file_info.file_path))
-            
-            audio_file = genai.upload_file(path=voice_path, mime_type="audio/ogg")
-            
-            if is_gemma:
-                 response = chat_agent.send_message("Я получил аудио, но я текстовая модель Gemma и не умею слушать звук.")
-            else:
-                 base_prompt = "Обязательно прослушай этот аудиофайл. Если в нём звучит команда или задача для сервера — выполни её. Если это обычный разговор или вопрос — просто ответь на него."
-                 prompt = f"{text}\n\n{base_prompt}" if text else base_prompt
-                 response = chat_agent.send_message([audio_file, prompt])
-                 
-            os.remove(voice_path)
-            
-        elif is_photo:
-            file_info = bot.get_file(message.photo[-1].file_id)
-            photo_path = f"temp_photo_{message.message_id}.jpg"
-            with open(photo_path, 'wb') as new_file:
-                new_file.write(bot.download_file(file_info.file_path))
-                
-            img_file = genai.upload_file(path=photo_path)
-            
-            if is_gemma:
-                response = chat_agent.send_message("Я получил изображение, но я текстовая модель Gemma и не умею смотреть картинки.")
-            else:
-                prompt = text if text else "Проанализируй это изображение."
-                response = chat_agent.send_message([img_file, prompt])
-                
-            os.remove(photo_path)
-            
-        else:
-            response = chat_agent.send_message(text)
-            
-        bot.delete_message(chat_id=message.chat.id, message_id=msg_wait.message_id)
+        elif cmd
         
-        markup = None
-        if ACTION_LOGS.get(CURRENT_CHAT_ID):
-            LAST_ACTIONS[CURRENT_CHAT_ID] = ACTION_LOGS[CURRENT_CHAT_ID].copy()
-            markup = InlineKeyboardMarkup()
-            markup.add(InlineKeyboardButton("🛠 Выполненные действия", callback_data="show_last_actions"))
-        
-        prefix = f"<b>{clean_model_name}:</b>\n\n"
-        send_long_text(message.chat.id, response.text, first_msg_id=msg_first.message_id, prefix=prefix, reply_markup=markup)
-        
-        if VOICE_MODE.get(message.chat.id):
-            generate_and_send_voice(message.chat.id, response.text)
-                              
-    except Exception as e:
-        handle_api_error(e, message.chat.id, msg_wait.message_id, message, clean_model_name)
-
-if __name__ == '__main__':
-    print(f"AI-Админ запущен. Допущено админов: {len(ADMIN_IDS)}. Режим невидимки включен...")
-    bot.polling(none_stop=True)
-    
