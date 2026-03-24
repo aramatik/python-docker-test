@@ -6,6 +6,8 @@ import google.generativeai as genai
 import html
 import re
 import shlex
+import asyncio
+import edge_tts
 
 # Импортируем наши внешние модули
 from markdown import split_text_safely, md_to_html
@@ -68,7 +70,6 @@ PRIORITY_MODELS = [
 ]
 
 def log_admin_action(user_id, action):
-    """Логирует действия админов в консоль"""
     print(f"[ADMIN {user_id}] {action}")
 
 # --- ФУНКЦИИ ВЫВОДА И ГОЛОСА ---
@@ -108,43 +109,44 @@ def send_long_text(chat_id, text, first_msg_id=None, is_code=False, prefix="", r
                 bot.send_message(chat_id, chunk.strip(), reply_markup=current_markup)
 
 def clean_text_for_voice(text: str) -> str:
-    """Удаляет код, теги и спецсимволы, чтобы RHVoice читал только нормальный текст."""
+    """Удаляет код, теги и спецсимволы, оставляя чистый текст для нейросети."""
     if not text: return ""
     text = re.sub(r'```.*?```', '', text, flags=re.DOTALL)
     text = re.sub(r'`.*?`', '', text)
     text = re.sub(r'<[^>]*>', '', text)
     text = re.sub(r'[*#_~]', '', text)
-    text = text.replace('\n', '. ')
-    text = re.sub(r'\.{2,}', '.', text)
-    text = re.sub(r'\s{2,}', ' ', text)
     return text.strip()
 
 def generate_and_send_voice(chat_id, text):
-    """Генерирует аудио через RHVoice, конвертирует в OGG Opus и отправляет."""
+    """Генерирует нейросетевое аудио через Edge TTS и отправляет в Telegram."""
     clean_text = clean_text_for_voice(text)
     if not clean_text:
         return
         
-    clean_text = clean_text[:2000] # Защита от слишком долгих генераций
-    wav_path = f"temp_tts_{chat_id}.wav"
+    clean_text = clean_text[:3000] # Ограничение длины
+    mp3_path = f"temp_tts_{chat_id}.mp3"
     ogg_path = f"temp_tts_{chat_id}.ogg"
     
     try:
-        safe_text = shlex.quote(clean_text)
-        tts_cmd = f"echo {safe_text} | RHVoice-test -p anna -o {wav_path}"
-        subprocess.run(tts_cmd, shell=True, timeout=60, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        # Асинхронная генерация речи (голос Светланы, женский, русский)
+        async def _generate():
+            communicate = edge_tts.Communicate(clean_text, "ru-RU-SvetlanaNeural")
+            await communicate.save(mp3_path)
+            
+        asyncio.run(_generate())
         
-        if os.path.exists(wav_path):
-            ffmpeg_cmd = f"ffmpeg -i {wav_path} -c:a libopus -b:a 32k -v quiet -y {ogg_path}"
+        # Конвертация в OGG Opus для Telegram
+        if os.path.exists(mp3_path):
+            ffmpeg_cmd = f"ffmpeg -i {mp3_path} -c:a libopus -b:a 32k -v quiet -y {ogg_path}"
             subprocess.run(ffmpeg_cmd, shell=True, timeout=60)
             
             if os.path.exists(ogg_path):
                 with open(ogg_path, 'rb') as voice_file:
                     bot.send_voice(chat_id, voice_file)
     except Exception as e:
-        print(f"Ошибка синтеза голоса: {e}")
+        print(f"Ошибка синтеза голоса (Edge TTS): {e}")
     finally:
-        if os.path.exists(wav_path): os.remove(wav_path)
+        if os.path.exists(mp3_path): os.remove(mp3_path)
         if os.path.exists(ogg_path): os.remove(ogg_path)
 
 # --- АГЕНТСКИЕ ИНСТРУМЕНТЫ (TOOLS) ---
@@ -426,7 +428,6 @@ def handle_query(call):
     global CURRENT_CHAT_ID
     data = call.data
 
-    # --- ОБРАБОТЧИКИ ГОЛОСОВОГО РЕЖИМА ---
     if data == "voice_on":
         VOICE_MODE[call.message.chat.id] = True
         safe_edit_message(call.message.chat.id, call.message.message_id, "🟢 Голосовой режим <b>ВКЛЮЧЕН</b>.\nИИ будет озвучивать свои ответы.", parse_mode='HTML')
@@ -437,7 +438,6 @@ def handle_query(call):
         safe_edit_message(call.message.chat.id, call.message.message_id, "🔴 Голосовой режим <b>ВЫКЛЮЧЕН</b>.", parse_mode='HTML')
         return
     
-    # --- ОБРАБОТЧИК КНОПКИ СКРЫТИЯ СООБЩЕНИЯ ---
     if data == "hide_message":
         try:
             bot.delete_message(call.message.chat.id, call.message.message_id)
@@ -445,7 +445,6 @@ def handle_query(call):
             pass
         return
     
-    # --- ОБРАБОТЧИК КНОПКИ ВЫВОДА ДЕЙСТВИЙ ИИ ---
     if data == "show_last_actions":
         actions = LAST_ACTIONS.get(call.message.chat.id)
         if not actions:
@@ -624,13 +623,8 @@ def handle_message(message):
 
     global CURRENT_CHAT_ID
     CURRENT_CHAT_ID = message.chat.id
-    
     text = (message.text or message.caption or "").strip()
 
-    # --- РУЧНОЙ ПЕРЕХВАТ КОМАНД ---
-    # Если это сообщение начинается со слэша, Telegram по какой-то причине мог
-    # пропустить его мимо декораторов (например, из-за опечатки пользователя).
-    # Мы перехватываем его здесь, чтобы ни в коем случае не отдавать ИИ.
     if text.startswith('/'):
         cmd = text.split()[0].lower()
         if cmd == '/voice': voice_mode_cmd(message)
@@ -689,9 +683,8 @@ def handle_message(message):
             if is_gemma:
                  response = chat_agent.send_message("Я получил аудио, но я текстовая модель Gemma и не умею слушать звук.")
             else:
-                 # Отправляем аудиофайл нативно. Если есть текст (подпись), добавляем его.
-                 content = [audio_file, text] if text else [audio_file]
-                 response = chat_agent.send_message(content)
+                 prompt = text if text else "Прослушай это голосовое сообщение и ответь на него."
+                 response = chat_agent.send_message([audio_file, prompt])
                  
             os.remove(voice_path)
             
@@ -706,8 +699,8 @@ def handle_message(message):
             if is_gemma:
                 response = chat_agent.send_message("Я получил изображение, но я текстовая модель Gemma и не умею смотреть картинки.")
             else:
-                content = [img_file, text] if text else [img_file]
-                response = chat_agent.send_message(content)
+                prompt = text if text else "Проанализируй это изображение."
+                response = chat_agent.send_message([img_file, prompt])
                 
             os.remove(photo_path)
             
