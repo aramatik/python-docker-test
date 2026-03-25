@@ -22,7 +22,7 @@ API_KEY_1 = os.getenv("GEMINI_API_KEY")
 API_KEY_2 = os.getenv("GEMINI2_API_KEY")
 API_KEY_3 = os.getenv("GEMINI3_API_KEY")
 
-# Безопасно собираем все ID админов в множество
+# Безопасно собираем все ID админов
 ADMIN_IDS = set()
 for env_var in ["ADMIN_ID", "ADMIN2_ID", "ADMIN3_ID"]:
     val = os.getenv(env_var)
@@ -49,21 +49,21 @@ PENDING_FILES = {}
 PENDING_SEARCH_RESULTS = {}
 
 # Настройки Gemma
-GEMMA_ROLE = {} # {chat_id: "admin" | "chat"}
-GEMMA_MODE = {} # {chat_id: "auto" | "semi"}
-PENDING_GEMMA_ACTION = {} # {chat_id: {"type": "bash", "val": "...", "msg_id": 123}}
+GEMMA_ROLE = {} 
+GEMMA_MODE = {} 
+PENDING_GEMMA_ACTION = {} 
 
-# Глобальные журналы и настройки
 ACTION_LOGS = {}
-LAST_ACTIONS = {} # Хранит логи по message_id: {message_id: list}
-VOICE_MODE = {}  # Состояние голосовых ответов для чата: {chat_id: bool}
-
-# Статусные сообщения ИИ (для live-редактирования) {chat_id: message_id}
+LAST_ACTIONS = {} 
+VOICE_MODE = {}  
 STATUS_MSG = {}
 
 # ─────────────────────────────────────────────
-#  ЛИМИТЫ API, МОДЕЛИ И ИСТОРИЯ ЗАПРОСОВ
+#  КОНФИГУРАЦИЯ: ПРОМПТЫ, МОДЕЛИ, ЛИМИТЫ
 # ─────────────────────────────────────────────
+
+PROMPTS_FILE = "prompts.txt"
+PROMPTS = {}
 
 MODELS_FILE = "models.txt"
 MODEL_RPM_LIMITS = {}
@@ -78,37 +78,55 @@ MODEL_TPM_LIMITS = {
 }
 PRIORITY_MODELS = []
 
+def load_prompts_config():
+    """Загружает системные промпты из файла prompts.txt"""
+    global PROMPTS
+    PROMPTS.clear()
+    
+    if not os.path.exists(PROMPTS_FILE):
+        default_prompts = """[GEMINI_ADMIN]
+Ты AI-агент и root-админ Ubuntu. Твои инструменты: execute_bash, send_file_to_telegram, search_web_tool, download_file_tool.
+Используй поиск для получения актуальной информации (курсы валют, новости).
+
+[GEMINI_ADVISOR]
+Ты root-админ Ubuntu. Дай только bash-команду (без sudo).
+
+[GEMMA_ADMIN_REACT]
+[SYSTEM] Ты автономный AI-админ. Если нужно выполнить команду: <BASH>cmd</BASH>. Поиск в сети: <SEARCH>query</SEARCH>. Скачать файл: <DOWNLOAD>url</DOWNLOAD>. Отправить файл: <FILE>path</FILE>."""
+        with open(PROMPTS_FILE, "w", encoding="utf-8") as f:
+            f.write(default_prompts)
+
+    with open(PROMPTS_FILE, "r", encoding="utf-8") as f:
+        current_key = None
+        current_text = []
+        for line in f:
+            match = re.match(r'^\[(.*?)\]$', line.strip())
+            if match:
+                if current_key:
+                    PROMPTS[current_key] = "\n".join(current_text).strip()
+                current_key = match.group(1)
+                current_text = []
+            else:
+                current_text.append(line.rstrip('\n'))
+        if current_key:
+            PROMPTS[current_key] = "\n".join(current_text).strip()
+    print(f"Загружены промпты: {list(PROMPTS.keys())}")
+
 def load_models_config():
-    """Загружает список моделей, RPM лимиты и ограничения по ключам из файла."""
+    """Загружает список моделей и лимиты из models.txt"""
     global PRIORITY_MODELS, MODEL_RPM_LIMITS, MODEL_RESTRICTED_KEYS
     PRIORITY_MODELS.clear()
     MODEL_RPM_LIMITS.clear()
     MODEL_RESTRICTED_KEYS.clear()
     
     if not os.path.exists(MODELS_FILE):
-        default_content = """gemini-2.5-flash [RPM:5]
-gemini-flash-latest [RPM:5]
-gemini-3-flash-preview [RPM:5]
-gemini-2.5-flash-lite [RPM:10]
-gemini-3.1-flash-lite-preview [RPM:15]
-gemini-flash-lite-latest [RPM:15]
-gemini-2.5-flash-lite-preview-sep-2025 [RPM:10,KEY:2,3]
-gemini-robotics-er-1.5-preview
-gemma-3-1b [RPM:15]
-gemma-3-4b [RPM:15]
-gemma-3-12b [RPM:15]
-gemma-3-27b [RPM:15]
-gemma-3n-e4b [RPM:15]
-gemma-3n-e2b [RPM:15]
-gemini-2.5-pro"""
-        with open(MODELS_FILE, "w", encoding="utf-8") as f:
-            f.write(default_content)
+        default_content = "gemini-2.5-flash [RPM:5]\ngemma-3-27b [RPM:15]\n"
+        with open(MODELS_FILE, "w", encoding="utf-8") as f: f.write(default_content)
     
     with open(MODELS_FILE, "r", encoding="utf-8") as f:
         for line in f:
             line = line.strip()
-            if not line or line.startswith("#"):
-                continue
+            if not line or line.startswith("#"): continue
             
             model_match = re.search(r'^([\w\-\.]+)', line)
             if model_match:
@@ -116,16 +134,16 @@ gemini-2.5-pro"""
                 PRIORITY_MODELS.append(model_name)
                 
                 rpm_match = re.search(r'RPM:(\d+)', line)
-                if rpm_match:
-                    MODEL_RPM_LIMITS[model_name] = int(rpm_match.group(1))
+                if rpm_match: MODEL_RPM_LIMITS[model_name] = int(rpm_match.group(1))
                     
                 key_match = re.search(r'KEY:([\d,]+)', line)
                 if key_match:
-                    keys_str = key_match.group(1)
-                    MODEL_RESTRICTED_KEYS[model_name] = [int(k) for k in keys_str.split(',') if k.isdigit()]
+                    MODEL_RESTRICTED_KEYS[model_name] = [int(k) for k in key_match.group(1).split(',') if k.isdigit()]
                     
     print(f"Загружено {len(PRIORITY_MODELS)} моделей из {MODELS_FILE}")
 
+# Вызываем загрузку конфигов при старте
+load_prompts_config()
 load_models_config()
 
 API_REQUEST_HISTORY = {1: deque(), 2: deque(), 3: deque()}
@@ -171,14 +189,11 @@ def check_api_rate_limit(chat_id, current_status_text):
     clean_name = CURRENT_MODEL.replace('models/', '')
     rpm_limit = MODEL_RPM_LIMITS.get(clean_name)
     tpm_limit = MODEL_TPM_LIMITS.get(clean_name)
-    
     now = time.time()
     
     if rpm_limit:
         history_rpm = API_REQUEST_HISTORY.setdefault(CURRENT_KEY_NUM, deque())
-        while history_rpm and now - history_rpm[0] > 60.5:
-            history_rpm.popleft()
-
+        while history_rpm and now - history_rpm[0] > 60.5: history_rpm.popleft()
         if len(history_rpm) >= rpm_limit:
             wait_time = 60.5 - (now - history_rpm[0])
             if wait_time > 0:
@@ -189,9 +204,7 @@ def check_api_rate_limit(chat_id, current_status_text):
 
     if tpm_limit:
         history_tpm = API_TOKEN_HISTORY.setdefault(CURRENT_KEY_NUM, deque())
-        while history_tpm and now - history_tpm[0][0] > 60.5:
-            history_tpm.popleft()
-            
+        while history_tpm and now - history_tpm[0][0] > 60.5: history_tpm.popleft()
         current_tpm = sum(count for _, count in history_tpm)
         if current_tpm > (tpm_limit - 1000):
             wait_time = 60.5 - (now - history_tpm[0][0])
@@ -248,13 +261,11 @@ def clean_text_for_voice(text: str) -> str:
 def generate_and_send_voice(chat_id, text):
     clean_text = clean_text_for_voice(text)
     if not clean_text: return
-
     voice_chunks = split_text_safely(clean_text, max_len=2000)
     total_chunks = len(voice_chunks)
 
     for i, chunk in enumerate(voice_chunks):
         if not chunk.strip(): continue
-
         mp3_path = f"temp_tts_{chat_id}_{i}.mp3"
         ogg_path = f"temp_tts_{chat_id}_{i}.ogg"
         msg_wait_voice = None
@@ -263,23 +274,15 @@ def generate_and_send_voice(chat_id, text):
             part_text = f" [часть {i+1}/{total_chunks}]" if total_chunks > 1 else ""
             msg_wait_voice = bot.send_message(chat_id, f"🎙 <i>Отправка голосового сообщения{part_text}...</i>", parse_mode='HTML')
             bot.send_chat_action(chat_id, 'record_voice')
-
             async def _generate():
                 communicate = edge_tts.Communicate(chunk, "ru-RU-SvetlanaNeural")
                 await communicate.save(mp3_path)
-
             asyncio.run(_generate())
-
             if os.path.exists(mp3_path):
-                ffmpeg_cmd = f"ffmpeg -i {mp3_path} -c:a libopus -b:a 32k -v quiet -y {ogg_path}"
-                subprocess.run(ffmpeg_cmd, shell=True, timeout=60)
-
+                subprocess.run(f"ffmpeg -i {mp3_path} -c:a libopus -b:a 32k -v quiet -y {ogg_path}", shell=True, timeout=60)
                 if os.path.exists(ogg_path):
-                    with open(ogg_path, 'rb') as voice_file:
-                        bot.send_voice(chat_id, voice_file)
-
-        except Exception as e:
-            print(f"Ошибка синтеза голоса (кусок {i}): {e}")
+                    with open(ogg_path, 'rb') as voice_file: bot.send_voice(chat_id, voice_file)
+        except Exception as e: print(f"Ошибка синтеза: {e}")
         finally:
             if msg_wait_voice:
                 try: bot.delete_message(chat_id, msg_wait_voice.message_id)
@@ -292,13 +295,12 @@ def generate_and_send_voice(chat_id, text):
 # ─────────────────────────────────────────────
 
 def execute_bash(command: str) -> str:
-    print(f"Выполнение: {command}")
     if CURRENT_CHAT_ID:
         ACTION_LOGS.setdefault(CURRENT_CHAT_ID, []).append(("bash", command))
         short_cmd = command if len(command) <= 80 else command[:77] + "…"
         status_text = f"⚙️ <b>Выполняю команду:</b>\n<code>{html.escape(short_cmd)}</code>"
         set_status(CURRENT_CHAT_ID, status_text)
-        
+        check_api_rate_limit(CURRENT_CHAT_ID, status_text) 
     try:
         result = subprocess.run(command, shell=True, capture_output=True, text=True, timeout=30)
         output = result.stdout if result.stdout else result.stderr
@@ -311,6 +313,7 @@ def search_web_tool(query: str) -> str:
         short_q = query if len(query) <= 80 else query[:77] + "…"
         status_text = f"🔍 <b>Ищу в интернете:</b>\n<i>{html.escape(short_q)}</i>"
         set_status(CURRENT_CHAT_ID, status_text)
+        check_api_rate_limit(CURRENT_CHAT_ID, status_text) 
     return web_search.search_web(query)
 
 def download_file_tool(url: str) -> str:
@@ -319,6 +322,7 @@ def download_file_tool(url: str) -> str:
         short_url = url if len(url) <= 70 else url[:67] + "…"
         status_text = f"⬇️ <b>Скачиваю файл:</b>\n<code>{html.escape(short_url)}</code>"
         set_status(CURRENT_CHAT_ID, status_text)
+        check_api_rate_limit(CURRENT_CHAT_ID, status_text) 
     return web_search.download_file_tool(url)
 
 def send_file_to_telegram(filepath: str) -> str:
@@ -339,19 +343,15 @@ def send_file_to_telegram(filepath: str) -> str:
         return f"Ошибка отправки файла: {str(e)}"
 
 # ─────────────────────────────────────────────
-#  ЛОГИКА МОДЕЛЕЙ
+#  ЛОГИКА МОДЕЛЕЙ И ПРОМПТОВ
 # ─────────────────────────────────────────────
 
 def get_models_lists():
     raw_models = [m.name for m in genai.list_models() if 'generateContent' in m.supported_generation_methods]
-    priority = []
-    other = []
-    used_models = set()
+    priority, other, used_models = [], [], set()
 
     for p in PRIORITY_MODELS:
-        restricted_keys = MODEL_RESTRICTED_KEYS.get(p, [])
-        if CURRENT_KEY_NUM in restricted_keys: continue 
-
+        if CURRENT_KEY_NUM in MODEL_RESTRICTED_KEYS.get(p, []): continue 
         search_str = p.lower().replace("sep-2025", "09-2025")
         best_match = None
         for m in raw_models:
@@ -361,10 +361,8 @@ def get_models_lists():
                 best_match = m
                 break
             elif search_str in clean_m:
-                if "tts" in clean_m and "tts" not in search_str: continue
-                if "image" in clean_m and "image" not in search_str: continue
-                if not best_match:
-                    best_match = m
+                if "tts" in clean_m or "image" in clean_m: continue
+                if not best_match: best_match = m
         if best_match:
             priority.append(best_match)
             used_models.add(best_match)
@@ -397,7 +395,6 @@ def get_models_keyboard(show_all=False):
     else:
         if OTHER_MODELS_CACHE:
             markup.add(InlineKeyboardButton(text="⬇️ Другие модели", callback_data="show_all_mods"))
-
     return markup
 
 def init_models(model_name, role="admin"):
@@ -412,26 +409,13 @@ def init_models(model_name, role="admin"):
         model_agent = genai.GenerativeModel(
             model_name=model_name,
             tools=[execute_bash, send_file_to_telegram, search_web_tool, download_file_tool],
-            system_instruction=(
-                "Ты AI-агент и root-админ Ubuntu. Твои инструменты: execute_bash, send_file_to_telegram, search_web_tool, download_file_tool.\n"
-                "1. Пакеты: используй apt/apt-get. Ты root, sudo не нужен.\n"
-                "2. Файлы: чтение через execute_bash (cat, ls), отправка юзеру через send_file_to_telegram.\n"
-                "3. Поиск в интернете: используй search_web_tool. Поддерживает операторы:\n"
-                "   - Обычный поиск: \"как настроить redis\"\n"
-                "   - По сайту: \"nginx docs site:nginx.org\"\n"
-                "   - По типу файла: \"ubuntu manual filetype:pdf\"\n"
-                "   - Прямая загрузка: \"download:https://example.com/file.tar.gz\"\n"
-                "4. Скачать файл по прямой ссылке: используй download_file_tool(url).\n"
-                "   Файл сохранится в /app/downloads/, затем можно отправить через send_file_to_telegram.\n"
-                "Вызывай инструменты (даже несколько раз подряд), анализируй их вывод и давай пользователю финальный текстовый ответ в формате Markdown.\n"
-                "Тебе НЕ НУЖНО имитировать консольный вывод, просто отвечай на языке пользователя."
-            )
+            system_instruction=PROMPTS.get("GEMINI_ADMIN", "Ты AI-админ.")
         )
         chat_agent = model_agent.start_chat(enable_automatic_function_calling=True)
 
         model_advisor = genai.GenerativeModel(
             model_name=model_name,
-            system_instruction="Ты root-админ Ubuntu. Дай только bash-команду (через apt-get, без sudo). Без markdown и пояснений."
+            system_instruction=PROMPTS.get("GEMINI_ADVISOR", "Дай bash-команду.")
         )
 
 def handle_api_error(e, chat_id, message_id, original_message, clean_model_name):
@@ -454,31 +438,29 @@ def handle_api_error(e, chat_id, message_id, original_message, clean_model_name)
 @bot.message_handler(commands=['start'])
 def send_welcome(message):
     if message.from_user.id not in ADMIN_IDS: return
-    log_admin_action(message.from_user.id, "Команда /start")
     bot.reply_to(message, "👋 Привет, Админ!\nВыбери модель Gemini:", reply_markup=get_models_keyboard())
 
 @bot.message_handler(commands=['gemini'])
 def change_model(message):
     if message.from_user.id not in ADMIN_IDS: return
-    log_admin_action(message.from_user.id, "Команда /gemini")
     bot.reply_to(message, "Выберите модель:", reply_markup=get_models_keyboard())
 
-@bot.message_handler(commands=['reload_models'])
-def reload_models_cmd(message):
+@bot.message_handler(commands=['reload'])
+def reload_configs_cmd(message):
+    """Обновляет конфиги моделей и промптов на лету."""
     if message.from_user.id not in ADMIN_IDS: return
-    log_admin_action(message.from_user.id, "Команда /reload_models")
     try:
         load_models_config()
+        load_prompts_config()
         global PRIORITY_MODELS_CACHE, OTHER_MODELS_CACHE, AVAILABLE_MODELS
         PRIORITY_MODELS_CACHE, OTHER_MODELS_CACHE, AVAILABLE_MODELS = [], [], [] 
-        bot.reply_to(message, f"✅ Файл <code>{MODELS_FILE}</code> успешно обновлен на лету!\nЗагружено <b>{len(PRIORITY_MODELS)}</b> моделей.", parse_mode='HTML')
+        bot.reply_to(message, f"✅ Конфигурация успешно обновлена!\nЗагружено <b>{len(PRIORITY_MODELS)}</b> моделей.\nЗагружены промпты: <b>{', '.join(PROMPTS.keys())}</b>.", parse_mode='HTML')
     except Exception as e:
         bot.reply_to(message, f"❌ Ошибка обновления: {e}")
 
 @bot.message_handler(commands=['changekey'])
 def change_key_cmd(message):
     if message.from_user.id not in ADMIN_IDS: return
-    log_admin_action(message.from_user.id, "Команда /changekey")
     markup = InlineKeyboardMarkup()
     markup.add(
         InlineKeyboardButton(text="🔑 KEY 1" + (" (Активен)" if CURRENT_KEY_NUM == 1 else ""), callback_data="key_1"),
@@ -490,7 +472,6 @@ def change_key_cmd(message):
 @bot.message_handler(commands=['voice'])
 def voice_mode_cmd(message):
     if message.from_user.id not in ADMIN_IDS: return
-    log_admin_action(message.from_user.id, "Команда /voice")
     is_active = VOICE_MODE.get(message.chat.id, False)
     status_text = "ВКЛЮЧЕН 🟢" if is_active else "ВЫКЛЮЧЕН 🔴"
     markup = InlineKeyboardMarkup()
@@ -500,7 +481,6 @@ def voice_mode_cmd(message):
 @bot.message_handler(commands=['clear'])
 def clear_cmd(message):
     if message.from_user.id not in ADMIN_IDS: return
-    log_admin_action(message.from_user.id, "Команда /clear")
     global chat_agent, CURRENT_MODEL
     if not CURRENT_MODEL:
         bot.reply_to(message, "⚠️ Модель еще не выбрана. Память пуста.")
@@ -508,13 +488,11 @@ def clear_cmd(message):
     try:
         init_models(CURRENT_MODEL)
         bot.reply_to(message, "🧹 Контекст и память ИИ успешно очищены!")
-    except Exception as e:
-        bot.reply_to(message, f"❌ Ошибка очистки памяти: {e}")
+    except Exception as e: bot.reply_to(message, f"❌ Ошибка: {e}")
 
 @bot.message_handler(commands=['search'])
 def search_cmd(message):
     if message.from_user.id not in ADMIN_IDS: return
-    log_admin_action(message.from_user.id, "Команда /search")
     msg = bot.reply_to(message, "Введите поисковый запрос (фразы в [квадратных скобках] ищутся целиком):")
     bot.register_next_step_handler(msg, process_search_query)
 
@@ -525,9 +503,7 @@ def process_search_query(message):
         bot.reply_to(message, "⚠️ Пустой запрос.")
         return
     words = parse_search_query(query)
-    if not words:
-        bot.reply_to(message, "⚠️ Не удалось разобрать запрос.")
-        return
+    if not words: return
     msg_wait = bot.send_message(message.chat.id, f"🔍 Ищу в базе: <code>{' | '.join(words)}</code>...", parse_mode='HTML')
     try:
         output = run_grep_search(words)
@@ -536,22 +512,17 @@ def process_search_query(message):
             return
         bot.delete_message(message.chat.id, msg_wait.message_id)
         formatted_chunks, clean_text_for_file = format_search_results(output, words)
-        for chunk in formatted_chunks[:5]:
-            bot.send_message(message.chat.id, f"<pre>{chunk.strip()}</pre>", parse_mode='HTML')
+        for chunk in formatted_chunks[:5]: bot.send_message(message.chat.id, f"<pre>{chunk.strip()}</pre>", parse_mode='HTML')
         if len(formatted_chunks) > 5:
             PENDING_SEARCH_RESULTS[message.chat.id] = clean_text_for_file
             markup = InlineKeyboardMarkup()
             markup.add(InlineKeyboardButton("📥 Скачать всё (.txt)", callback_data="download_search_txt"))
             bot.send_message(message.chat.id, f"⚠️ <b>Внимание:</b> Показано 5 сообщений из {len(formatted_chunks)}. Остальной текст обрезан.\n\nВы можете скачать полные результаты поиска отдельным файлом:", parse_mode='HTML', reply_markup=markup)
-    except subprocess.TimeoutExpired:
-        safe_edit_message(message.chat.id, msg_wait.message_id, "❌ Ошибка: Превышено время ожидания поиска (более 60 секунд).")
-    except Exception as e:
-        safe_edit_message(message.chat.id, msg_wait.message_id, f"❌ Ошибка поиска: {html.escape(str(e))}")
+    except Exception as e: safe_edit_message(message.chat.id, msg_wait.message_id, f"❌ Ошибка поиска: {html.escape(str(e))}")
 
 @bot.message_handler(content_types=['document'])
 def handle_document(message):
     if message.from_user.id not in ADMIN_IDS: return
-    log_admin_action(message.from_user.id, f"Загрузил документ: {message.document.file_name}")
     global CURRENT_CHAT_ID
     CURRENT_CHAT_ID = message.chat.id
     PENDING_FILES[message.chat.id] = {
@@ -577,7 +548,7 @@ def handle_query(call):
 
     if data == "voice_on":
         VOICE_MODE[call.message.chat.id] = True
-        safe_edit_message(call.message.chat.id, call.message.message_id, "🟢 Голосовой режим <b>ВКЛЮЧЕН</b>.\nИИ будет озвучивать свои ответы.", parse_mode='HTML')
+        safe_edit_message(call.message.chat.id, call.message.message_id, "🟢 Голосовой режим <b>ВКЛЮЧЕН</b>.", parse_mode='HTML')
         return
 
     if data == "voice_off":
@@ -594,11 +565,10 @@ def handle_query(call):
         try:
             target_msg_id = int(data.split("_")[2])
             actions = LAST_ACTIONS.get(target_msg_id)
-        except Exception:
-            actions = None
+        except Exception: actions = None
 
         if not actions:
-            bot.answer_callback_query(call.id, "❌ Данные об этих действиях устарели (бот был перезапущен).", show_alert=True)
+            bot.answer_callback_query(call.id, "❌ Данные об этих действиях устарели.", show_alert=True)
             return
 
         log_text = ""
@@ -612,8 +582,7 @@ def handle_query(call):
 
         if bash_commands:
             bash_str = "\n".join(bash_commands)
-            if log_text: log_text += f'\n<pre><code class="language-bash">{html.escape(bash_str)}</code></pre>'
-            else: log_text += f'<pre><code class="language-bash">{html.escape(bash_str)}</code></pre>'
+            log_text += f'\n<pre><code class="language-bash">{html.escape(bash_str)}</code></pre>'
 
         hide_markup = InlineKeyboardMarkup()
         hide_markup.add(InlineKeyboardButton("❌ Скрыть", callback_data="hide_message"))
@@ -632,10 +601,9 @@ def handle_query(call):
             with open(temp_filename, "w", encoding="utf-8") as f: f.write(full_text)
             with open(temp_filename, "rb") as f: bot.send_document(call.message.chat.id, f, caption="📁 Полные результаты поиска")
             safe_edit_message(call.message.chat.id, call.message.message_id, "✅ Файл успешно отправлен.")
-        except Exception as e: safe_edit_message(call.message.chat.id, call.message.message_id, f"❌ Ошибка файла: {str(e)}")
+        except Exception as e: safe_edit_message(call.message.chat.id, call.message.message_id, f"❌ Ошибка: {str(e)}")
         finally:
             if os.path.exists(temp_filename): os.remove(temp_filename)
-            PENDING_SEARCH_RESULTS.pop(call.message.chat.id, None)
         return
 
     if data == "show_all_mods":
@@ -783,18 +751,20 @@ def handle_query(call):
             return
 
 # ─────────────────────────────────────────────
-#  ReAct ЛОГИКА ДЛЯ GEMMA
+#  ReAct ЛОГИКА ДЛЯ GEMMA (С ДОБАВЛЕНИЕМ <FILE>)
 # ─────────────────────────────────────────────
 
 def process_gemma_react(chat_id, response_text, first_msg_id):
     bash_match = re.search(r'<BASH>(.*?)</BASH>', response_text, re.DOTALL | re.IGNORECASE)
     search_match = re.search(r'<SEARCH>(.*?)</SEARCH>', response_text, re.DOTALL | re.IGNORECASE)
     dl_match = re.search(r'<DOWNLOAD>(.*?)</DOWNLOAD>', response_text, re.DOTALL | re.IGNORECASE)
+    file_match = re.search(r'<FILE>(.*?)</FILE>', response_text, re.DOTALL | re.IGNORECASE)
     
     action = None
     if bash_match: action = {"type": "bash", "val": bash_match.group(1).strip(), "msg_id": first_msg_id}
     elif search_match: action = {"type": "search", "val": search_match.group(1).strip(), "msg_id": first_msg_id}
     elif dl_match: action = {"type": "download", "val": dl_match.group(1).strip(), "msg_id": first_msg_id}
+    elif file_match: action = {"type": "file", "val": file_match.group(1).strip(), "msg_id": first_msg_id}
     
     if not action:
         clean_model_name = CURRENT_MODEL.replace('models/', '')
@@ -815,7 +785,11 @@ def process_gemma_react(chat_id, response_text, first_msg_id):
         clear_status(chat_id)
         markup = InlineKeyboardMarkup()
         markup.row(InlineKeyboardButton("✅ Выполнить", callback_data=f"gact_yes_{chat_id}"), InlineKeyboardButton("❌ Отмена", callback_data=f"gact_no_{chat_id}"))
-        act_name = "Команда BASH" if action['type'] == 'bash' else ("Поиск в сети" if action['type'] == 'search' else "Скачивание файла")
+        
+        # Определяем красивое имя для действия
+        act_names = {"bash": "Команда BASH", "search": "Поиск в сети", "download": "Скачивание файла", "file": "Отправка файла в чат"}
+        act_name = act_names.get(action['type'])
+        
         bot.send_message(chat_id, f"🤖 <b>Gemma запрашивает действие:</b>\n\n{act_name}:\n<code>{html.escape(action['val'])}</code>", parse_mode='HTML', reply_markup=markup)
     else:
         execute_gemma_action(chat_id, action)
@@ -826,8 +800,9 @@ def execute_gemma_action(chat_id, action):
     if action["type"] == "bash": res = execute_bash(action["val"])
     elif action["type"] == "search": res = search_web_tool(action["val"])
     elif action["type"] == "download": res = download_file_tool(action["val"])
+    elif action["type"] == "file": res = send_file_to_telegram(action["val"])
     
-    followup_prompt = f"РЕЗУЛЬТАТ ВЫПОЛНЕНИЯ ({action['type']}):\n{res}\nОсновываясь на этом, дай финальный ответ или вызови инструмент снова."
+    followup_prompt = f"РЕЗУЛЬТАТ ВЫПОЛНЕНИЯ ({action['type']}):\n{res}\nОсновываясь на этом, дай финальный ответ (если задача выполнена) или вызови новый тег."
     status_text = "🧠 <b>Gemma анализирует результат...</b>"
     set_status(chat_id, status_text)
     
@@ -847,7 +822,6 @@ def execute_gemma_action(chat_id, action):
 @bot.message_handler(content_types=['voice', 'text', 'photo'])
 def handle_message(message):
     if message.from_user.id not in ADMIN_IDS: return
-    log_admin_action(message.from_user.id, f"Сообщение: {message.content_type}")
 
     global CURRENT_CHAT_ID
     CURRENT_CHAT_ID = message.chat.id
@@ -860,9 +834,9 @@ def handle_message(message):
         elif cmd == '/clear': clear_cmd(message)
         elif cmd == '/gemini': change_model(message)
         elif cmd == '/changekey': change_key_cmd(message)
-        elif cmd == '/reload_models': reload_models_cmd(message)
+        elif cmd == '/reload': reload_configs_cmd(message)
         elif cmd == '/start': send_welcome(message)
-        else: bot.reply_to(message, "⚠️ Неизвестная команда. ИИ игнорирует сообщения со слэшем (/).")
+        else: bot.reply_to(message, "⚠️ Неизвестная команда.")
         return
 
     if not CURRENT_MODEL:
@@ -878,7 +852,6 @@ def handle_message(message):
     if not is_voice and not is_photo:
         if text.startswith('!'):
             cmd = text[1:].strip()
-            log_admin_action(message.from_user.id, f"Прямая команда: {cmd}")
             bot.send_message(message.chat.id, f"⚡ Выполняю напрямую:\n<code>{html.escape(cmd)}</code>", parse_mode='HTML')
             result = execute_bash(cmd)
             send_long_text(message.chat.id, result, is_code=True)
@@ -957,17 +930,15 @@ def handle_message(message):
             check_api_rate_limit(message.chat.id, status_text)
             
             if is_gemma and GEMMA_ROLE.get(message.chat.id) == "admin":
-                react_sys = (
-                    "\n\n[SYSTEM] Ты AI-админ. Если нужно получить инфо с сервера, напиши строго <BASH>команда</BASH>. "
-                    "Если нужен поиск в интернете: <SEARCH>запрос</SEARCH>. Скачать файл по ссылке: <DOWNLOAD>url</DOWNLOAD>. "
-                    "Используй ТОЛЬКО ОДИН тег за раз. Если информация уже собрана, просто ответь текстом без тегов."
-                )
+                # ПОДКЛЕИВАЕМ ПРОМПТ ИЗ ФАЙЛА
+                react_sys = "\n\n" + PROMPTS.get("GEMMA_ADMIN_REACT", "[SYSTEM] Используй теги: <BASH>, <SEARCH>, <DOWNLOAD>, <FILE>.")
                 final_text = text + react_sys
+                
                 response = chat_agent.send_message(final_text)
                 if hasattr(response, 'usage_metadata'): track_token_usage(response.usage_metadata.total_token_count)
                 
                 process_gemma_react(message.chat.id, response.text, msg_first.message_id)
-                return # Выходим, так как process_gemma_react сам отправит финальный текст и логи
+                return 
             else:
                 response = chat_agent.send_message(text)
                 if hasattr(response, 'usage_metadata'): track_token_usage(response.usage_metadata.total_token_count)
@@ -991,6 +962,5 @@ def handle_message(message):
         handle_api_error(e, message.chat.id, msg_first.message_id, message, clean_model_name)
 
 if __name__ == '__main__':
-    print(f"AI-Админ запущен. Допущено админов: {len(ADMIN_IDS)}. ReAct логика готова.")
+    print(f"AI-Админ запущен. Допущено админов: {len(ADMIN_IDS)}.")
     bot.polling(none_stop=True)
-        
