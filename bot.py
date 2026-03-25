@@ -22,7 +22,6 @@ API_KEY_1 = os.getenv("GEMINI_API_KEY")
 API_KEY_2 = os.getenv("GEMINI2_API_KEY")
 API_KEY_3 = os.getenv("GEMINI3_API_KEY")
 
-# Безопасно собираем все ID админов
 ADMIN_IDS = set()
 for env_var in ["ADMIN_ID", "ADMIN2_ID", "ADMIN3_ID"]:
     val = os.getenv(env_var)
@@ -48,10 +47,10 @@ PENDING_RETRY_MESSAGE = None
 PENDING_FILES = {}
 PENDING_SEARCH_RESULTS = {}
 
-# Настройки Gemma
-GEMMA_ROLE = {} 
-GEMMA_MODE = {} 
-PENDING_GEMMA_ACTION = {} 
+# Единые настройки для ВСЕХ моделей
+MODEL_ROLE = {}  # {chat_id: "admin" | "chat"}
+MODEL_MODE = {}  # {chat_id: "auto" | "semi"}
+PENDING_ACTION = {} # {chat_id: {"type": "native"|"react", "name": "...", "val": "...", "msg_id": 123, "orig_text": "..."}}
 
 ACTION_LOGS = {}
 LAST_ACTIONS = {} 
@@ -79,7 +78,6 @@ MODEL_TPM_LIMITS = {
 PRIORITY_MODELS = []
 
 def load_prompts_config():
-    """Загружает системные промпты из файла prompts.txt"""
     global PROMPTS
     PROMPTS.clear()
     
@@ -92,7 +90,10 @@ def load_prompts_config():
 Ты root-админ Ubuntu. Дай только bash-команду (без sudo).
 
 [GEMMA_ADMIN_REACT]
-[SYSTEM] Ты автономный AI-админ. Если нужно выполнить команду: <BASH>cmd</BASH>. Поиск в сети (обязательно для курсов валют, новостей, цен): <SEARCH>query</SEARCH>. Скачать файл: <DOWNLOAD>url</DOWNLOAD>. Отправить файл юзеру: <FILE>path</FILE>."""
+[SYSTEM] Ты автономный AI-админ. Если нужно выполнить команду: <BASH>cmd</BASH>. Поиск в сети (обязательно для курсов валют, новостей, цен): <SEARCH>query</SEARCH>. Скачать файл: <DOWNLOAD>url</DOWNLOAD>. Отправить файл юзеру: <FILE>path</FILE>.
+
+[CHAT_BOT]
+Ты умный, полезный и дружелюбный ИИ-ассистент. Отвечай на вопросы пользователя и поддерживай диалог. Системные функции отключены."""
         with open(PROMPTS_FILE, "w", encoding="utf-8") as f:
             f.write(default_prompts)
 
@@ -102,18 +103,14 @@ def load_prompts_config():
         for line in f:
             match = re.match(r'^\[(.*?)\]$', line.strip())
             if match:
-                if current_key:
-                    PROMPTS[current_key] = "\n".join(current_text).strip()
+                if current_key: PROMPTS[current_key] = "\n".join(current_text).strip()
                 current_key = match.group(1)
                 current_text = []
-            else:
-                current_text.append(line.rstrip('\n'))
-        if current_key:
-            PROMPTS[current_key] = "\n".join(current_text).strip()
+            else: current_text.append(line.rstrip('\n'))
+        if current_key: PROMPTS[current_key] = "\n".join(current_text).strip()
     print(f"Загружены промпты: {list(PROMPTS.keys())}")
 
 def load_models_config():
-    """Загружает список моделей и лимиты из models.txt"""
     global PRIORITY_MODELS, MODEL_RPM_LIMITS, MODEL_RESTRICTED_KEYS
     PRIORITY_MODELS.clear()
     MODEL_RPM_LIMITS.clear()
@@ -137,12 +134,10 @@ def load_models_config():
                 if rpm_match: MODEL_RPM_LIMITS[model_name] = int(rpm_match.group(1))
                     
                 key_match = re.search(r'KEY:([\d,]+)', line)
-                if key_match:
-                    MODEL_RESTRICTED_KEYS[model_name] = [int(k) for k in key_match.group(1).split(',') if k.isdigit()]
+                if key_match: MODEL_RESTRICTED_KEYS[model_name] = [int(k) for k in key_match.group(1).split(',') if k.isdigit()]
                     
     print(f"Загружено {len(PRIORITY_MODELS)} моделей из {MODELS_FILE}")
 
-# Вызываем загрузку конфигов при старте
 load_prompts_config()
 load_models_config()
 
@@ -179,8 +174,7 @@ def clear_status(chat_id):
 
 def track_token_usage(token_count):
     global CURRENT_KEY_NUM
-    if token_count:
-        API_TOKEN_HISTORY[CURRENT_KEY_NUM].append((time.time(), token_count))
+    if token_count: API_TOKEN_HISTORY[CURRENT_KEY_NUM].append((time.time(), token_count))
 
 def check_api_rate_limit(chat_id, current_status_text):
     global CURRENT_MODEL, CURRENT_KEY_NUM
@@ -334,16 +328,13 @@ def send_file_to_telegram(filepath: str) -> str:
 
     if not CURRENT_CHAT_ID: return "Ошибка: ID чата неизвестен."
     if not os.path.exists(filepath): return f"Ошибка: Файл {filepath} не найден."
-
     try:
-        with open(filepath, 'rb') as f:
-            bot.send_document(CURRENT_CHAT_ID, f)
+        with open(filepath, 'rb') as f: bot.send_document(CURRENT_CHAT_ID, f)
         return f"Успех: Файл {filepath} отправлен."
-    except Exception as e:
-        return f"Ошибка отправки файла: {str(e)}"
+    except Exception as e: return f"Ошибка отправки файла: {str(e)}"
 
 # ─────────────────────────────────────────────
-#  ЛОГИКА МОДЕЛЕЙ И ПРОМПТОВ
+#  ЛОГИКА МОДЕЛЕЙ
 # ─────────────────────────────────────────────
 
 def get_models_lists():
@@ -397,7 +388,7 @@ def get_models_keyboard(show_all=False):
             markup.add(InlineKeyboardButton(text="⬇️ Другие модели", callback_data="show_all_mods"))
     return markup
 
-def init_models(model_name, role="admin"):
+def init_models(model_name, role="admin", mode="auto"):
     global chat_agent, model_advisor
     is_gemma = "gemma" in model_name.lower()
 
@@ -406,12 +397,20 @@ def init_models(model_name, role="admin"):
         chat_agent = model_agent.start_chat()
         model_advisor = genai.GenerativeModel(model_name=model_name)
     else:
-        model_agent = genai.GenerativeModel(
-            model_name=model_name,
-            tools=[execute_bash, send_file_to_telegram, search_web_tool, download_file_tool],
-            system_instruction=PROMPTS.get("GEMINI_ADMIN", "Ты AI-админ.")
-        )
-        chat_agent = model_agent.start_chat(enable_automatic_function_calling=True)
+        if role == "chat":
+            model_agent = genai.GenerativeModel(
+                model_name=model_name,
+                system_instruction=PROMPTS.get("CHAT_BOT", "Ты ИИ-ассистент.")
+            )
+            chat_agent = model_agent.start_chat()
+        else: # admin
+            enable_auto = (mode == "auto")
+            model_agent = genai.GenerativeModel(
+                model_name=model_name,
+                tools=[execute_bash, send_file_to_telegram, search_web_tool, download_file_tool],
+                system_instruction=PROMPTS.get("GEMINI_ADMIN", "Ты AI-админ.")
+            )
+            chat_agent = model_agent.start_chat(enable_automatic_function_calling=enable_auto)
 
         model_advisor = genai.GenerativeModel(
             model_name=model_name,
@@ -432,10 +431,10 @@ def handle_api_error(e, chat_id, message_id, original_message, clean_model_name)
         safe_edit_message(chat_id, message_id, f"❌ Ошибка ИИ: {html.escape(error_text)}")
 
 def trim_chat_history(agent):
-    """АВТО-ТРИММЕР: Ограничивает память ИИ до последних 6 сообщений (3 диалогов)"""
     MAX_HISTORY = 6
     if hasattr(agent, 'history') and len(agent.history) > MAX_HISTORY:
         agent.history = agent.history[-MAX_HISTORY:]
+
 
 # ─────────────────────────────────────────────
 #  ОБРАБОТЧИКИ КОМАНД
@@ -453,16 +452,14 @@ def change_model(message):
 
 @bot.message_handler(commands=['reload'])
 def reload_configs_cmd(message):
-    """Обновляет конфиги моделей и промптов на лету."""
     if message.from_user.id not in ADMIN_IDS: return
     try:
         load_models_config()
         load_prompts_config()
         global PRIORITY_MODELS_CACHE, OTHER_MODELS_CACHE, AVAILABLE_MODELS
         PRIORITY_MODELS_CACHE, OTHER_MODELS_CACHE, AVAILABLE_MODELS = [], [], [] 
-        bot.reply_to(message, f"✅ Конфигурация успешно обновлена!\nЗагружено <b>{len(PRIORITY_MODELS)}</b> моделей.\nЗагружены промпты: <b>{', '.join(PROMPTS.keys())}</b>.", parse_mode='HTML')
-    except Exception as e:
-        bot.reply_to(message, f"❌ Ошибка обновления: {e}")
+        bot.reply_to(message, f"✅ Конфигурация обновлена!\nЗагружено <b>{len(PRIORITY_MODELS)}</b> моделей.\nПромпты: <b>{', '.join(PROMPTS.keys())}</b>.", parse_mode='HTML')
+    except Exception as e: bot.reply_to(message, f"❌ Ошибка: {e}")
 
 @bot.message_handler(commands=['changekey'])
 def change_key_cmd(message):
@@ -492,7 +489,7 @@ def clear_cmd(message):
         bot.reply_to(message, "⚠️ Модель еще не выбрана. Память пуста.")
         return
     try:
-        init_models(CURRENT_MODEL)
+        init_models(CURRENT_MODEL, role=MODEL_ROLE.get(message.chat.id, "admin"), mode=MODEL_MODE.get(message.chat.id, "auto"))
         bot.reply_to(message, "🧹 Контекст и память ИИ успешно очищены!")
     except Exception as e: bot.reply_to(message, f"❌ Ошибка: {e}")
 
@@ -523,7 +520,7 @@ def process_search_query(message):
             PENDING_SEARCH_RESULTS[message.chat.id] = clean_text_for_file
             markup = InlineKeyboardMarkup()
             markup.add(InlineKeyboardButton("📥 Скачать всё (.txt)", callback_data="download_search_txt"))
-            bot.send_message(message.chat.id, f"⚠️ <b>Внимание:</b> Показано 5 сообщений из {len(formatted_chunks)}. Остальной текст обрезан.\n\nВы можете скачать полные результаты поиска отдельным файлом:", parse_mode='HTML', reply_markup=markup)
+            bot.send_message(message.chat.id, f"⚠️ <b>Внимание:</b> Показано 5 сообщений. Остальной текст обрезан.\n\nСкачать полные результаты:", parse_mode='HTML', reply_markup=markup)
     except Exception as e: safe_edit_message(message.chat.id, msg_wait.message_id, f"❌ Ошибка поиска: {html.escape(str(e))}")
 
 @bot.message_handler(content_types=['document'])
@@ -541,6 +538,125 @@ def handle_document(message):
     markup.row(InlineKeyboardButton("🧠 Обработать ИИ", callback_data="file_ai"))
     bot.reply_to(message, f"📥 Загрузить файл <b>{html.escape(message.document.file_name)}</b> на сервер?", reply_markup=markup, parse_mode='HTML')
 
+
+# ─────────────────────────────────────────────
+#  ЕДИНЫЙ ПАРСЕР И МАРШРУТИЗАТОР ОТВЕТОВ
+# ─────────────────────────────────────────────
+
+def parse_and_route_response(chat_id, response, first_msg_id, original_text):
+    """Универсальный парсер. Понимает как XML теги Gemma, так и Native Tools Gemini."""
+    clean_model_name = CURRENT_MODEL.replace('models/', '')
+    is_gemma = "gemma" in clean_model_name.lower()
+    role = MODEL_ROLE.get(chat_id, "admin")
+    
+    if role == "chat":
+        finish_response(chat_id, response.text, first_msg_id, clean_model_name)
+        return
+
+    action = None
+    
+    if is_gemma:
+        # ReAct парсер для Gemma
+        response_text = response.text or ""
+        bash_match = re.search(r'<BASH>(.*?)</BASH>', response_text, re.DOTALL | re.IGNORECASE)
+        search_match = re.search(r'<SEARCH>(.*?)</SEARCH>', response_text, re.DOTALL | re.IGNORECASE)
+        dl_match = re.search(r'<DOWNLOAD>(.*?)</DOWNLOAD>', response_text, re.DOTALL | re.IGNORECASE)
+        file_match = re.search(r'<FILE>(.*?)</FILE>', response_text, re.DOTALL | re.IGNORECASE)
+        
+        if bash_match: action = {"type": "react", "name": "bash", "val": bash_match.group(1).strip(), "disp_name": "Команда BASH", "disp_val": bash_match.group(1).strip()}
+        elif search_match: action = {"type": "react", "name": "search", "val": search_match.group(1).strip(), "disp_name": "Поиск в сети", "disp_val": search_match.group(1).strip()}
+        elif dl_match: action = {"type": "react", "name": "download", "val": dl_match.group(1).strip(), "disp_name": "Скачивание файла", "disp_val": dl_match.group(1).strip()}
+        elif file_match: action = {"type": "react", "name": "file", "val": file_match.group(1).strip(), "disp_name": "Отправка файла в чат", "disp_val": file_match.group(1).strip()}
+        
+    else:
+        # Native Function Call перехватчик для Gemini (полуавтомат)
+        if response.parts:
+            for part in response.parts:
+                if part.function_call:
+                    fn_name = part.function_call.name
+                    fn_args = {key: val for key, val in part.function_call.args.items()}
+                    
+                    disp_name = fn_name
+                    disp_val = str(fn_args)
+                    if fn_name == "execute_bash": disp_name, disp_val = "Команда BASH", fn_args.get("command", "")
+                    elif fn_name == "search_web_tool": disp_name, disp_val = "Поиск в сети", fn_args.get("query", "")
+                    elif fn_name == "download_file_tool": disp_name, disp_val = "Скачивание файла", fn_args.get("url", "")
+                    elif fn_name == "send_file_to_telegram": disp_name, disp_val = "Отправка файла в чат", fn_args.get("filepath", "")
+                    
+                    action = {"type": "native", "name": fn_name, "args": fn_args, "disp_name": disp_name, "disp_val": disp_val}
+                    break
+                    
+    if action:
+        action["msg_id"] = first_msg_id
+        action["orig_text"] = original_text
+        process_action_request(chat_id, action)
+    else:
+        finish_response(chat_id, response.text, first_msg_id, clean_model_name)
+
+def finish_response(chat_id, text, msg_id, clean_model_name):
+    markup = None
+    if ACTION_LOGS.get(chat_id):
+        LAST_ACTIONS[msg_id] = ACTION_LOGS[chat_id].copy()
+        markup = InlineKeyboardMarkup()
+        markup.add(InlineKeyboardButton("🛠 Выполненные действия", callback_data=f"show_acts_{msg_id}"))
+    
+    send_long_text(chat_id, text, first_msg_id=msg_id, prefix=f"<b>{clean_model_name}:</b>\n\n", reply_markup=markup)
+    if VOICE_MODE.get(chat_id): generate_and_send_voice(chat_id, text)
+    clear_status(chat_id)
+
+def process_action_request(chat_id, action):
+    mode = MODEL_MODE.get(chat_id, "semi")
+    if mode == "semi":
+        PENDING_ACTION[chat_id] = action
+        clear_status(chat_id)
+        markup = InlineKeyboardMarkup()
+        markup.row(InlineKeyboardButton("✅ Выполнить", callback_data=f"act_yes_{chat_id}"), InlineKeyboardButton("❌ Отмена", callback_data=f"act_no_{chat_id}"))
+        bot.send_message(chat_id, f"🤖 <b>Запрос действия ИИ:</b>\n\n{action['disp_name']}:\n<code>{html.escape(action['disp_val'])}</code>", parse_mode='HTML', reply_markup=markup)
+    else:
+        execute_pending_action(chat_id, action)
+
+def execute_pending_action(chat_id, action):
+    global chat_agent
+    res = "Нет результата."
+    clean_model_name = CURRENT_MODEL.replace('models/', '')
+    
+    if action["type"] == "react":
+        if action["name"] == "bash": res = execute_bash(action["val"])
+        elif action["name"] == "search": res = search_web_tool(action["val"])
+        elif action["name"] == "download": res = download_file_tool(action["val"])
+        elif action["name"] == "file": res = send_file_to_telegram(action["val"])
+    elif action["type"] == "native":
+        fn_name = action["name"]
+        args = action["args"]
+        if fn_name == "execute_bash": res = execute_bash(args.get("command", ""))
+        elif fn_name == "search_web_tool": res = search_web_tool(args.get("query", ""))
+        elif fn_name == "download_file_tool": res = download_file_tool(args.get("url", ""))
+        elif fn_name == "send_file_to_telegram": res = send_file_to_telegram(args.get("filepath", ""))
+        
+    status_text = "🧠 <b>Анализирую результат...</b>"
+    set_status(chat_id, status_text)
+    
+    try:
+        check_api_rate_limit(chat_id, status_text)
+        
+        if action["type"] == "react":
+            followup_prompt = f"РЕЗУЛЬТАТ ВЫПОЛНЕНИЯ ({action['name']}):\n{res}\nОсновываясь на этом, дай финальный ответ или вызови новый тег."
+            response = chat_agent.send_message(followup_prompt)
+            if hasattr(chat_agent, 'history') and len(chat_agent.history) >= 2:
+                chat_agent.history[-2].parts[0].text = f"[Система сообщила результат действия {action['name']}]"
+                
+        elif action["type"] == "native":
+            response = chat_agent.send_message({"function_response": {"name": action["name"], "response": {"result": str(res)}}})
+            
+        if hasattr(response, 'usage_metadata'): track_token_usage(response.usage_metadata.total_token_count)
+        trim_chat_history(chat_agent)
+        parse_and_route_response(chat_id, response, action["msg_id"], action["orig_text"])
+        
+    except Exception as e:
+        clear_status(chat_id)
+        bot.send_message(chat_id, f"❌ Ошибка ИИ (Loop): {e}")
+
+
 # ─────────────────────────────────────────────
 #  ОБРАБОТКА CALLBACKS (КНОПКИ)
 # ─────────────────────────────────────────────
@@ -549,37 +665,32 @@ def handle_document(message):
 def handle_query(call):
     if call.from_user.id not in ADMIN_IDS: return
     global CURRENT_MODEL, CURRENT_KEY_NUM, PRIORITY_MODELS_CACHE, OTHER_MODELS_CACHE, AVAILABLE_MODELS
-    global CURRENT_CHAT_ID, GEMMA_ROLE, GEMMA_MODE, PENDING_GEMMA_ACTION
+    global CURRENT_CHAT_ID, MODEL_ROLE, MODEL_MODE, PENDING_ACTION
     data = call.data
 
     if data == "voice_on":
         VOICE_MODE[call.message.chat.id] = True
         safe_edit_message(call.message.chat.id, call.message.message_id, "🟢 Голосовой режим <b>ВКЛЮЧЕН</b>.", parse_mode='HTML')
         return
-
     if data == "voice_off":
         VOICE_MODE[call.message.chat.id] = False
         safe_edit_message(call.message.chat.id, call.message.message_id, "🔴 Голосовой режим <b>ВЫКЛЮЧЕН</b>.", parse_mode='HTML')
         return
-
     if data == "hide_message":
         try: bot.delete_message(call.message.chat.id, call.message.message_id)
         except Exception: pass
         return
 
     if data.startswith("show_acts_"):
-        try:
-            target_msg_id = int(data.split("_")[2])
-            actions = LAST_ACTIONS.get(target_msg_id)
-        except Exception: actions = None
-
+        try: target_msg_id = int(data.split("_")[2])
+        except Exception: target_msg_id = 0
+        actions = LAST_ACTIONS.get(target_msg_id)
         if not actions:
             bot.answer_callback_query(call.id, "❌ Данные об этих действиях устарели.", show_alert=True)
             return
 
         log_text = ""
         bash_commands = []
-
         for act_type, act_val in actions:
             if act_type == "bash": bash_commands.append(act_val)
             elif act_type == "search": log_text += f"🌐 <b>Поиск:</b> <i>{html.escape(act_val)}</i>\n"
@@ -630,64 +741,78 @@ def handle_query(call):
         bot.send_message(call.message.chat.id, f"✅ Активен <b>KEY {key_num}</b>.\nВызовите /gemini для выбора модели.", parse_mode='HTML')
         return
 
+    # ВЫБОР МОДЕЛИ -> РОЛИ -> РЕЖИМА
     if data.startswith("mod_"):
         model_name = data.replace("mod_", "")
         CURRENT_MODEL = model_name
-        is_gemma = "gemma" in CURRENT_MODEL.lower()
         try: bot.delete_message(call.message.chat.id, call.message.message_id)
         except: pass
         
-        if is_gemma:
-            markup = InlineKeyboardMarkup()
-            markup.row(InlineKeyboardButton("🛠 Админ", callback_data="grole_admin"), InlineKeyboardButton("💬 Чат-бот", callback_data="grole_chat"))
-            bot.send_message(call.message.chat.id, f"Выбрана модель <b>{CURRENT_MODEL}</b>.\nВыберите роль Gemma:", reply_markup=markup, parse_mode='HTML')
-        else:
-            init_models(CURRENT_MODEL)
-            bot.send_message(call.message.chat.id, f"✅ Выбрана модель: <b>{CURRENT_MODEL}</b> (Gemini API)", parse_mode='HTML')
+        markup = InlineKeyboardMarkup()
+        markup.row(InlineKeyboardButton("🛠 Админ", callback_data="role_admin"), InlineKeyboardButton("💬 Чат-бот", callback_data="role_chat"))
+        bot.send_message(call.message.chat.id, f"Выбрана модель <b>{CURRENT_MODEL}</b>.\nВыберите роль ИИ:", reply_markup=markup, parse_mode='HTML')
         return
 
-    if data.startswith("grole_"):
-        role = data.replace("grole_", "")
-        GEMMA_ROLE[call.message.chat.id] = role
+    if data.startswith("role_"):
+        role = data.replace("role_", "")
+        MODEL_ROLE[call.message.chat.id] = role
         try: bot.delete_message(call.message.chat.id, call.message.message_id)
         except: pass
         
         if role == "admin":
             markup = InlineKeyboardMarkup()
-            markup.row(InlineKeyboardButton("⚡ Авто", callback_data="gmode_auto"), InlineKeyboardButton("🛑 Полуавтомат", callback_data="gmode_semi"))
-            bot.send_message(call.message.chat.id, "Выберите режим работы Админа:", reply_markup=markup)
+            markup.row(InlineKeyboardButton("⚡ Авто", callback_data="mode_auto"), InlineKeyboardButton("🛑 Полуавтомат", callback_data="mode_semi"))
+            bot.send_message(call.message.chat.id, "Выберите режим выполнения команд:", reply_markup=markup)
         else:
-            init_models(CURRENT_MODEL, role="chat")
-            bot.send_message(call.message.chat.id, f"✅ Gemma запущена в режиме: <b>Чат-бот</b>", parse_mode='HTML')
+            MODEL_MODE[call.message.chat.id] = "auto"
+            init_models(CURRENT_MODEL, role="chat", mode="auto")
+            bot.send_message(call.message.chat.id, f"✅ ИИ запущен в роли: <b>Чат-бот</b>", parse_mode='HTML')
         return
 
-    if data.startswith("gmode_"):
-        mode = data.replace("gmode_", "")
-        GEMMA_MODE[call.message.chat.id] = mode
-        init_models(CURRENT_MODEL, role="admin")
+    if data.startswith("mode_"):
+        mode = data.replace("mode_", "")
+        MODEL_MODE[call.message.chat.id] = mode
+        init_models(CURRENT_MODEL, role="admin", mode=mode)
         try: bot.delete_message(call.message.chat.id, call.message.message_id)
         except: pass
-        m_text = "АВТО (выполняет команды сразу)" if mode == "auto" else "ПОЛУАВТОМАТ (спрашивает разрешение)"
-        bot.send_message(call.message.chat.id, f"✅ Gemma запущена в режиме: <b>Админ -> {m_text}</b>", parse_mode='HTML')
+        m_text = "АВТО (выполняет функции сам)" if mode == "auto" else "ПОЛУАВТОМАТ (спрашивает разрешение)"
+        bot.send_message(call.message.chat.id, f"✅ ИИ запущен в роли: <b>Админ -> {m_text}</b>", parse_mode='HTML')
         return
 
-    if data.startswith("gact_yes_"):
-        action = PENDING_GEMMA_ACTION.get(call.message.chat.id)
+    # УПРАВЛЕНИЕ ДЕЙСТВИЯМИ (Полуавтомат)
+    if data.startswith("act_yes_"):
+        action = PENDING_ACTION.get(call.message.chat.id)
         if not action:
             bot.answer_callback_query(call.id, "❌ Действие устарело.", show_alert=True)
             return
         try: bot.delete_message(call.message.chat.id, call.message.message_id)
         except: pass
-        execute_gemma_action(call.message.chat.id, action)
+        execute_pending_action(call.message.chat.id, action)
         return
 
-    if data.startswith("gact_no_"):
-        PENDING_GEMMA_ACTION.pop(call.message.chat.id, None)
+    if data.startswith("act_no_"):
+        action = PENDING_ACTION.pop(call.message.chat.id, None)
         try: bot.delete_message(call.message.chat.id, call.message.message_id)
         except: pass
         bot.send_message(call.message.chat.id, "❌ Действие отменено пользователем.")
+        
+        # Сообщаем ИИ, что юзер отменил операцию, чтобы ИИ мог продолжить диалог
+        if action:
+            status_text = "🧠 <b>Сообщаю об отмене...</b>"
+            set_status(call.message.chat.id, status_text)
+            try:
+                check_api_rate_limit(call.message.chat.id, status_text)
+                if action["type"] == "react":
+                    resp = chat_agent.send_message("ПОЛЬЗОВАТЕЛЬ ЗАПРЕТИЛ ВЫПОЛНЕНИЕ ЭТОЙ ОПЕРАЦИИ. Ответь пользователю.")
+                elif action["type"] == "native":
+                    resp = chat_agent.send_message({"function_response": {"name": action["name"], "response": {"result": "ERROR: User denied permission to execute."}}})
+                parse_and_route_response(call.message.chat.id, resp, action["msg_id"], action["orig_text"])
+            except Exception as e:
+                clear_status(call.message.chat.id)
+                bot.send_message(call.message.chat.id, f"❌ Ошибка ИИ: {e}")
         return
 
+    # ФАЙЛЫ
     if data in ["file_yes", "file_no", "file_ai"]:
         file_info_dict = PENDING_FILES.get(call.message.chat.id)
         if data == "file_no":
@@ -732,23 +857,14 @@ def handle_query(call):
                 gemini_file = genai.upload_file(path=temp_file_name, mime_type=mime) if mime else genai.upload_file(path=temp_file_name)
 
                 if is_gemma:
-                    response = chat_agent.send_message("Я текстовая модель Gemma, я пока не умею читать файлы.")
+                    response = chat_agent.send_message("Я текстовая модель Gemma, я пока не умею читать файлы напрямую.")
+                    parse_and_route_response(call.message.chat.id, response, call.message.message_id, "file")
                 else:
                     check_api_rate_limit(call.message.chat.id, status_text)
                     response = chat_agent.send_message([gemini_file, "Проанализируй этот файл. Расскажи, что в нём, либо выполни инструкции."])
-                    trim_chat_history(chat_agent) # Применяем триммер
+                    trim_chat_history(chat_agent)
+                    parse_and_route_response(call.message.chat.id, response, call.message.message_id, "file")
                 os.remove(temp_file_name)
-                clear_status(call.message.chat.id)
-
-                markup = None
-                if ACTION_LOGS.get(CURRENT_CHAT_ID):
-                    LAST_ACTIONS[call.message.message_id] = ACTION_LOGS[CURRENT_CHAT_ID].copy()
-                    markup = InlineKeyboardMarkup()
-                    markup.add(InlineKeyboardButton("🛠 Выполненные действия", callback_data=f"show_acts_{call.message.message_id}"))
-
-                prefix = f"<b>{clean_model_name}:</b>\n\n"
-                send_long_text(call.message.chat.id, response.text, first_msg_id=call.message.message_id, prefix=prefix, reply_markup=markup)
-                if VOICE_MODE.get(call.message.chat.id): generate_and_send_voice(call.message.chat.id, response.text)
 
             except Exception as e:
                 clear_status(call.message.chat.id)
@@ -756,79 +872,6 @@ def handle_query(call):
                 handle_api_error(e, call.message.chat.id, err_msg.message_id, None, clean_name)
             PENDING_FILES.pop(call.message.chat.id, None)
             return
-
-# ─────────────────────────────────────────────
-#  ReAct ЛОГИКА ДЛЯ GEMMA (С ОЧИСТКОЙ ИСТОРИИ)
-# ─────────────────────────────────────────────
-
-def process_gemma_react(chat_id, response_text, first_msg_id, original_user_text):
-    bash_match = re.search(r'<BASH>(.*?)</BASH>', response_text, re.DOTALL | re.IGNORECASE)
-    search_match = re.search(r'<SEARCH>(.*?)</SEARCH>', response_text, re.DOTALL | re.IGNORECASE)
-    dl_match = re.search(r'<DOWNLOAD>(.*?)</DOWNLOAD>', response_text, re.DOTALL | re.IGNORECASE)
-    file_match = re.search(r'<FILE>(.*?)</FILE>', response_text, re.DOTALL | re.IGNORECASE)
-    
-    action = None
-    if bash_match: action = {"type": "bash", "val": bash_match.group(1).strip(), "msg_id": first_msg_id, "orig_text": original_user_text}
-    elif search_match: action = {"type": "search", "val": search_match.group(1).strip(), "msg_id": first_msg_id, "orig_text": original_user_text}
-    elif dl_match: action = {"type": "download", "val": dl_match.group(1).strip(), "msg_id": first_msg_id, "orig_text": original_user_text}
-    elif file_match: action = {"type": "file", "val": file_match.group(1).strip(), "msg_id": first_msg_id, "orig_text": original_user_text}
-    
-    if not action:
-        clean_model_name = CURRENT_MODEL.replace('models/', '')
-        markup = None
-        if ACTION_LOGS.get(chat_id):
-            LAST_ACTIONS[first_msg_id] = ACTION_LOGS[chat_id].copy()
-            markup = InlineKeyboardMarkup()
-            markup.add(InlineKeyboardButton("🛠 Выполненные действия", callback_data=f"show_acts_{first_msg_id}"))
-        
-        send_long_text(chat_id, response_text, first_msg_id=first_msg_id, prefix=f"<b>{clean_model_name}:</b>\n\n", reply_markup=markup)
-        if VOICE_MODE.get(chat_id): generate_and_send_voice(chat_id, response_text)
-        clear_status(chat_id)
-        return
-
-    mode = GEMMA_MODE.get(chat_id, "semi")
-    if mode == "semi":
-        PENDING_GEMMA_ACTION[chat_id] = action
-        clear_status(chat_id)
-        markup = InlineKeyboardMarkup()
-        markup.row(InlineKeyboardButton("✅ Выполнить", callback_data=f"gact_yes_{chat_id}"), InlineKeyboardButton("❌ Отмена", callback_data=f"gact_no_{chat_id}"))
-        
-        act_names = {"bash": "Команда BASH", "search": "Поиск в сети", "download": "Скачивание файла", "file": "Отправка файла в чат"}
-        act_name = act_names.get(action['type'])
-        
-        bot.send_message(chat_id, f"🤖 <b>Gemma запрашивает действие:</b>\n\n{act_name}:\n<code>{html.escape(action['val'])}</code>", parse_mode='HTML', reply_markup=markup)
-    else:
-        execute_gemma_action(chat_id, action)
-
-def execute_gemma_action(chat_id, action):
-    global chat_agent
-    res = "Нет результата."
-    if action["type"] == "bash": res = execute_bash(action["val"])
-    elif action["type"] == "search": res = search_web_tool(action["val"])
-    elif action["type"] == "download": res = download_file_tool(action["val"])
-    elif action["type"] == "file": res = send_file_to_telegram(action["val"])
-    
-    followup_prompt = f"РЕЗУЛЬТАТ ВЫПОЛНЕНИЯ ({action['type']}):\n{res}\nОсновываясь на этом, дай финальный ответ или вызови новый тег."
-    status_text = "🧠 <b>Gemma анализирует результат...</b>"
-    set_status(chat_id, status_text)
-    
-    try:
-        check_api_rate_limit(chat_id, status_text)
-        response = chat_agent.send_message(followup_prompt)
-        
-        # ХАК: Удаляем лог результата из истории, чтобы не забивать память!
-        # Мы заменяем громоздкий followup_prompt на короткую заглушку
-        if hasattr(chat_agent, 'history') and len(chat_agent.history) >= 2:
-            chat_agent.history[-2].parts[0].text = f"[Система сообщила результат действия {action['type']}]"
-        
-        if hasattr(response, 'usage_metadata'): track_token_usage(response.usage_metadata.total_token_count)
-        
-        trim_chat_history(chat_agent) # Применяем триммер
-        
-        process_gemma_react(chat_id, response.text, action["msg_id"], action["orig_text"])
-    except Exception as e:
-        clear_status(chat_id)
-        bot.send_message(chat_id, f"❌ Ошибка ИИ (ReAct Loop): {e}")
 
 # ─────────────────────────────────────────────
 #  ГЛАВНЫЙ ОБРАБОТЧИК СООБЩЕНИЙ
@@ -860,6 +903,7 @@ def handle_message(message):
 
     clean_model_name = CURRENT_MODEL.replace('models/', '')
     is_gemma = "gemma" in clean_model_name.lower()
+    role = MODEL_ROLE.get(message.chat.id, "admin")
 
     is_voice = message.content_type == 'voice'
     is_photo = message.content_type == 'photo'
@@ -899,18 +943,17 @@ def handle_message(message):
             set_status(message.chat.id, "🎙 <b>Слушаю голосовое сообщение...</b>")
             file_info = bot.get_file(message.voice.file_id)
             voice_path = f"temp_voice_{message.message_id}.ogg"
-            with open(voice_path, 'wb') as new_file:
-                new_file.write(bot.download_file(file_info.file_path))
+            with open(voice_path, 'wb') as new_file: new_file.write(bot.download_file(file_info.file_path))
 
             audio_file = genai.upload_file(path=voice_path, mime_type="audio/ogg")
             status_text = "🧠 <b>Анализирую аудио...</b>"
             set_status(message.chat.id, status_text)
             
             if is_gemma:
-                response = chat_agent.send_message("Я получил аудио, но я текстовая модель Gemma и не умею слушать звук.")
+                response = chat_agent.send_message("Я текстовая модель Gemma и не умею слушать звук.")
                 if hasattr(response, 'usage_metadata'): track_token_usage(response.usage_metadata.total_token_count)
             else:
-                base_prompt = "Обязательно прослушай этот аудиофайл. Если в нём звучит команда или задача для сервера — выполни её. Если это обычный разговор или вопрос — просто ответь на него."
+                base_prompt = "Прослушай этот аудиофайл. Если в нём звучит команда для сервера — выполни её. Если обычный разговор — ответь."
                 prompt = f"{text}\n\n{base_prompt}" if text else base_prompt
                 
                 check_api_rate_limit(message.chat.id, status_text)
@@ -924,15 +967,14 @@ def handle_message(message):
             set_status(message.chat.id, "🖼 <b>Анализирую изображение...</b>")
             file_info = bot.get_file(message.photo[-1].file_id)
             photo_path = f"temp_photo_{message.message_id}.jpg"
-            with open(photo_path, 'wb') as new_file:
-                new_file.write(bot.download_file(file_info.file_path))
+            with open(photo_path, 'wb') as new_file: new_file.write(bot.download_file(file_info.file_path))
 
             img_file = genai.upload_file(path=photo_path)
             status_text = "🖼 <b>Анализирую изображение...</b>"
             set_status(message.chat.id, status_text)
             
             if is_gemma:
-                response = chat_agent.send_message("Я получил изображение, но я текстовая модель Gemma и не умею смотреть картинки.")
+                response = chat_agent.send_message("Я текстовая модель Gemma и не умею смотреть картинки.")
                 if hasattr(response, 'usage_metadata'): track_token_usage(response.usage_metadata.total_token_count)
             else:
                 prompt = text if text else "Проанализируй это изображение."
@@ -946,39 +988,24 @@ def handle_message(message):
         else:
             check_api_rate_limit(message.chat.id, status_text)
             
-            if is_gemma and GEMMA_ROLE.get(message.chat.id) == "admin":
+            if is_gemma and role == "admin":
                 react_sys = "\n\n" + PROMPTS.get("GEMMA_ADMIN_REACT", "[SYSTEM] Используй теги: <BASH>, <SEARCH>, <DOWNLOAD>, <FILE>.")
                 final_text = text + react_sys
-                
                 response = chat_agent.send_message(final_text)
                 
-                # ЧИСТИМ ИСТОРИЮ ОТ ПРОМПТА-ИНЪЕКЦИИ
                 if hasattr(chat_agent, 'history') and len(chat_agent.history) >= 2:
-                    chat_agent.history[-2].parts[0].text = text # Заменяем текст с промптом на оригинальный запрос
+                    chat_agent.history[-2].parts[0].text = text 
                 
                 if hasattr(response, 'usage_metadata'): track_token_usage(response.usage_metadata.total_token_count)
+                trim_chat_history(chat_agent) 
                 
-                trim_chat_history(chat_agent) # Применяем триммер
-                process_gemma_react(message.chat.id, response.text, msg_first.message_id, text)
-                return 
             else:
                 response = chat_agent.send_message(text)
                 if hasattr(response, 'usage_metadata'): track_token_usage(response.usage_metadata.total_token_count)
-                trim_chat_history(chat_agent) # Применяем триммер
+                trim_chat_history(chat_agent) 
 
-        clear_status(message.chat.id)
-
-        markup = None
-        if ACTION_LOGS.get(CURRENT_CHAT_ID):
-            LAST_ACTIONS[msg_first.message_id] = ACTION_LOGS[CURRENT_CHAT_ID].copy()
-            markup = InlineKeyboardMarkup()
-            markup.add(InlineKeyboardButton("🛠 Выполненные действия", callback_data=f"show_acts_{msg_first.message_id}"))
-
-        prefix = f"<b>{clean_model_name}:</b>\n\n"
-        send_long_text(message.chat.id, response.text, first_msg_id=msg_first.message_id, prefix=prefix, reply_markup=markup)
-
-        if VOICE_MODE.get(message.chat.id):
-            generate_and_send_voice(message.chat.id, response.text)
+        # Вызываем универсальный маршрутизатор ответов
+        parse_and_route_response(message.chat.id, response, msg_first.message_id, text)
 
     except Exception as e:
         clear_status(message.chat.id)
