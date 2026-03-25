@@ -8,6 +8,8 @@ import re
 import shlex
 import asyncio
 import edge_tts
+import time
+from collections import deque
 
 # Импортируем наши внешние модули
 from markdown import split_text_safely, md_to_html
@@ -48,11 +50,27 @@ PENDING_SEARCH_RESULTS = {}
 
 # Глобальные журналы и настройки
 ACTION_LOGS = {}
-LAST_ACTIONS = {} # Теперь хранит логи по message_id: {message_id: list}
+LAST_ACTIONS = {} # Хранит логи по message_id: {message_id: list}
 VOICE_MODE = {}  # Состояние голосовых ответов для чата: {chat_id: bool}
 
 # Статусные сообщения ИИ (для live-редактирования) {chat_id: message_id}
 STATUS_MSG = {}
+
+# ─────────────────────────────────────────────
+#  ЛИМИТЫ API И ИСТОРИЯ ЗАПРОСОВ
+# ─────────────────────────────────────────────
+# Лимиты RPM (Requests Per Minute) для бесплатных моделей
+MODEL_RPM_LIMITS = {
+    "gemini-2.5-flash": 5,
+    "gemini-flash-latest": 5,
+    "gemini-3-flash-preview": 5,
+    "gemini-2.5-flash-lite": 10,
+    "gemini-3.1-flash-lite-preview": 15,
+    "gemini-flash-lite-latest": 15
+}
+
+# Храним историю запросов отдельно для каждого API-ключа
+API_REQUEST_HISTORY = {1: deque(), 2: deque(), 3: deque()}
 
 PRIORITY_MODELS = [
     "gemini-2.5-flash",
@@ -81,11 +99,7 @@ def log_admin_action(user_id, action):
 # ─────────────────────────────────────────────
 
 def set_status(chat_id, text: str):
-    """
-    Отправляет или редактирует статусное сообщение ИИ.
-    При первом вызове — создаёт сообщение.
-    При последующих — редактирует его (не создаёт новое).
-    """
+    """Отправляет или редактирует статусное сообщение ИИ."""
     global STATUS_MSG
     msg_id = STATUS_MSG.get(chat_id)
     if msg_id:
@@ -100,16 +114,13 @@ def set_status(chat_id, text: str):
         except Exception as e:
             if "message is not modified" in str(e).lower():
                 return
-            # Если сообщение недоступно — создадим новое
             STATUS_MSG.pop(chat_id, None)
 
-    # Создаём новое статусное сообщение
     try:
         msg = bot.send_message(chat_id, text, parse_mode='HTML')
         STATUS_MSG[chat_id] = msg.message_id
     except Exception as e:
         print(f"[set_status] Ошибка отправки: {e}")
-
 
 def clear_status(chat_id):
     """Удаляет статусное сообщение (когда ИИ закончил работу)."""
@@ -119,6 +130,41 @@ def clear_status(chat_id):
             bot.delete_message(chat_id, msg_id)
         except Exception:
             pass
+
+def check_api_rate_limit(chat_id, current_status_text):
+    """
+    Проверяет лимиты RPM. Если лимит достигнут — ставит поток на паузу,
+    добавляя к текущему статусу уведомление об ожидании.
+    """
+    global CURRENT_MODEL, CURRENT_KEY_NUM
+    if not CURRENT_MODEL: return
+
+    clean_name = CURRENT_MODEL.replace('models/', '')
+    rpm_limit = MODEL_RPM_LIMITS.get(clean_name)
+    
+    if not rpm_limit: return # Если для модели нет жесткого лимита, пропускаем
+
+    history = API_REQUEST_HISTORY.setdefault(CURRENT_KEY_NUM, deque())
+    now = time.time()
+
+    # Удаляем из истории запросы, которые были сделаны более минуты назад
+    while history and now - history[0] > 60.5:
+        history.popleft()
+
+    # Если достигли лимита
+    if len(history) >= rpm_limit:
+        # Вычисляем, сколько секунд осталось ждать до освобождения 1 запроса
+        wait_time = 60.5 - (now - history[0])
+        if wait_time > 0:
+            set_status(chat_id, f"{current_status_text}\n⏳ <i>Тайм-аут API: ожидание {wait_time:.1f} сек (лимит {rpm_limit} RPM)...</i>")
+            time.sleep(wait_time) # Ставим поток на паузу
+            
+            # Возвращаем оригинальный статус обратно после сна
+            set_status(chat_id, current_status_text)
+            now = time.time() # Обновляем время
+
+    # Записываем текущий запрос в историю
+    history.append(now)
 
 
 # ─────────────────────────────────────────────
@@ -160,7 +206,6 @@ def send_long_text(chat_id, text, first_msg_id=None, is_code=False, prefix="", r
                 bot.send_message(chat_id, chunk.strip(), reply_markup=current_markup)
 
 def clean_text_for_voice(text: str) -> str:
-    """Удаляет код, ссылки, теги и спецсимволы, оставляя чистый текст для диктора."""
     if not text: return ""
     text = re.sub(r'```.*?```', '', text, flags=re.DOTALL)
     text = re.sub(r'`.*?`', '', text)
@@ -173,17 +218,14 @@ def clean_text_for_voice(text: str) -> str:
     return text.strip()
 
 def generate_and_send_voice(chat_id, text):
-    """Генерирует аудио через Edge TTS. Если текст длинный — шлет несколько голосовых с индикацией."""
     clean_text = clean_text_for_voice(text)
-    if not clean_text:
-        return
+    if not clean_text: return
 
     voice_chunks = split_text_safely(clean_text, max_len=2000)
     total_chunks = len(voice_chunks)
 
     for i, chunk in enumerate(voice_chunks):
-        if not chunk.strip():
-            continue
+        if not chunk.strip(): continue
 
         mp3_path = f"temp_tts_{chat_id}_{i}.mp3"
         ogg_path = f"temp_tts_{chat_id}_{i}.ogg"
@@ -212,10 +254,8 @@ def generate_and_send_voice(chat_id, text):
             print(f"Ошибка синтеза голоса (кусок {i}): {e}")
         finally:
             if msg_wait_voice:
-                try:
-                    bot.delete_message(chat_id, msg_wait_voice.message_id)
-                except Exception:
-                    pass
+                try: bot.delete_message(chat_id, msg_wait_voice.message_id)
+                except Exception: pass
             if os.path.exists(mp3_path): os.remove(mp3_path)
             if os.path.exists(ogg_path): os.remove(ogg_path)
 
@@ -230,7 +270,11 @@ def execute_bash(command: str) -> str:
     if CURRENT_CHAT_ID:
         ACTION_LOGS.setdefault(CURRENT_CHAT_ID, []).append(("bash", command))
         short_cmd = command if len(command) <= 80 else command[:77] + "…"
-        set_status(CURRENT_CHAT_ID, f"⚙️ <b>Выполняю команду:</b>\n<code>{html.escape(short_cmd)}</code>")
+        status_text = f"⚙️ <b>Выполняю команду:</b>\n<code>{html.escape(short_cmd)}</code>"
+        
+        set_status(CURRENT_CHAT_ID, status_text)
+        check_api_rate_limit(CURRENT_CHAT_ID, status_text) # Проверка лимита
+        
     try:
         result = subprocess.run(command, shell=True, capture_output=True, text=True, timeout=30)
         output = result.stdout if result.stdout else result.stderr
@@ -249,18 +293,27 @@ def search_web_tool(query: str) -> str:
     if CURRENT_CHAT_ID:
         ACTION_LOGS.setdefault(CURRENT_CHAT_ID, []).append(("search", query))
         short_q = query if len(query) <= 80 else query[:77] + "…"
-        set_status(CURRENT_CHAT_ID, f"🔍 <b>Ищу в интернете:</b>\n<i>{html.escape(short_q)}</i>")
+        status_text = f"🔍 <b>Ищу в интернете:</b>\n<i>{html.escape(short_q)}</i>"
+        
+        set_status(CURRENT_CHAT_ID, status_text)
+        check_api_rate_limit(CURRENT_CHAT_ID, status_text) # Проверка лимита
+        
     return web_search.search_web(query)
 
 def download_file_tool(url: str) -> str:
     """
     Скачивает файл по прямой ссылке с правильными заголовками и User-Agent.
     Сохраняет файл в /app/downloads/ и возвращает путь к нему.
+    Используй для скачивания файлов по прямым ссылкам (PDF, архивы, скрипты и т.д.)
     """
     if CURRENT_CHAT_ID:
         ACTION_LOGS.setdefault(CURRENT_CHAT_ID, []).append(("download", url))
         short_url = url if len(url) <= 70 else url[:67] + "…"
-        set_status(CURRENT_CHAT_ID, f"⬇️ <b>Скачиваю файл:</b>\n<code>{html.escape(short_url)}</code>")
+        status_text = f"⬇️ <b>Скачиваю файл:</b>\n<code>{html.escape(short_url)}</code>"
+        
+        set_status(CURRENT_CHAT_ID, status_text)
+        check_api_rate_limit(CURRENT_CHAT_ID, status_text) # Проверка лимита
+        
     return web_search.download_file_tool(url)
 
 def send_file_to_telegram(filepath: str) -> str:
@@ -269,6 +322,8 @@ def send_file_to_telegram(filepath: str) -> str:
     if CURRENT_CHAT_ID:
         ACTION_LOGS.setdefault(CURRENT_CHAT_ID, []).append(("file", filepath))
         short_path = os.path.basename(filepath)
+        
+        # Инструмент отправки файла не инициирует API-запрос, лимит тут не нужен
         set_status(CURRENT_CHAT_ID, f"📤 <b>Отправляю файл:</b>\n<code>{html.escape(short_path)}</code>")
 
     if not CURRENT_CHAT_ID: return "Ошибка: ID чата неизвестен."
@@ -555,7 +610,6 @@ def handle_query(call):
             pass
         return
 
-    # НОВАЯ ЛОГИКА ОТОБРАЖЕНИЯ ПО MESSAGE_ID
     if data.startswith("show_acts_"):
         try:
             target_msg_id = int(data.split("_")[2])
@@ -691,10 +745,12 @@ def handle_query(call):
 
             CURRENT_CHAT_ID = call.message.chat.id
             ACTION_LOGS[CURRENT_CHAT_ID] = []
-            STATUS_MSG.pop(CURRENT_CHAT_ID, None)  # сбрасываем прошлый статус
+            STATUS_MSG.pop(CURRENT_CHAT_ID, None)
 
             safe_edit_message(call.message.chat.id, call.message.message_id, f"<b>{clean_name}:</b>\n🧠 Читаю файл...")
-            set_status(call.message.chat.id, "🧠 <b>Анализирую файл...</b>")
+            
+            status_text = "🧠 <b>Анализирую файл...</b>"
+            set_status(call.message.chat.id, status_text)
 
             try:
                 file_info = bot.get_file(file_info_dict['file_id'])
@@ -707,6 +763,7 @@ def handle_query(call):
                 if is_gemma:
                     response = chat_agent.send_message("Я текстовая модель Gemma, я пока не умею читать файлы.")
                 else:
+                    check_api_rate_limit(call.message.chat.id, status_text)
                     response = chat_agent.send_message([gemini_file, "Проанализируй этот файл. Расскажи, что в нём, либо выполни инструкции."])
                 os.remove(temp_file_name)
 
@@ -714,7 +771,6 @@ def handle_query(call):
 
                 markup = None
                 if ACTION_LOGS.get(CURRENT_CHAT_ID):
-                    # СОХРАНЯЕМ ЛОГИ ПО ID СООБЩЕНИЯ
                     LAST_ACTIONS[call.message.message_id] = ACTION_LOGS[CURRENT_CHAT_ID].copy()
                     markup = InlineKeyboardMarkup()
                     markup.add(InlineKeyboardButton("🛠 Выполненные действия", callback_data=f"show_acts_{call.message.message_id}"))
@@ -728,7 +784,6 @@ def handle_query(call):
 
             except Exception as e:
                 clear_status(call.message.chat.id)
-                # Создаём временное сообщение для handle_api_error
                 err_msg = bot.send_message(call.message.chat.id, "❌")
                 handle_api_error(e, call.message.chat.id, err_msg.message_id, None, clean_name)
 
@@ -784,20 +839,22 @@ def handle_message(message):
         if text.startswith('#'):
             task = text[1:].strip()
             msg_first = bot.send_message(message.chat.id, f"<b>{clean_model_name}:</b>", parse_mode='HTML')
-            msg_wait = bot.send_message(message.chat.id, "🧠 Думаю...")
+            status_text = "🧠 <b>Думаю...</b>"
+            set_status(message.chat.id, status_text)
             try:
+                check_api_rate_limit(message.chat.id, status_text)
                 response = model_advisor.generate_content(task)
-                send_long_text(message.chat.id, response.text, first_msg_id=msg_wait.message_id, is_code=True)
+                clear_status(message.chat.id)
+                send_long_text(message.chat.id, response.text, first_msg_id=msg_first.message_id, is_code=True)
             except Exception as e:
-                handle_api_error(e, message.chat.id, msg_wait.message_id, message, clean_model_name)
+                clear_status(message.chat.id)
+                handle_api_error(e, message.chat.id, msg_first.message_id, message, clean_model_name)
             return
 
-    # Сброс логов и статуса для нового запроса
     ACTION_LOGS[CURRENT_CHAT_ID] = []
     STATUS_MSG.pop(CURRENT_CHAT_ID, None)
 
     msg_first = bot.send_message(message.chat.id, f"<b>{clean_model_name}:</b>", parse_mode='HTML')
-    # Первый статус
     set_status(message.chat.id, "🤖 <b>Обрабатываю запрос...</b>")
 
     try:
@@ -810,12 +867,16 @@ def handle_message(message):
 
             audio_file = genai.upload_file(path=voice_path, mime_type="audio/ogg")
 
-            set_status(message.chat.id, "🧠 <b>Анализирую аудио...</b>")
+            status_text = "🧠 <b>Анализирую аудио...</b>"
+            set_status(message.chat.id, status_text)
+            
             if is_gemma:
                 response = chat_agent.send_message("Я получил аудио, но я текстовая модель Gemma и не умею слушать звук.")
             else:
                 base_prompt = "Обязательно прослушай этот аудиофайл. Если в нём звучит команда или задача для сервера — выполни её. Если это обычный разговор или вопрос — просто ответь на него."
                 prompt = f"{text}\n\n{base_prompt}" if text else base_prompt
+                
+                check_api_rate_limit(message.chat.id, status_text)
                 response = chat_agent.send_message([audio_file, prompt])
 
             os.remove(voice_path)
@@ -829,24 +890,30 @@ def handle_message(message):
 
             img_file = genai.upload_file(path=photo_path)
 
+            status_text = "🖼 <b>Анализирую изображение...</b>"
+            set_status(message.chat.id, status_text)
+            
             if is_gemma:
                 response = chat_agent.send_message("Я получил изображение, но я текстовая модель Gemma и не умею смотреть картинки.")
             else:
                 prompt = text if text else "Проанализируй это изображение."
+                
+                check_api_rate_limit(message.chat.id, status_text)
                 response = chat_agent.send_message([img_file, prompt])
 
             os.remove(photo_path)
 
         else:
-            set_status(message.chat.id, "🧠 <b>Думаю над ответом...</b>")
+            status_text = "🧠 <b>Думаю над ответом...</b>"
+            set_status(message.chat.id, status_text)
+            
+            check_api_rate_limit(message.chat.id, status_text)
             response = chat_agent.send_message(text)
 
-        # Удаляем статусное сообщение после получения ответа
         clear_status(message.chat.id)
 
         markup = None
         if ACTION_LOGS.get(CURRENT_CHAT_ID):
-            # СОХРАНЯЕМ ЛОГИ ПО ID СООБЩЕНИЯ (конкретно к тому, где будет висеть кнопка)
             LAST_ACTIONS[msg_first.message_id] = ACTION_LOGS[CURRENT_CHAT_ID].copy()
             markup = InlineKeyboardMarkup()
             markup.add(InlineKeyboardButton("🛠 Выполненные действия", callback_data=f"show_acts_{msg_first.message_id}"))
@@ -865,3 +932,4 @@ def handle_message(message):
 if __name__ == '__main__':
     print(f"AI-Админ запущен. Допущено админов: {len(ADMIN_IDS)}. Режим невидимки включен...")
     bot.polling(none_stop=True)
+    
