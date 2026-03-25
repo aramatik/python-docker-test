@@ -92,7 +92,7 @@ def load_prompts_config():
 Ты root-админ Ubuntu. Дай только bash-команду (без sudo).
 
 [GEMMA_ADMIN_REACT]
-[SYSTEM] Ты автономный AI-админ. Если нужно выполнить команду: <BASH>cmd</BASH>. Поиск в сети: <SEARCH>query</SEARCH>. Скачать файл: <DOWNLOAD>url</DOWNLOAD>. Отправить файл: <FILE>path</FILE>."""
+[SYSTEM] Ты автономный AI-админ. Если нужно выполнить команду: <BASH>cmd</BASH>. Поиск в сети (обязательно для курсов валют, новостей, цен): <SEARCH>query</SEARCH>. Скачать файл: <DOWNLOAD>url</DOWNLOAD>. Отправить файл юзеру: <FILE>path</FILE>."""
         with open(PROMPTS_FILE, "w", encoding="utf-8") as f:
             f.write(default_prompts)
 
@@ -431,6 +431,12 @@ def handle_api_error(e, chat_id, message_id, original_message, clean_model_name)
     else:
         safe_edit_message(chat_id, message_id, f"❌ Ошибка ИИ: {html.escape(error_text)}")
 
+def trim_chat_history(agent):
+    """АВТО-ТРИММЕР: Ограничивает память ИИ до последних 6 сообщений (3 диалогов)"""
+    MAX_HISTORY = 6
+    if hasattr(agent, 'history') and len(agent.history) > MAX_HISTORY:
+        agent.history = agent.history[-MAX_HISTORY:]
+
 # ─────────────────────────────────────────────
 #  ОБРАБОТЧИКИ КОМАНД
 # ─────────────────────────────────────────────
@@ -730,6 +736,7 @@ def handle_query(call):
                 else:
                     check_api_rate_limit(call.message.chat.id, status_text)
                     response = chat_agent.send_message([gemini_file, "Проанализируй этот файл. Расскажи, что в нём, либо выполни инструкции."])
+                    trim_chat_history(chat_agent) # Применяем триммер
                 os.remove(temp_file_name)
                 clear_status(call.message.chat.id)
 
@@ -751,20 +758,20 @@ def handle_query(call):
             return
 
 # ─────────────────────────────────────────────
-#  ReAct ЛОГИКА ДЛЯ GEMMA (С ДОБАВЛЕНИЕМ <FILE>)
+#  ReAct ЛОГИКА ДЛЯ GEMMA (С ОЧИСТКОЙ ИСТОРИИ)
 # ─────────────────────────────────────────────
 
-def process_gemma_react(chat_id, response_text, first_msg_id):
+def process_gemma_react(chat_id, response_text, first_msg_id, original_user_text):
     bash_match = re.search(r'<BASH>(.*?)</BASH>', response_text, re.DOTALL | re.IGNORECASE)
     search_match = re.search(r'<SEARCH>(.*?)</SEARCH>', response_text, re.DOTALL | re.IGNORECASE)
     dl_match = re.search(r'<DOWNLOAD>(.*?)</DOWNLOAD>', response_text, re.DOTALL | re.IGNORECASE)
     file_match = re.search(r'<FILE>(.*?)</FILE>', response_text, re.DOTALL | re.IGNORECASE)
     
     action = None
-    if bash_match: action = {"type": "bash", "val": bash_match.group(1).strip(), "msg_id": first_msg_id}
-    elif search_match: action = {"type": "search", "val": search_match.group(1).strip(), "msg_id": first_msg_id}
-    elif dl_match: action = {"type": "download", "val": dl_match.group(1).strip(), "msg_id": first_msg_id}
-    elif file_match: action = {"type": "file", "val": file_match.group(1).strip(), "msg_id": first_msg_id}
+    if bash_match: action = {"type": "bash", "val": bash_match.group(1).strip(), "msg_id": first_msg_id, "orig_text": original_user_text}
+    elif search_match: action = {"type": "search", "val": search_match.group(1).strip(), "msg_id": first_msg_id, "orig_text": original_user_text}
+    elif dl_match: action = {"type": "download", "val": dl_match.group(1).strip(), "msg_id": first_msg_id, "orig_text": original_user_text}
+    elif file_match: action = {"type": "file", "val": file_match.group(1).strip(), "msg_id": first_msg_id, "orig_text": original_user_text}
     
     if not action:
         clean_model_name = CURRENT_MODEL.replace('models/', '')
@@ -786,7 +793,6 @@ def process_gemma_react(chat_id, response_text, first_msg_id):
         markup = InlineKeyboardMarkup()
         markup.row(InlineKeyboardButton("✅ Выполнить", callback_data=f"gact_yes_{chat_id}"), InlineKeyboardButton("❌ Отмена", callback_data=f"gact_no_{chat_id}"))
         
-        # Определяем красивое имя для действия
         act_names = {"bash": "Команда BASH", "search": "Поиск в сети", "download": "Скачивание файла", "file": "Отправка файла в чат"}
         act_name = act_names.get(action['type'])
         
@@ -802,15 +808,24 @@ def execute_gemma_action(chat_id, action):
     elif action["type"] == "download": res = download_file_tool(action["val"])
     elif action["type"] == "file": res = send_file_to_telegram(action["val"])
     
-    followup_prompt = f"РЕЗУЛЬТАТ ВЫПОЛНЕНИЯ ({action['type']}):\n{res}\nОсновываясь на этом, дай финальный ответ (если задача выполнена) или вызови новый тег."
+    followup_prompt = f"РЕЗУЛЬТАТ ВЫПОЛНЕНИЯ ({action['type']}):\n{res}\nОсновываясь на этом, дай финальный ответ или вызови новый тег."
     status_text = "🧠 <b>Gemma анализирует результат...</b>"
     set_status(chat_id, status_text)
     
     try:
         check_api_rate_limit(chat_id, status_text)
         response = chat_agent.send_message(followup_prompt)
+        
+        # ХАК: Удаляем лог результата из истории, чтобы не забивать память!
+        # Мы заменяем громоздкий followup_prompt на короткую заглушку
+        if hasattr(chat_agent, 'history') and len(chat_agent.history) >= 2:
+            chat_agent.history[-2].parts[0].text = f"[Система сообщила результат действия {action['type']}]"
+        
         if hasattr(response, 'usage_metadata'): track_token_usage(response.usage_metadata.total_token_count)
-        process_gemma_react(chat_id, response.text, action["msg_id"])
+        
+        trim_chat_history(chat_agent) # Применяем триммер
+        
+        process_gemma_react(chat_id, response.text, action["msg_id"], action["orig_text"])
     except Exception as e:
         clear_status(chat_id)
         bot.send_message(chat_id, f"❌ Ошибка ИИ (ReAct Loop): {e}")
@@ -901,6 +916,7 @@ def handle_message(message):
                 check_api_rate_limit(message.chat.id, status_text)
                 response = chat_agent.send_message([audio_file, prompt])
                 if hasattr(response, 'usage_metadata'): track_token_usage(response.usage_metadata.total_token_count)
+                trim_chat_history(chat_agent)
 
             os.remove(voice_path)
 
@@ -923,6 +939,7 @@ def handle_message(message):
                 check_api_rate_limit(message.chat.id, status_text)
                 response = chat_agent.send_message([img_file, prompt])
                 if hasattr(response, 'usage_metadata'): track_token_usage(response.usage_metadata.total_token_count)
+                trim_chat_history(chat_agent)
 
             os.remove(photo_path)
 
@@ -930,18 +947,24 @@ def handle_message(message):
             check_api_rate_limit(message.chat.id, status_text)
             
             if is_gemma and GEMMA_ROLE.get(message.chat.id) == "admin":
-                # ПОДКЛЕИВАЕМ ПРОМПТ ИЗ ФАЙЛА
                 react_sys = "\n\n" + PROMPTS.get("GEMMA_ADMIN_REACT", "[SYSTEM] Используй теги: <BASH>, <SEARCH>, <DOWNLOAD>, <FILE>.")
                 final_text = text + react_sys
                 
                 response = chat_agent.send_message(final_text)
+                
+                # ЧИСТИМ ИСТОРИЮ ОТ ПРОМПТА-ИНЪЕКЦИИ
+                if hasattr(chat_agent, 'history') and len(chat_agent.history) >= 2:
+                    chat_agent.history[-2].parts[0].text = text # Заменяем текст с промптом на оригинальный запрос
+                
                 if hasattr(response, 'usage_metadata'): track_token_usage(response.usage_metadata.total_token_count)
                 
-                process_gemma_react(message.chat.id, response.text, msg_first.message_id)
+                trim_chat_history(chat_agent) # Применяем триммер
+                process_gemma_react(message.chat.id, response.text, msg_first.message_id, text)
                 return 
             else:
                 response = chat_agent.send_message(text)
                 if hasattr(response, 'usage_metadata'): track_token_usage(response.usage_metadata.total_token_count)
+                trim_chat_history(chat_agent) # Применяем триммер
 
         clear_status(message.chat.id)
 
