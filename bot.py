@@ -334,7 +334,7 @@ def send_file_to_telegram(filepath: str) -> str:
     except Exception as e: return f"Ошибка отправки файла: {str(e)}"
 
 # ─────────────────────────────────────────────
-#  ЛОГИКА МОДЕЛЕЙ
+#  ЛОГИКА МОДЕЛЕЙ И УМНЫЙ ТРИММЕР
 # ─────────────────────────────────────────────
 
 def get_models_lists():
@@ -419,6 +419,15 @@ def init_models(model_name, role="admin", mode="auto"):
 
 def handle_api_error(e, chat_id, message_id, original_message, clean_model_name):
     error_text = str(e)
+    
+    # АВТО-ИСЦЕЛЕНИЕ: Если история сломалась (ошибка 400 из-за рассинхрона function_call)
+    if "function response turn comes immediately after a function call" in error_text:
+        global chat_agent
+        if chat_agent:
+            chat_agent.history.clear()
+        safe_edit_message(chat_id, message_id, "⚠️ <b>Сбой синхронизации API!</b>\nКонтекст был поврежден (прерван вызов функции). Память ИИ автоматически очищена. Пожалуйста, повторите ваш последний запрос.")
+        return
+
     if "429" in error_text or "Quota exceeded" in error_text:
         global PENDING_RETRY_MESSAGE
         PENDING_RETRY_MESSAGE = original_message
@@ -431,10 +440,29 @@ def handle_api_error(e, chat_id, message_id, original_message, clean_model_name)
         safe_edit_message(chat_id, message_id, f"❌ Ошибка ИИ: {html.escape(error_text)}")
 
 def trim_chat_history(agent):
+    """УМНЫЙ ТРИММЕР: Аккуратно обрезает историю, не разрывая вызовы функций."""
     MAX_HISTORY = 6
-    if hasattr(agent, 'history') and len(agent.history) > MAX_HISTORY:
-        agent.history = agent.history[-MAX_HISTORY:]
-
+    if not hasattr(agent, 'history') or len(agent.history) <= MAX_HISTORY:
+        return
+        
+    cut_idx = len(agent.history) - MAX_HISTORY
+    
+    # Обязательно ищем сообщение с ролью 'user', которое НЕ является function_response
+    while cut_idx < len(agent.history):
+        msg = agent.history[cut_idx]
+        if msg.role == 'user':
+            is_function_response = False
+            for part in msg.parts:
+                if hasattr(part, 'function_response') and part.function_response:
+                    is_function_response = True
+                    break
+            
+            if not is_function_response:
+                break # Нашли безопасное место для среза
+        cut_idx += 1
+        
+    if cut_idx < len(agent.history):
+        agent.history = agent.history[cut_idx:]
 
 # ─────────────────────────────────────────────
 #  ОБРАБОТЧИКИ КОМАНД
@@ -538,13 +566,11 @@ def handle_document(message):
     markup.row(InlineKeyboardButton("🧠 Обработать ИИ", callback_data="file_ai"))
     bot.reply_to(message, f"📥 Загрузить файл <b>{html.escape(message.document.file_name)}</b> на сервер?", reply_markup=markup, parse_mode='HTML')
 
-
 # ─────────────────────────────────────────────
 #  ЕДИНЫЙ ПАРСЕР И МАРШРУТИЗАТОР ОТВЕТОВ
 # ─────────────────────────────────────────────
 
 def parse_and_route_response(chat_id, response, first_msg_id, original_text):
-    """Универсальный парсер. Понимает как XML теги Gemma, так и Native Tools Gemini."""
     clean_model_name = CURRENT_MODEL.replace('models/', '')
     is_gemma = "gemma" in clean_model_name.lower()
     role = MODEL_ROLE.get(chat_id, "admin")
@@ -556,7 +582,6 @@ def parse_and_route_response(chat_id, response, first_msg_id, original_text):
     action = None
     
     if is_gemma:
-        # ReAct парсер для Gemma
         response_text = response.text or ""
         bash_match = re.search(r'<BASH>(.*?)</BASH>', response_text, re.DOTALL | re.IGNORECASE)
         search_match = re.search(r'<SEARCH>(.*?)</SEARCH>', response_text, re.DOTALL | re.IGNORECASE)
@@ -569,10 +594,9 @@ def parse_and_route_response(chat_id, response, first_msg_id, original_text):
         elif file_match: action = {"type": "react", "name": "file", "val": file_match.group(1).strip(), "disp_name": "Отправка файла в чат", "disp_val": file_match.group(1).strip()}
         
     else:
-        # Native Function Call перехватчик для Gemini (полуавтомат)
         if response.parts:
             for part in response.parts:
-                if part.function_call:
+                if hasattr(part, 'function_call') and part.function_call:
                     fn_name = part.function_call.name
                     fn_args = {key: val for key, val in part.function_call.args.items()}
                     
@@ -796,7 +820,6 @@ def handle_query(call):
         except: pass
         bot.send_message(call.message.chat.id, "❌ Действие отменено пользователем.")
         
-        # Сообщаем ИИ, что юзер отменил операцию, чтобы ИИ мог продолжить диалог
         if action:
             status_text = "🧠 <b>Сообщаю об отмене...</b>"
             set_status(call.message.chat.id, status_text)
@@ -901,6 +924,14 @@ def handle_message(message):
         bot.reply_to(message, "⚠️ Сначала выберите модель (/gemini)", reply_markup=get_models_keyboard())
         return
 
+    # ПЕРЕХВАТЧИК: Если висит запрос функции, а юзер написал текст - закрываем функцию "отменой"
+    pending = PENDING_ACTION.pop(message.chat.id, None)
+    if pending and pending.get("type") == "native":
+        try:
+            chat_agent.send_message({"function_response": {"name": pending["name"], "response": {"result": "Отменено пользователем (написал новое сообщение)"}}})
+        except Exception:
+            pass
+
     clean_model_name = CURRENT_MODEL.replace('models/', '')
     is_gemma = "gemma" in clean_model_name.lower()
     role = MODEL_ROLE.get(message.chat.id, "admin")
@@ -1004,7 +1035,6 @@ def handle_message(message):
                 if hasattr(response, 'usage_metadata'): track_token_usage(response.usage_metadata.total_token_count)
                 trim_chat_history(chat_agent) 
 
-        # Вызываем универсальный маршрутизатор ответов
         parse_and_route_response(message.chat.id, response, msg_first.message_id, text)
 
     except Exception as e:
