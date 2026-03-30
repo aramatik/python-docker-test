@@ -25,7 +25,7 @@ def parse_search_query(query):
 
 def run_grep_search(terms, base_path="/app/downloads/база/*.csv"):
     """
-    Генерирует и выполняет команду grep по переданным аргументам.
+    Генерирует и выполняет команду grep по переданным аргументам для обычных файлов.
     """
     if not terms: return ""
         
@@ -33,6 +33,7 @@ def run_grep_search(terms, base_path="/app/downloads/база/*.csv"):
     for word in terms[1:]:
         cmd += f" | grep -i {shlex.quote(word)}"
         
+    # Таймаут для обычных баз оставляем 60 секунд
     result = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=60)
     return result.stdout.strip()
 
@@ -56,15 +57,15 @@ def run_archive_search(terms, base_path="/app/downloads/база"):
             cmd += f" | grep -i {shlex.quote(word)}"
             
         try:
-            # Даем на каждый архив отдельный таймаут (архивы могут быть большими)
-            res = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=60)
+            # УВЕЛИЧИЛИ ТАЙМ-АУТ ДО 5 МИНУТ (300 СЕКУНД)
+            res = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=300)
             if res.stdout:
                 for line in res.stdout.strip().split('\n'):
                     if line:
                         # Форматируем под стандартный вывод grep (имя_файла:совпадение)
                         all_results.append(f"{arch_name}:{line}")
         except subprocess.TimeoutExpired:
-            all_results.append(f"{arch_name}:[Таймаут поиска в архиве]")
+            all_results.append(f"{arch_name}:[Таймаут поиска в архиве (превышен лимит 5 минут)]")
         except Exception:
             pass
             
@@ -118,4 +119,4 @@ def format_search_results(output, terms):
         formatted_chunks.append(current_chunk)
         
     return formatted_chunks, clean_text_for_file
-        
+    
