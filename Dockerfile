@@ -2,9 +2,9 @@ FROM python:3.12-slim
 
 WORKDIR /app
 
-# Убрали rhvoice, оставили ffmpeg для конвертации аудио
+# Убрали rhvoice, оставили ffmpeg для конвертации аудио и добавили p7zip-full для чтения архивов
 RUN apt-get update && apt-get install -y \
-    iputils-ping curl wget nano net-tools htop docker.io ffmpeg \
+    iputils-ping curl wget nano net-tools htop docker.io ffmpeg p7zip-full \
     && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt .
