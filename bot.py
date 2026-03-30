@@ -13,7 +13,7 @@ from collections import deque
 
 # Импортируем наши внешние модули
 from markdown import split_text_safely, md_to_html
-from search import parse_search_query, run_grep_search, format_search_results
+from search import parse_search_query, run_grep_search, run_archive_search, format_search_results
 import web_search
 
 # Загружаем ключи
@@ -22,6 +22,7 @@ API_KEY_1 = os.getenv("GEMINI_API_KEY")
 API_KEY_2 = os.getenv("GEMINI2_API_KEY")
 API_KEY_3 = os.getenv("GEMINI3_API_KEY")
 
+# Безопасно собираем все ID админов
 ADMIN_IDS = set()
 for env_var in ["ADMIN_ID", "ADMIN2_ID", "ADMIN3_ID"]:
     val = os.getenv(env_var)
@@ -50,7 +51,7 @@ PENDING_SEARCH_RESULTS = {}
 # Единые настройки для ВСЕХ моделей
 MODEL_ROLE = {}  # {chat_id: "admin" | "chat"}
 MODEL_MODE = {}  # {chat_id: "auto" | "semi"}
-PENDING_ACTION = {} # {chat_id: {"type": "native"|"react", "name": "...", "val": "...", "msg_id": 123, "orig_text": "..."}}
+PENDING_ACTION = {} 
 
 ACTION_LOGS = {}
 LAST_ACTIONS = {} 
@@ -108,7 +109,6 @@ def load_prompts_config():
                 current_text = []
             else: current_text.append(line.rstrip('\n'))
         if current_key: PROMPTS[current_key] = "\n".join(current_text).strip()
-    print(f"Загружены промпты: {list(PROMPTS.keys())}")
 
 def load_models_config():
     global PRIORITY_MODELS, MODEL_RPM_LIMITS, MODEL_RESTRICTED_KEYS
@@ -135,8 +135,6 @@ def load_models_config():
                     
                 key_match = re.search(r'KEY:([\d,]+)', line)
                 if key_match: MODEL_RESTRICTED_KEYS[model_name] = [int(k) for k in key_match.group(1).split(',') if k.isdigit()]
-                    
-    print(f"Загружено {len(PRIORITY_MODELS)} моделей из {MODELS_FILE}")
 
 load_prompts_config()
 load_models_config()
@@ -217,7 +215,7 @@ def check_api_rate_limit(chat_id, current_status_text):
 def safe_edit_message(chat_id, message_id, text, parse_mode='HTML', reply_markup=None):
     try: bot.edit_message_text(chat_id=chat_id, message_id=message_id, text=text, parse_mode=parse_mode, reply_markup=reply_markup)
     except Exception as e:
-        if "message is not modified" not in str(e).lower(): raise e
+        if "message is not modified" in str(e).lower(): raise e
 
 def send_long_text(chat_id, text, first_msg_id=None, is_code=False, prefix="", reply_markup=None):
     if not text: return
@@ -298,7 +296,7 @@ def execute_bash(command: str) -> str:
     try:
         result = subprocess.run(command, shell=True, capture_output=True, text=True, timeout=30)
         output = result.stdout if result.stdout else result.stderr
-        return output[:2500]
+        return output[:2500]  # Вернули стандартный лимит 2500 символов
     except Exception as e: return f"Ошибка: {str(e)}"
 
 def search_web_tool(query: str) -> str:
@@ -403,7 +401,7 @@ def init_models(model_name, role="admin", mode="auto"):
                 system_instruction=PROMPTS.get("CHAT_BOT", "Ты ИИ-ассистент.")
             )
             chat_agent = model_agent.start_chat()
-        else: # admin
+        else:
             enable_auto = (mode == "auto")
             model_agent = genai.GenerativeModel(
                 model_name=model_name,
@@ -420,7 +418,6 @@ def init_models(model_name, role="admin", mode="auto"):
 def handle_api_error(e, chat_id, message_id, original_message, clean_model_name):
     error_text = str(e)
     
-    # АВТО-ИСЦЕЛЕНИЕ: Если история сломалась (ошибка 400 из-за рассинхрона function_call)
     if "function response turn comes immediately after a function call" in error_text:
         global chat_agent
         if chat_agent:
@@ -440,14 +437,12 @@ def handle_api_error(e, chat_id, message_id, original_message, clean_model_name)
         safe_edit_message(chat_id, message_id, f"❌ Ошибка ИИ: {html.escape(error_text)}")
 
 def trim_chat_history(agent):
-    """УМНЫЙ ТРИММЕР: Аккуратно обрезает историю, не разрывая вызовы функций."""
     MAX_HISTORY = 6
     if not hasattr(agent, 'history') or len(agent.history) <= MAX_HISTORY:
         return
         
     cut_idx = len(agent.history) - MAX_HISTORY
     
-    # Обязательно ищем сообщение с ролью 'user', которое НЕ является function_response
     while cut_idx < len(agent.history):
         msg = agent.history[cut_idx]
         if msg.role == 'user':
@@ -458,7 +453,7 @@ def trim_chat_history(agent):
                     break
             
             if not is_function_response:
-                break # Нашли безопасное место для среза
+                break 
         cut_idx += 1
         
     if cut_idx < len(agent.history):
@@ -472,6 +467,26 @@ def trim_chat_history(agent):
 def send_welcome(message):
     if message.from_user.id not in ADMIN_IDS: return
     bot.reply_to(message, "👋 Привет, Админ!\nВыбери модель Gemini:", reply_markup=get_models_keyboard())
+
+@bot.message_handler(commands=['help'])
+def send_help(message):
+    if message.from_user.id not in ADMIN_IDS: return
+    log_admin_action(message.from_user.id, "Команда /help")
+    help_text = (
+        "🤖 <b>Справка по командам AI-Админа:</b>\n\n"
+        "🔸 /start — Приветствие и выбор модели\n"
+        "🔸 /help — Показать эту справку\n"
+        "🔸 /gemini — Выбрать активную модель ИИ\n"
+        "🔸 /changekey — Сменить текущий API-ключ Gemini\n"
+        "🔸 /reload — Перезагрузить конфиги (models.txt, prompts.txt)\n"
+        "🔸 /voice — Управление голосовыми ответами (Вкл/Выкл)\n"
+        "🔸 /clear — Очистить память (контекст) текущей модели\n"
+        "🔸 /search — Поиск по базам данных (csv) и архивам (zip, 7z)\n\n"
+        "💡 <b>Скрытые команды:</b>\n"
+        "<code>!команда</code> — Выполнить bash-команду напрямую (без ИИ)\n"
+        "<code>#запрос</code> — Выполнить запрос через ИИ-советника (вернет только команду)"
+    )
+    bot.reply_to(message, help_text, parse_mode='HTML')
 
 @bot.message_handler(commands=['gemini'])
 def change_model(message):
@@ -523,11 +538,16 @@ def clear_cmd(message):
 
 @bot.message_handler(commands=['search'])
 def search_cmd(message):
+    """Новое меню команды /search с выбором места поиска."""
     if message.from_user.id not in ADMIN_IDS: return
-    msg = bot.reply_to(message, "Введите поисковый запрос (фразы в [квадратных скобках] ищутся целиком):")
-    bot.register_next_step_handler(msg, process_search_query)
+    markup = InlineKeyboardMarkup()
+    markup.row(
+        InlineKeyboardButton("📂 Обычные базы", callback_data="search_type_regular"),
+        InlineKeyboardButton("🗄 В архивах", callback_data="search_type_archive")
+    )
+    bot.reply_to(message, "Где искать?", reply_markup=markup)
 
-def process_search_query(message):
+def process_search_query(message, search_type="regular"):
     if message.from_user.id not in ADMIN_IDS: return
     query = (message.text or "").strip()
     if not query:
@@ -535,21 +555,33 @@ def process_search_query(message):
         return
     words = parse_search_query(query)
     if not words: return
-    msg_wait = bot.send_message(message.chat.id, f"🔍 Ищу в базе: <code>{' | '.join(words)}</code>...", parse_mode='HTML')
+    
+    mode_text = "в архивах (.zip, .7z)" if search_type == "archive" else "в обычных базах (.csv)"
+    msg_wait = bot.send_message(message.chat.id, f"🔍 Ищу {mode_text}: <code>{' | '.join(words)}</code>...", parse_mode='HTML')
+    
     try:
-        output = run_grep_search(words)
+        if search_type == "archive":
+            output = run_archive_search(words)
+        else:
+            output = run_grep_search(words)
+            
         if not output:
             safe_edit_message(message.chat.id, msg_wait.message_id, "🤷‍♂️ По вашему запросу ничего не найдено.")
             return
+            
         bot.delete_message(message.chat.id, msg_wait.message_id)
         formatted_chunks, clean_text_for_file = format_search_results(output, words)
-        for chunk in formatted_chunks[:5]: bot.send_message(message.chat.id, f"<pre>{chunk.strip()}</pre>", parse_mode='HTML')
+        
+        for chunk in formatted_chunks[:5]: 
+            bot.send_message(message.chat.id, f"<pre>{chunk.strip()}</pre>", parse_mode='HTML')
+            
         if len(formatted_chunks) > 5:
             PENDING_SEARCH_RESULTS[message.chat.id] = clean_text_for_file
             markup = InlineKeyboardMarkup()
             markup.add(InlineKeyboardButton("📥 Скачать всё (.txt)", callback_data="download_search_txt"))
             bot.send_message(message.chat.id, f"⚠️ <b>Внимание:</b> Показано 5 сообщений. Остальной текст обрезан.\n\nСкачать полные результаты:", parse_mode='HTML', reply_markup=markup)
-    except Exception as e: safe_edit_message(message.chat.id, msg_wait.message_id, f"❌ Ошибка поиска: {html.escape(str(e))}")
+    except Exception as e: 
+        safe_edit_message(message.chat.id, msg_wait.message_id, f"❌ Ошибка поиска: {html.escape(str(e))}")
 
 @bot.message_handler(content_types=['document'])
 def handle_document(message):
@@ -642,7 +674,6 @@ def process_action_request(chat_id, action):
 def execute_pending_action(chat_id, action):
     global chat_agent
     res = "Нет результата."
-    clean_model_name = CURRENT_MODEL.replace('models/', '')
     
     if action["type"] == "react":
         if action["name"] == "bash": res = execute_bash(action["val"])
@@ -691,6 +722,17 @@ def handle_query(call):
     global CURRENT_MODEL, CURRENT_KEY_NUM, PRIORITY_MODELS_CACHE, OTHER_MODELS_CACHE, AVAILABLE_MODELS
     global CURRENT_CHAT_ID, MODEL_ROLE, MODEL_MODE, PENDING_ACTION
     data = call.data
+
+    # ВЫБОР РЕЖИМА ПОИСКА
+    if data in ["search_type_regular", "search_type_archive"]:
+        search_type = "archive" if "archive" in data else "regular"
+        try: bot.delete_message(call.message.chat.id, call.message.message_id)
+        except Exception: pass
+        
+        mode_text = "В архивах (.zip, .7z)" if search_type == "archive" else "Обычные базы (.csv)"
+        msg = bot.send_message(call.message.chat.id, f"🔍 Режим: <b>{mode_text}</b>\n\nВведите поисковый запрос (фразы в [квадратных скобках] ищутся целиком):", parse_mode='HTML')
+        bot.register_next_step_handler(msg, process_search_query, search_type=search_type)
+        return
 
     if data == "voice_on":
         VOICE_MODE[call.message.chat.id] = True
@@ -916,15 +958,15 @@ def handle_message(message):
         elif cmd == '/gemini': change_model(message)
         elif cmd == '/changekey': change_key_cmd(message)
         elif cmd == '/reload': reload_configs_cmd(message)
+        elif cmd == '/help': send_help(message)
         elif cmd == '/start': send_welcome(message)
-        else: bot.reply_to(message, "⚠️ Неизвестная команда.")
+        else: bot.reply_to(message, "⚠️ Неизвестная команда. Введите /help для справки.")
         return
 
     if not CURRENT_MODEL:
         bot.reply_to(message, "⚠️ Сначала выберите модель (/gemini)", reply_markup=get_models_keyboard())
         return
 
-    # ПЕРЕХВАТЧИК: Если висит запрос функции, а юзер написал текст - закрываем функцию "отменой"
     pending = PENDING_ACTION.pop(message.chat.id, None)
     if pending and pending.get("type") == "native":
         try:
