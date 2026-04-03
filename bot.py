@@ -68,14 +68,7 @@ PROMPTS = {}
 MODELS_FILE = "models.txt"
 MODEL_RPM_LIMITS = {}
 MODEL_RESTRICTED_KEYS = {} 
-MODEL_TPM_LIMITS = {
-    "gemma-3-27b": 15000,
-    "gemma-3-12b": 15000,
-    "gemma-3-4b": 15000,
-    "gemma-3-1b": 15000,
-    "gemma-3n-e4b": 15000,
-    "gemma-3n-e2b": 15000
-}
+MODEL_TPM_LIMITS = {}
 PRIORITY_MODELS = []
 
 def load_prompts_config():
@@ -111,13 +104,17 @@ def load_prompts_config():
         if current_key: PROMPTS[current_key] = "\n".join(current_text).strip()
 
 def load_models_config():
-    global PRIORITY_MODELS, MODEL_RPM_LIMITS, MODEL_RESTRICTED_KEYS
+    global PRIORITY_MODELS, MODEL_RPM_LIMITS, MODEL_RESTRICTED_KEYS, MODEL_TPM_LIMITS
     PRIORITY_MODELS.clear()
     MODEL_RPM_LIMITS.clear()
     MODEL_RESTRICTED_KEYS.clear()
+    MODEL_TPM_LIMITS.clear()
     
     if not os.path.exists(MODELS_FILE):
-        default_content = "gemini-2.5-flash [RPM:5]\ngemma-3-27b [RPM:15]\n"
+        default_content = """gemini-2.5-flash [RPM:5,TPM:250000]
+gemini-flash-latest [RPM:5,TPM:250000]
+gemini-2.5-flash-lite [RPM:10,TPM:250000]
+gemma-3-27b [RPM:15,TPM:15000]"""
         with open(MODELS_FILE, "w", encoding="utf-8") as f: f.write(default_content)
     
     with open(MODELS_FILE, "r", encoding="utf-8") as f:
@@ -132,6 +129,9 @@ def load_models_config():
                 
                 rpm_match = re.search(r'RPM:(\d+)', line)
                 if rpm_match: MODEL_RPM_LIMITS[model_name] = int(rpm_match.group(1))
+                
+                tpm_match = re.search(r'TPM:(\d+)', line)
+                if tpm_match: MODEL_TPM_LIMITS[model_name] = int(tpm_match.group(1))
                     
                 key_match = re.search(r'KEY:([\d,]+)', line)
                 if key_match: MODEL_RESTRICTED_KEYS[model_name] = [int(k) for k in key_match.group(1).split(',') if k.isdigit()]
@@ -179,8 +179,11 @@ def check_api_rate_limit(chat_id, current_status_text):
     if not CURRENT_MODEL: return
 
     clean_name = CURRENT_MODEL.replace('models/', '')
+    
+    # Берем лимиты строго из конфига (без дефолтных значений)
     rpm_limit = MODEL_RPM_LIMITS.get(clean_name)
     tpm_limit = MODEL_TPM_LIMITS.get(clean_name)
+    
     now = time.time()
     
     if rpm_limit:
@@ -198,7 +201,7 @@ def check_api_rate_limit(chat_id, current_status_text):
         history_tpm = API_TOKEN_HISTORY.setdefault(CURRENT_KEY_NUM, deque())
         while history_tpm and now - history_tpm[0][0] > 60.5: history_tpm.popleft()
         current_tpm = sum(count for _, count in history_tpm)
-        if current_tpm > (tpm_limit - 1000):
+        if current_tpm > (tpm_limit - 1000): # Буфер 1000 токенов
             wait_time = 60.5 - (now - history_tpm[0][0])
             if wait_time > 0:
                 set_status(chat_id, f"{current_status_text}\n⏳ <i>Тайм-аут токенов: ожидание {wait_time:.1f}с (использовано {current_tpm}/{tpm_limit} TPM)</i>")
@@ -296,7 +299,7 @@ def execute_bash(command: str) -> str:
     try:
         result = subprocess.run(command, shell=True, capture_output=True, text=True, timeout=30)
         output = result.stdout if result.stdout else result.stderr
-        return output[:2500]  # Вернули стандартный лимит 2500 символов
+        return output[:2500] 
     except Exception as e: return f"Ошибка: {str(e)}"
 
 def search_web_tool(query: str) -> str:
@@ -374,13 +377,16 @@ def get_models_keyboard(show_all=False):
     for model_name in PRIORITY_MODELS_CACHE:
         clean_name = model_name.replace('models/', '')
         rpm_info = MODEL_RPM_LIMITS.get(clean_name)
+        # Выводим инфо о RPM только если оно явно задано в конфиге
         btn_text = f"{clean_name} (RPM:{rpm_info})" if rpm_info else clean_name
         markup.add(InlineKeyboardButton(text=btn_text, callback_data=f"mod_{model_name}"))
 
     if show_all:
         for model_name in OTHER_MODELS_CACHE:
             clean_name = model_name.replace('models/', '')
-            markup.add(InlineKeyboardButton(text=clean_name, callback_data=f"mod_{model_name}"))
+            rpm_info = MODEL_RPM_LIMITS.get(clean_name)
+            btn_text = f"{clean_name} (RPM:{rpm_info})" if rpm_info else clean_name
+            markup.add(InlineKeyboardButton(text=btn_text, callback_data=f"mod_{model_name}"))
     else:
         if OTHER_MODELS_CACHE:
             markup.add(InlineKeyboardButton(text="⬇️ Другие модели", callback_data="show_all_mods"))
@@ -811,38 +817,41 @@ def handle_query(call):
     if data.startswith("mod_"):
         model_name = data.replace("mod_", "")
         CURRENT_MODEL = model_name
+        clean_name = CURRENT_MODEL.replace('models/', '')
         try: bot.delete_message(call.message.chat.id, call.message.message_id)
         except: pass
         
         markup = InlineKeyboardMarkup()
         markup.row(InlineKeyboardButton("🛠 Админ", callback_data="role_admin"), InlineKeyboardButton("💬 Чат-бот", callback_data="role_chat"))
-        bot.send_message(call.message.chat.id, f"Выбрана модель <b>{CURRENT_MODEL}</b>.\nВыберите роль ИИ:", reply_markup=markup, parse_mode='HTML')
+        bot.send_message(call.message.chat.id, f"Выбрана модель <b>{clean_name}</b>.\nВыберите роль ИИ:", reply_markup=markup, parse_mode='HTML')
         return
 
     if data.startswith("role_"):
         role = data.replace("role_", "")
         MODEL_ROLE[call.message.chat.id] = role
+        clean_name = CURRENT_MODEL.replace('models/', '')
         try: bot.delete_message(call.message.chat.id, call.message.message_id)
         except: pass
         
         if role == "admin":
             markup = InlineKeyboardMarkup()
             markup.row(InlineKeyboardButton("⚡ Авто", callback_data="mode_auto"), InlineKeyboardButton("🛑 Полуавтомат", callback_data="mode_semi"))
-            bot.send_message(call.message.chat.id, "Выберите режим выполнения команд:", reply_markup=markup)
+            bot.send_message(call.message.chat.id, f"Выберите режим выполнения команд для <b>{clean_name}</b>:", parse_mode='HTML', reply_markup=markup)
         else:
             MODEL_MODE[call.message.chat.id] = "auto"
             init_models(CURRENT_MODEL, role="chat", mode="auto")
-            bot.send_message(call.message.chat.id, f"✅ ИИ запущен в роли: <b>Чат-бот</b>", parse_mode='HTML')
+            bot.send_message(call.message.chat.id, f"✅ <b>{clean_name}</b> запущен в роли: <b>Чат-бот</b>", parse_mode='HTML')
         return
 
     if data.startswith("mode_"):
         mode = data.replace("mode_", "")
         MODEL_MODE[call.message.chat.id] = mode
+        clean_name = CURRENT_MODEL.replace('models/', '')
         init_models(CURRENT_MODEL, role="admin", mode=mode)
         try: bot.delete_message(call.message.chat.id, call.message.message_id)
         except: pass
         m_text = "АВТО (выполняет функции сам)" if mode == "auto" else "ПОЛУАВТОМАТ (спрашивает разрешение)"
-        bot.send_message(call.message.chat.id, f"✅ ИИ запущен в роли: <b>Админ -> {m_text}</b>", parse_mode='HTML')
+        bot.send_message(call.message.chat.id, f"✅ <b>{clean_name}</b> запущен в роли: <b>Админ -> {m_text}</b>", parse_mode='HTML')
         return
 
     # УПРАВЛЕНИЕ ДЕЙСТВИЯМИ (Полуавтомат)
