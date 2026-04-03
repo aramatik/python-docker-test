@@ -86,6 +86,9 @@ def load_prompts_config():
 [GEMMA_ADMIN_REACT]
 [SYSTEM] Ты автономный AI-админ. Если нужно выполнить команду: <BASH>cmd</BASH>. Поиск в сети (обязательно для курсов валют, новостей, цен): <SEARCH>query</SEARCH>. Скачать файл: <DOWNLOAD>url</DOWNLOAD>. Отправить файл юзеру: <FILE>path</FILE>.
 
+[GEMMA4_ADMIN_REACT]
+[SYSTEM] Ты автономный AI-админ (Gemma 4). Твоя задача выдавать ТОЛЬКО ОДИН тег действия без лишних рассуждений. Запрещено дублировать правила в ответе. Если нужна команда Linux: напиши строго <BASH>cmd</BASH>. Поиск: <SEARCH>query</SEARCH>. Скачать файл: <DOWNLOAD>url</DOWNLOAD>. Отправить файл: <FILE>path</FILE>.
+
 [CHAT_BOT]
 Ты умный, полезный и дружелюбный ИИ-ассистент. Отвечай на вопросы пользователя и поддерживай диалог. Системные функции отключены."""
         with open(PROMPTS_FILE, "w", encoding="utf-8") as f:
@@ -180,7 +183,6 @@ def check_api_rate_limit(chat_id, current_status_text):
 
     clean_name = CURRENT_MODEL.replace('models/', '')
     
-    # Берем лимиты строго из конфига (без дефолтных значений)
     rpm_limit = MODEL_RPM_LIMITS.get(clean_name)
     tpm_limit = MODEL_TPM_LIMITS.get(clean_name)
     
@@ -358,6 +360,12 @@ def get_models_lists():
         if best_match:
             priority.append(best_match)
             used_models.add(best_match)
+            
+            # МАГИЯ ПРОБРОСА КОНФИГА: привязываем лимиты к реальному имени API
+            clean_best_match = best_match.replace('models/', '')
+            if p in MODEL_RPM_LIMITS: MODEL_RPM_LIMITS[clean_best_match] = MODEL_RPM_LIMITS[p]
+            if p in MODEL_TPM_LIMITS: MODEL_TPM_LIMITS[clean_best_match] = MODEL_TPM_LIMITS[p]
+            if p in MODEL_RESTRICTED_KEYS: MODEL_RESTRICTED_KEYS[clean_best_match] = MODEL_RESTRICTED_KEYS[p]
 
     for m in raw_models:
         if m not in used_models:
@@ -377,7 +385,6 @@ def get_models_keyboard(show_all=False):
     for model_name in PRIORITY_MODELS_CACHE:
         clean_name = model_name.replace('models/', '')
         rpm_info = MODEL_RPM_LIMITS.get(clean_name)
-        # Выводим инфо о RPM только если оно явно задано в конфиге
         btn_text = f"{clean_name} (RPM:{rpm_info})" if rpm_info else clean_name
         markup.add(InlineKeyboardButton(text=btn_text, callback_data=f"mod_{model_name}"))
 
@@ -386,7 +393,7 @@ def get_models_keyboard(show_all=False):
             clean_name = model_name.replace('models/', '')
             rpm_info = MODEL_RPM_LIMITS.get(clean_name)
             btn_text = f"{clean_name} (RPM:{rpm_info})" if rpm_info else clean_name
-            markup.add(InlineKeyboardButton(text=btn_text, callback_data=f"mod_{model_name}"))
+            markup.add(InlineKeyboardButton(text=clean_name, callback_data=f"mod_{model_name}"))
     else:
         if OTHER_MODELS_CACHE:
             markup.add(InlineKeyboardButton(text="⬇️ Другие модели", callback_data="show_all_mods"))
@@ -464,6 +471,12 @@ def trim_chat_history(agent):
         
     if cut_idx < len(agent.history):
         agent.history = agent.history[cut_idx:]
+
+def get_gemma_react_prompt(clean_model_name):
+    """Выдает правильный промпт в зависимости от версии Gemma."""
+    if "gemma-4" in clean_model_name.lower():
+        return "\n\n" + PROMPTS.get("GEMMA4_ADMIN_REACT", "[SYSTEM] Используй теги: <BASH>, <SEARCH>, <DOWNLOAD>, <FILE>.")
+    return "\n\n" + PROMPTS.get("GEMMA_ADMIN_REACT", "[SYSTEM] Используй теги: <BASH>, <SEARCH>, <DOWNLOAD>, <FILE>.")
 
 # ─────────────────────────────────────────────
 #  ОБРАБОТЧИКИ КОМАНД
@@ -1071,7 +1084,7 @@ def handle_message(message):
             check_api_rate_limit(message.chat.id, status_text)
             
             if is_gemma and role == "admin":
-                react_sys = "\n\n" + PROMPTS.get("GEMMA_ADMIN_REACT", "[SYSTEM] Используй теги: <BASH>, <SEARCH>, <DOWNLOAD>, <FILE>.")
+                react_sys = get_gemma_react_prompt(clean_model_name)
                 final_text = text + react_sys
                 response = chat_agent.send_message(final_text)
                 
@@ -1095,3 +1108,4 @@ def handle_message(message):
 if __name__ == '__main__':
     print(f"AI-Админ запущен. Допущено админов: {len(ADMIN_IDS)}.")
     bot.polling(none_stop=True)
+                         
