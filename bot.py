@@ -277,6 +277,7 @@ def generate_and_send_voice(chat_id, text):
 # ─────────────────────────────────────────────
 
 def execute_bash(command: str) -> str:
+    """Выполняет bash команду на сервере."""
     if CURRENT_CHAT_ID:
         ACTION_LOGS.setdefault(CURRENT_CHAT_ID, []).append(("bash", command))
         short_cmd = command if len(command) <= 80 else command[:77] + "…"
@@ -290,6 +291,7 @@ def execute_bash(command: str) -> str:
     except Exception as e: return f"Ошибка: {str(e)}"
 
 def search_web_tool(query: str) -> str:
+    """Ищет информацию в интернете."""
     if CURRENT_CHAT_ID:
         ACTION_LOGS.setdefault(CURRENT_CHAT_ID, []).append(("search", query))
         short_q = query if len(query) <= 80 else query[:77] + "…"
@@ -299,6 +301,7 @@ def search_web_tool(query: str) -> str:
     return web_search.search_web(query)
 
 def download_file_tool(url: str) -> str:
+    """Скачивает файл по URL на сервер."""
     if CURRENT_CHAT_ID:
         ACTION_LOGS.setdefault(CURRENT_CHAT_ID, []).append(("download", url))
         short_url = url if len(url) <= 70 else url[:67] + "…"
@@ -308,6 +311,7 @@ def download_file_tool(url: str) -> str:
     return web_search.download_file_tool(url)
 
 def send_file_to_telegram(filepath: str) -> str:
+    """Отправляет файл с сервера в чат пользователю."""
     global CURRENT_CHAT_ID
     if CURRENT_CHAT_ID:
         ACTION_LOGS.setdefault(CURRENT_CHAT_ID, []).append(("file", filepath))
@@ -320,6 +324,31 @@ def send_file_to_telegram(filepath: str) -> str:
         with open(filepath, 'rb') as f: bot.send_document(CURRENT_CHAT_ID, f)
         return f"Успех: Файл {filepath} отправлен."
     except Exception as e: return f"Ошибка отправки файла: {str(e)}"
+
+def delete_scheduled_task_tool(task_id: str) -> str:
+    """Удаляет фоновую задачу по её ID (используется для само-остановки циклических задач)."""
+    global CURRENT_CHAT_ID
+    if not CURRENT_CHAT_ID: return "Error: Chat ID unknown."
+    
+    ACTION_LOGS.setdefault(CURRENT_CHAT_ID, []).append(("delete_task", task_id))
+    
+    if task.delete_task(CURRENT_CHAT_ID, task_id, deleted_by="AI_AGENT"):
+        return f"Success: Task {task_id} has been permanently deleted from the schedule."
+    return f"Error: Task {task_id} not found or already deleted."
+
+def list_my_tasks_tool() -> str:
+    """Возвращает список всех активных фоновых задач текущего чата."""
+    global CURRENT_CHAT_ID
+    if not CURRENT_CHAT_ID: return "Error: Chat ID unknown."
+    
+    ACTION_LOGS.setdefault(CURRENT_CHAT_ID, []).append(("list_tasks", "all"))
+    tasks = task.get_all_tasks(CURRENT_CHAT_ID)
+    if not tasks: return "No active scheduled tasks."
+    
+    res = "Active Tasks:\n"
+    for t in tasks:
+        res += f"- ID: {t['id']}, CRON: {t['cron']}, Prompt: {t['prompt']}\n"
+    return res
 
 # ─────────────────────────────────────────────
 #  ЛОГИКА МОДЕЛЕЙ И УМНЫЙ ТРИММЕР
@@ -395,21 +424,21 @@ def init_models(model_name, role="admin", mode="auto"):
         if role == "chat":
             model_agent = genai.GenerativeModel(
                 model_name=model_name,
-                system_instruction=PROMPTS.get("CHAT_BOT", "Ты ИИ-ассистент.")
+                system_instruction=PROMPTS.get("CHAT_BOT", "")
             )
             chat_agent = model_agent.start_chat()
         else:
             enable_auto = (mode == "auto")
             model_agent = genai.GenerativeModel(
                 model_name=model_name,
-                tools=[execute_bash, send_file_to_telegram, search_web_tool, download_file_tool],
-                system_instruction=PROMPTS.get("GEMINI_ADMIN", "Ты AI-админ.")
+                tools=[execute_bash, search_web_tool, download_file_tool, send_file_to_telegram, delete_scheduled_task_tool, list_my_tasks_tool],
+                system_instruction=PROMPTS.get("GEMINI_ADMIN", "")
             )
             chat_agent = model_agent.start_chat(enable_automatic_function_calling=enable_auto)
 
         model_advisor = genai.GenerativeModel(
             model_name=model_name,
-            system_instruction=PROMPTS.get("GEMINI_ADVISOR", "Дай bash-команду.")
+            system_instruction=PROMPTS.get("GEMINI_ADVISOR", "")
         )
 
 def handle_api_error(e, chat_id, message_id, original_message, clean_model_name):
@@ -458,23 +487,32 @@ def trim_chat_history(agent):
 
 def get_gemma_react_prompt(clean_model_name):
     if "gemma-4" in clean_model_name.lower():
-        return "\n\n" + PROMPTS.get("GEMMA4_ADMIN_REACT", "[SYSTEM] Используй теги: <BASH>, <SEARCH>, <DOWNLOAD>, <FILE>.")
-    return "\n\n" + PROMPTS.get("GEMMA_ADMIN_REACT", "[SYSTEM] Используй теги: <BASH>, <SEARCH>, <DOWNLOAD>, <FILE>.")
+        return "\n\n" + PROMPTS.get("GEMMA4_ADMIN_REACT", "")
+    return "\n\n" + PROMPTS.get("GEMMA_ADMIN_REACT", "")
 
 # ─────────────────────────────────────────────
 #  ФОНОВЫЙ ВЫПОЛНИТЕЛЬ ЗАДАЧ (SCHEDULER CALLBACK)
 # ─────────────────────────────────────────────
 
-def execute_scheduled_task(chat_id, prompt, model_name):
+def execute_scheduled_task(chat_id, prompt, model_name, task_id):
     """Эта функция вызывается модулем task.py по расписанию CRON."""
     try:
         bot.send_message(chat_id, f"⏰ <b>Запуск фоновой задачи:</b>\n<i>{prompt}</i>", parse_mode='HTML')
         
-        system_prompt = PROMPTS.get("GEMINI_ADMIN", "") + "\n\n[ВАЖНО] Тебе поручена фоновая задача по расписанию. Выполни её, используя доступные инструменты, и предоставь пользователю итоговый отчет. Не спрашивай дополнительных разрешений."
+        task_specific_instructions = (
+            f"\n\n[SYSTEM: BACKGROUND TASK RUNNER]\n"
+            f"1. You are currently running as a background scheduled task.\n"
+            f"2. Your unique Task ID is: {task_id}\n"
+            f"3. State Management: You have no memory of previous runs. If you need to keep track of counts or data between executions, you MUST use the `execute_bash` tool to read/write to a text file in `/app/downloads/tasks/state_{task_id}.txt`.\n"
+            f"4. Self-Deletion: If your instructions say to stop or delete the task after a certain condition (e.g., 'after 5 times'), use the `delete_scheduled_task_tool(task_id)` passing your ID: {task_id}.\n"
+            f"5. Complete the user's prompt using your tools, and provide the final report."
+        )
+        
+        system_prompt = PROMPTS.get("GEMINI_ADMIN", "") + task_specific_instructions
         
         task_model = genai.GenerativeModel(
             model_name=model_name,
-            tools=[execute_bash, search_web_tool, download_file_tool],
+            tools=[execute_bash, search_web_tool, download_file_tool, send_file_to_telegram, delete_scheduled_task_tool, list_my_tasks_tool],
             system_instruction=system_prompt
         )
         
@@ -482,6 +520,7 @@ def execute_scheduled_task(chat_id, prompt, model_name):
         
         global CURRENT_CHAT_ID
         CURRENT_CHAT_ID = chat_id
+        ACTION_LOGS[chat_id] = []
         
         check_api_rate_limit(None, "")
         response = task_chat.send_message(prompt)
@@ -491,8 +530,13 @@ def execute_scheduled_task(chat_id, prompt, model_name):
             
         send_long_text(chat_id, response.text, prefix=f"<b>Отчет ({model_name.replace('models/', '')}):</b>\n\n")
         
+        used_actions = ACTION_LOGS.get(chat_id, [])
+        log_actions_str = ", ".join([f"{a[0]}: {str(a[1])[:30]}..." for a in used_actions]) if used_actions else "No tools used"
+        task.log_task_event(f"EXECUTE: Chat={chat_id} | ID={task_id} | Actions: [{log_actions_str}]")
+        
     except Exception as e:
         bot.send_message(chat_id, f"❌ Ошибка фоновой задачи: {e}")
+        task.log_task_event(f"ERROR: Task ID={task_id} failed: {e}")
 
 # ─────────────────────────────────────────────
 #  ОБРАБОТЧИКИ КОМАНД
@@ -612,7 +656,6 @@ def task_cmd(message):
         bot.reply_to(message, "⚠️ Сначала выберите модель (/gemini), которая будет выполнять эту задачу.")
         return
         
-    # Блокируем Gemma для фоновых задач, так как они не умеют в Native Function Calling
     if "gemma" in CURRENT_MODEL.lower():
         bot.reply_to(message, "⚠️ Фоновые задачи по расписанию поддерживаются <b>ТОЛЬКО для моделей Gemini</b>, так как они требуют нативного Function Calling. Пожалуйста, смените модель.", parse_mode='HTML')
         return
@@ -625,7 +668,6 @@ def task_cmd(message):
     msg_wait = bot.send_message(message.chat.id, "🧠 <i>Анализирую расписание...</i>", parse_mode='HTML')
     
     try:
-        # Теперь datetime.now() автоматически берет Киевское время из ОС контейнера
         now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         parse_prompt = (
             "Convert the user's task request into a standard CRON expression and a clear system prompt for an AI agent. "
@@ -633,7 +675,8 @@ def task_cmd(message):
             "CRON format: minute hour day month day_of_week. "
             f"The current time on the server is {now_str}. "
             "Create a CRON expression that triggers EXACTLY at the user's requested time (do NOT shift timezones, output the exact requested hours). "
-            "For example, if user asks 'every day at 20:00', cron should be '0 20 * * *'. "
+            "IMPORTANT: If the user asks for random numbers or dynamic system data, instruct the AI to ACTUALLY execute bash commands (e.g. `echo $((1 + $RANDOM % 10000))`) using tools, instead of just guessing the text. "
+            "If the user wants the task to stop after N times, explicitly instruct the AI to use `delete_scheduled_task_tool` when the condition is met. "
             f"User request: '{user_text}'"
         )
         
@@ -646,7 +689,7 @@ def task_cmd(message):
         cron_expr = parsed_data["cron"]
         ai_prompt = parsed_data["prompt"]
         
-        task_id = task.add_task(message.chat.id, cron_expr, ai_prompt, CURRENT_MODEL)
+        task_id = task.add_task(message.chat.id, cron_expr, ai_prompt, CURRENT_MODEL, user_text)
         
         safe_edit_message(message.chat.id, msg_wait.message_id, 
             f"✅ <b>Задача успешно создана!</b>\n\n"
@@ -740,6 +783,9 @@ def parse_and_route_response(chat_id, response, first_msg_id, original_text):
                     elif fn_name == "search_web_tool": disp_name, disp_val = "Поиск в сети", fn_args.get("query", "")
                     elif fn_name == "download_file_tool": disp_name, disp_val = "Скачивание файла", fn_args.get("url", "")
                     elif fn_name == "send_file_to_telegram": disp_name, disp_val = "Отправка файла в чат", fn_args.get("filepath", "")
+                    elif fn_name == "delete_scheduled_task_tool": disp_name, disp_val = "Удаление задачи", fn_args.get("task_id", "")
+                    elif fn_name == "list_my_tasks_tool": disp_name, disp_val = "Список задач", ""
+                    
                     action = {"type": "native", "name": fn_name, "args": fn_args, "disp_name": disp_name, "disp_val": disp_val}
                     break
     if action:
@@ -786,6 +832,8 @@ def execute_pending_action(chat_id, action):
         elif fn_name == "search_web_tool": res = search_web_tool(args.get("query", ""))
         elif fn_name == "download_file_tool": res = download_file_tool(args.get("url", ""))
         elif fn_name == "send_file_to_telegram": res = send_file_to_telegram(args.get("filepath", ""))
+        elif fn_name == "delete_scheduled_task_tool": res = delete_scheduled_task_tool(args.get("task_id", ""))
+        elif fn_name == "list_my_tasks_tool": res = list_my_tasks_tool()
         
     status_text = "🧠 <b>Анализирую результат...</b>"
     set_status(chat_id, status_text)
@@ -855,6 +903,8 @@ def handle_query(call):
             elif act_type == "search": log_text += f"🌐 <b>Поиск:</b> <i>{html.escape(act_val)}</i>\n"
             elif act_type == "download": log_text += f"⬇️ <b>Скачан файл:</b> <i>{html.escape(act_val)}</i>\n"
             elif act_type == "file": log_text += f"📤 <b>Отправлен файл:</b> <i>{html.escape(act_val)}</i>\n"
+            elif act_type == "delete_task": log_text += f"🗑 <b>Удалил задачу:</b> <i>ID {html.escape(act_val)}</i>\n"
+            elif act_type == "list_tasks": log_text += f"📋 <b>Просмотрел активные задачи</b>\n"
 
         if bash_commands:
             bash_str = "\n".join(bash_commands)
