@@ -497,7 +497,12 @@ def get_gemma_react_prompt(clean_model_name):
 def execute_scheduled_task(chat_id, prompt, model_name, task_id):
     """Эта функция вызывается модулем task.py по расписанию CRON."""
     try:
-        bot.send_message(chat_id, f"⏰ <b>Запуск фоновой задачи:</b>\n<i>{prompt}</i>", parse_mode='HTML')
+        # 1. Создаем первичное якорное сообщение-заглушку (сюда потом запишем ответ)
+        msg_first = bot.send_message(chat_id, f"⏰ <b>Запуск фоновой задачи:</b> <code>{task_id}</code>", parse_mode='HTML')
+        
+        # 2. Выводим статус "шестеренки", чтобы показать, что процесс пошел
+        status_text = "🤖 <b>Выполняю фоновую задачу...</b>"
+        set_status(chat_id, status_text)
         
         task_specific_instructions = (
             f"\n\n[SYSTEM: BACKGROUND TASK RUNNER]\n"
@@ -505,7 +510,8 @@ def execute_scheduled_task(chat_id, prompt, model_name, task_id):
             f"2. Your unique Task ID is: {task_id}\n"
             f"3. State Management: You have no memory of previous runs. If you need to keep track of counts or data between executions, you MUST use the `execute_bash` tool to read/write to a text file in `/app/downloads/tasks/state_{task_id}.txt`.\n"
             f"4. Self-Deletion: If your instructions say to stop or delete the task after a certain condition (e.g., 'after 5 times'), use the `delete_scheduled_task_tool(task_id)` passing your ID: {task_id}.\n"
-            f"5. Complete the user's prompt using your tools, and provide the final report."
+            f"5. Try to combine your bash commands into a single script execution to save time. Do not make more than 1-2 bash calls per execution.\n"
+            f"6. Complete the user's prompt using your tools, and provide the final report."
         )
         
         system_prompt = PROMPTS.get("GEMINI_ADMIN", "") + task_specific_instructions
@@ -520,22 +526,37 @@ def execute_scheduled_task(chat_id, prompt, model_name, task_id):
         
         global CURRENT_CHAT_ID
         CURRENT_CHAT_ID = chat_id
+        
+        # Сбрасываем лог действий конкретно для этого запуска
         ACTION_LOGS[chat_id] = []
         
-        check_api_rate_limit(None, "")
+        check_api_rate_limit(chat_id, status_text)
         response = task_chat.send_message(prompt)
         
         if hasattr(response, 'usage_metadata'): 
             track_token_usage(response.usage_metadata.total_token_count)
             
-        send_long_text(chat_id, response.text, prefix=f"<b>Отчет ({model_name.replace('models/', '')}):</b>\n\n")
+        # 3. Задача завершена — удаляем статус "шестеренки"
+        clear_status(chat_id)
+        
+        # 4. Прикрепляем инлайн-кнопку "Выполненные действия"
+        markup = None
+        if ACTION_LOGS.get(chat_id):
+            LAST_ACTIONS[msg_first.message_id] = ACTION_LOGS[chat_id].copy()
+            markup = InlineKeyboardMarkup()
+            markup.add(InlineKeyboardButton("🛠 Выполненные действия", callback_data=f"show_acts_{msg_first.message_id}"))
+        
+        # 5. Вклеиваем ответ ИИ в наше самое первое сообщение с нужным заголовком
+        prefix = f"⏰ <b>Запуск фоновой задачи:</b> <code>{task_id}</code>\n\n"
+        send_long_text(chat_id, response.text, first_msg_id=msg_first.message_id, prefix=prefix, reply_markup=markup)
         
         used_actions = ACTION_LOGS.get(chat_id, [])
         log_actions_str = ", ".join([f"{a[0]}: {str(a[1])[:30]}..." for a in used_actions]) if used_actions else "No tools used"
         task.log_task_event(f"EXECUTE: Chat={chat_id} | ID={task_id} | Actions: [{log_actions_str}]")
         
     except Exception as e:
-        bot.send_message(chat_id, f"❌ Ошибка фоновой задачи: {e}")
+        clear_status(chat_id)
+        bot.send_message(chat_id, f"❌ Ошибка фоновой задачи <code>{task_id}</code>: {e}", parse_mode='HTML')
         task.log_task_event(f"ERROR: Task ID={task_id} failed: {e}")
 
 # ─────────────────────────────────────────────
