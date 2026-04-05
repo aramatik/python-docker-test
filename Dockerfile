@@ -2,14 +2,16 @@ FROM python:3.12-slim
 
 WORKDIR /app
 
-# Убрали rhvoice, оставили ffmpeg для конвертации аудио и добавили p7zip-full для чтения архивов
+# Устанавливаем часовой пояс прямо в систему контейнера
+ENV TZ=Europe/Kiev
+
 RUN apt-get update && apt-get install -y \
-    iputils-ping curl wget nano net-tools htop docker.io ffmpeg p7zip-full \
+    iputils-ping curl wget nano net-tools htop docker.io ffmpeg p7zip-full tzdata \
+    && ln -snf /usr/share/zoneinfo/$TZ /etc/localtime && echo $TZ > /etc/timezone \
     && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt .
 
-# Добавили установку edge-tts
 RUN pip install --no-cache-dir -r requirements.txt ddgs edge-tts
 
 COPY . .
