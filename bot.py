@@ -11,12 +11,13 @@ import edge_tts
 import time
 import json
 from collections import deque
+from datetime import datetime
 
 # Импортируем наши внешние модули
 from markdown import split_text_safely, md_to_html
 from search import parse_search_query, run_grep_search, run_archive_search, format_search_results
 import web_search
-import task # НОВЫЙ МОДУЛЬ ПЛАНИРОВЩИКА ЗАДАЧ
+import task # МОДУЛЬ ПЛАНИРОВЩИКА ЗАДАЧ
 
 # Загружаем ключи
 TG_TOKEN = os.getenv("TG_TOKEN")
@@ -24,6 +25,7 @@ API_KEY_1 = os.getenv("GEMINI_API_KEY")
 API_KEY_2 = os.getenv("GEMINI2_API_KEY")
 API_KEY_3 = os.getenv("GEMINI3_API_KEY")
 
+# Безопасно собираем все ID админов
 ADMIN_IDS = set()
 for env_var in ["ADMIN_ID", "ADMIN2_ID", "ADMIN3_ID"]:
     val = os.getenv(env_var)
@@ -49,14 +51,19 @@ PENDING_RETRY_MESSAGE = None
 PENDING_FILES = {}
 PENDING_SEARCH_RESULTS = {}
 
-MODEL_ROLE = {}  
-MODEL_MODE = {}  
+# Единые настройки для ВСЕХ моделей
+MODEL_ROLE = {}  # {chat_id: "admin" | "chat"}
+MODEL_MODE = {}  # {chat_id: "auto" | "semi"}
 PENDING_ACTION = {} 
 
 ACTION_LOGS = {}
 LAST_ACTIONS = {} 
 VOICE_MODE = {}  
 STATUS_MSG = {}
+
+# ─────────────────────────────────────────────
+#  КОНФИГУРАЦИЯ: ПРОМПТЫ, МОДЕЛИ, ЛИМИТЫ
+# ─────────────────────────────────────────────
 
 PROMPTS_FILE = "prompts.txt"
 PROMPTS = {}
@@ -71,8 +78,9 @@ def load_prompts_config():
     global PROMPTS
     PROMPTS.clear()
     if not os.path.exists(PROMPTS_FILE):
-        print(f"⚠️ Файл {PROMPTS_FILE} не найден! Создан пустой.")
-        with open(PROMPTS_FILE, "w", encoding="utf-8") as f: f.write("")
+        print(f"⚠️ Файл {PROMPTS_FILE} не найден! Создан пустой. Пожалуйста, заполните его.")
+        with open(PROMPTS_FILE, "w", encoding="utf-8") as f:
+            f.write("")
 
     with open(PROMPTS_FILE, "r", encoding="utf-8") as f:
         current_key = None
@@ -94,8 +102,8 @@ def load_models_config():
     MODEL_TPM_LIMITS.clear()
     
     if not os.path.exists(MODELS_FILE):
-        default_content = "gemini-2.5-flash [RPM:5,TPM:250000]\n"
-        with open(MODELS_FILE, "w", encoding="utf-8") as f: f.write(default_content)
+        print(f"⚠️ Файл {MODELS_FILE} не найден! Создан пустой. Пожалуйста, заполните его.")
+        with open(MODELS_FILE, "w", encoding="utf-8") as f: f.write("")
     
     with open(MODELS_FILE, "r", encoding="utf-8") as f:
         for line in f:
@@ -125,6 +133,10 @@ API_TOKEN_HISTORY = {1: deque(), 2: deque(), 3: deque()}
 def log_admin_action(user_id, action):
     print(f"[ADMIN {user_id}] {action}")
 
+# ─────────────────────────────────────────────
+#  Live-статус и Трекер Лимитов
+# ─────────────────────────────────────────────
+
 def set_status(chat_id, text: str):
     global STATUS_MSG
     msg_id = STATUS_MSG.get(chat_id)
@@ -153,9 +165,12 @@ def track_token_usage(token_count):
 def check_api_rate_limit(chat_id, current_status_text):
     global CURRENT_MODEL, CURRENT_KEY_NUM
     if not CURRENT_MODEL: return
+
     clean_name = CURRENT_MODEL.replace('models/', '')
+    
     rpm_limit = MODEL_RPM_LIMITS.get(clean_name)
     tpm_limit = MODEL_TPM_LIMITS.get(clean_name)
+    
     now = time.time()
     
     if rpm_limit:
@@ -173,7 +188,7 @@ def check_api_rate_limit(chat_id, current_status_text):
         history_tpm = API_TOKEN_HISTORY.setdefault(CURRENT_KEY_NUM, deque())
         while history_tpm and now - history_tpm[0][0] > 60.5: history_tpm.popleft()
         current_tpm = sum(count for _, count in history_tpm)
-        if current_tpm > (tpm_limit - 1000): 
+        if current_tpm > (tpm_limit - 1000): # Буфер 1000 токенов
             wait_time = 60.5 - (now - history_tpm[0][0])
             if wait_time > 0:
                 if chat_id: set_status(chat_id, f"{current_status_text}\n⏳ <i>Тайм-аут токенов: ожидание {wait_time:.1f}с (использовано {current_tpm}/{tpm_limit} TPM)</i>")
@@ -182,6 +197,10 @@ def check_api_rate_limit(chat_id, current_status_text):
                 now = time.time()
 
     API_REQUEST_HISTORY[CURRENT_KEY_NUM].append(now)
+
+# ─────────────────────────────────────────────
+#  ФУНКЦИИ ВЫВОДА
+# ─────────────────────────────────────────────
 
 def safe_edit_message(chat_id, message_id, text, parse_mode='HTML', reply_markup=None):
     try: bot.edit_message_text(chat_id=chat_id, message_id=message_id, text=text, parse_mode=parse_mode, reply_markup=reply_markup)
@@ -208,6 +227,54 @@ def send_long_text(chat_id, text, first_msg_id=None, is_code=False, prefix="", r
         else:
             try: bot.send_message(chat_id, formatted, parse_mode='HTML', reply_markup=current_markup)
             except Exception: bot.send_message(chat_id, chunk.strip(), reply_markup=current_markup)
+
+def clean_text_for_voice(text: str) -> str:
+    if not text: return ""
+    text = re.sub(r'```.*?```', '', text, flags=re.DOTALL)
+    text = re.sub(r'`.*?`', '', text)
+    text = re.sub(r'https?://\S+|www\.\S+', '', text)
+    text = re.sub(r'<[^>]*>', '', text)
+    text = re.sub(r'[*#_~()\[\]{}<>@|\\/]', '', text)
+    text = text.replace('\n', '. ')
+    text = re.sub(r'\.{2,}', '.', text)
+    text = re.sub(r'\s{2,}', ' ', text)
+    return text.strip()
+
+def generate_and_send_voice(chat_id, text):
+    clean_text = clean_text_for_voice(text)
+    if not clean_text: return
+    voice_chunks = split_text_safely(clean_text, max_len=2000)
+    total_chunks = len(voice_chunks)
+
+    for i, chunk in enumerate(voice_chunks):
+        if not chunk.strip(): continue
+        mp3_path = f"temp_tts_{chat_id}_{i}.mp3"
+        ogg_path = f"temp_tts_{chat_id}_{i}.ogg"
+        msg_wait_voice = None
+
+        try:
+            part_text = f" [часть {i+1}/{total_chunks}]" if total_chunks > 1 else ""
+            msg_wait_voice = bot.send_message(chat_id, f"🎙 <i>Отправка голосового сообщения{part_text}...</i>", parse_mode='HTML')
+            bot.send_chat_action(chat_id, 'record_voice')
+            async def _generate():
+                communicate = edge_tts.Communicate(chunk, "ru-RU-SvetlanaNeural")
+                await communicate.save(mp3_path)
+            asyncio.run(_generate())
+            if os.path.exists(mp3_path):
+                subprocess.run(f"ffmpeg -i {mp3_path} -c:a libopus -b:a 32k -v quiet -y {ogg_path}", shell=True, timeout=60)
+                if os.path.exists(ogg_path):
+                    with open(ogg_path, 'rb') as voice_file: bot.send_voice(chat_id, voice_file)
+        except Exception as e: print(f"Ошибка синтеза: {e}")
+        finally:
+            if msg_wait_voice:
+                try: bot.delete_message(chat_id, msg_wait_voice.message_id)
+                except Exception: pass
+            if os.path.exists(mp3_path): os.remove(mp3_path)
+            if os.path.exists(ogg_path): os.remove(ogg_path)
+
+# ─────────────────────────────────────────────
+#  АГЕНТСКИЕ ИНСТРУМЕНТЫ
+# ─────────────────────────────────────────────
 
 def execute_bash(command: str) -> str:
     if CURRENT_CHAT_ID:
@@ -253,6 +320,10 @@ def send_file_to_telegram(filepath: str) -> str:
         with open(filepath, 'rb') as f: bot.send_document(CURRENT_CHAT_ID, f)
         return f"Успех: Файл {filepath} отправлен."
     except Exception as e: return f"Ошибка отправки файла: {str(e)}"
+
+# ─────────────────────────────────────────────
+#  ЛОГИКА МОДЕЛЕЙ И УМНЫЙ ТРИММЕР
+# ─────────────────────────────────────────────
 
 def get_models_lists():
     raw_models = [m.name for m in genai.list_models() if 'generateContent' in m.supported_generation_methods]
@@ -324,7 +395,7 @@ def init_models(model_name, role="admin", mode="auto"):
         if role == "chat":
             model_agent = genai.GenerativeModel(
                 model_name=model_name,
-                system_instruction=PROMPTS.get("CHAT_BOT", "")
+                system_instruction=PROMPTS.get("CHAT_BOT", "Ты ИИ-ассистент.")
             )
             chat_agent = model_agent.start_chat()
         else:
@@ -332,13 +403,13 @@ def init_models(model_name, role="admin", mode="auto"):
             model_agent = genai.GenerativeModel(
                 model_name=model_name,
                 tools=[execute_bash, send_file_to_telegram, search_web_tool, download_file_tool],
-                system_instruction=PROMPTS.get("GEMINI_ADMIN", "")
+                system_instruction=PROMPTS.get("GEMINI_ADMIN", "Ты AI-админ.")
             )
             chat_agent = model_agent.start_chat(enable_automatic_function_calling=enable_auto)
 
         model_advisor = genai.GenerativeModel(
             model_name=model_name,
-            system_instruction=PROMPTS.get("GEMINI_ADVISOR", "")
+            system_instruction=PROMPTS.get("GEMINI_ADVISOR", "Дай bash-команду.")
         )
 
 def handle_api_error(e, chat_id, message_id, original_message, clean_model_name):
@@ -385,6 +456,11 @@ def trim_chat_history(agent):
     if cut_idx < len(agent.history):
         agent.history = agent.history[cut_idx:]
 
+def get_gemma_react_prompt(clean_model_name):
+    if "gemma-4" in clean_model_name.lower():
+        return "\n\n" + PROMPTS.get("GEMMA4_ADMIN_REACT", "[SYSTEM] Используй теги: <BASH>, <SEARCH>, <DOWNLOAD>, <FILE>.")
+    return "\n\n" + PROMPTS.get("GEMMA_ADMIN_REACT", "[SYSTEM] Используй теги: <BASH>, <SEARCH>, <DOWNLOAD>, <FILE>.")
+
 # ─────────────────────────────────────────────
 #  ФОНОВЫЙ ВЫПОЛНИТЕЛЬ ЗАДАЧ (SCHEDULER CALLBACK)
 # ─────────────────────────────────────────────
@@ -394,9 +470,6 @@ def execute_scheduled_task(chat_id, prompt, model_name):
     try:
         bot.send_message(chat_id, f"⏰ <b>Запуск фоновой задачи:</b>\n<i>{prompt}</i>", parse_mode='HTML')
         
-        # Создаем одноразовую "чистую" сессию ИИ (исключительно Gemini)
-        # Для простоты и стабильности фоновых задач принудительно используем нативные функции
-        
         system_prompt = PROMPTS.get("GEMINI_ADMIN", "") + "\n\n[ВАЖНО] Тебе поручена фоновая задача по расписанию. Выполни её, используя доступные инструменты, и предоставь пользователю итоговый отчет. Не спрашивай дополнительных разрешений."
         
         task_model = genai.GenerativeModel(
@@ -405,10 +478,8 @@ def execute_scheduled_task(chat_id, prompt, model_name):
             system_instruction=system_prompt
         )
         
-        # Запускаем в режиме АВТО
         task_chat = task_model.start_chat(enable_automatic_function_calling=True)
         
-        # ВАЖНО: временно подменяем CURRENT_CHAT_ID чтобы логи шли в нужный чат
         global CURRENT_CHAT_ID
         CURRENT_CHAT_ID = chat_id
         
@@ -435,6 +506,7 @@ def send_welcome(message):
 @bot.message_handler(commands=['help'])
 def send_help(message):
     if message.from_user.id not in ADMIN_IDS: return
+    log_admin_action(message.from_user.id, "Команда /help")
     help_text = (
         "🤖 <b>Справка по командам AI-Админа:</b>\n\n"
         "🔸 /start — Выбор модели\n"
@@ -540,43 +612,49 @@ def task_cmd(message):
         bot.reply_to(message, "⚠️ Сначала выберите модель (/gemini), которая будет выполнять эту задачу.")
         return
         
+    # Блокируем Gemma для фоновых задач, так как они не умеют в Native Function Calling
+    if "gemma" in CURRENT_MODEL.lower():
+        bot.reply_to(message, "⚠️ Фоновые задачи по расписанию поддерживаются <b>ТОЛЬКО для моделей Gemini</b>, так как они требуют нативного Function Calling. Пожалуйста, смените модель.", parse_mode='HTML')
+        return
+        
     user_text = message.text.replace("/task", "").strip()
     if not user_text:
         bot.reply_to(message, "⚠️ Вы не указали задачу. Пример:\n<code>/task каждый день в 20:00 присылай мне выжимку новостей</code>", parse_mode='HTML')
         return
         
-    msg_wait = bot.send_message(message.chat.id, "🧠 <i>Парсинг расписания...</i>", parse_mode='HTML')
+    msg_wait = bot.send_message(message.chat.id, "🧠 <i>Анализирую расписание...</i>", parse_mode='HTML')
     
-    # Используем ИИ для перевода запроса в CRON и чистый промпт
     try:
+        # Теперь datetime.now() автоматически берет Киевское время из ОС контейнера
+        now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         parse_prompt = (
-            "Convert the following task request into a standard CRON expression and a clear prompt for an AI agent. "
+            "Convert the user's task request into a standard CRON expression and a clear system prompt for an AI agent. "
             "Return ONLY a raw JSON object with keys 'cron' and 'prompt'. No markdown formatting, no comments. "
-            "CRON format: minute hour day month day_of_week. Timezone is UTC (assume user means server time). "
-            f"Request: '{user_text}'"
+            "CRON format: minute hour day month day_of_week. "
+            f"The current time on the server is {now_str}. "
+            "Create a CRON expression that triggers EXACTLY at the user's requested time (do NOT shift timezones, output the exact requested hours). "
+            "For example, if user asks 'every day at 20:00', cron should be '0 20 * * *'. "
+            f"User request: '{user_text}'"
         )
         
-        # Берем легкую модель для парсинга, чтобы было быстро
-        parser_model = genai.GenerativeModel("gemini-2.5-flash-lite")
+        parser_model = genai.GenerativeModel("gemini-2.5-flash") 
         res = parser_model.generate_content(parse_prompt)
         
-        # Очищаем ответ от возможного Markdown (```json ... ```)
         cleaned_json_text = res.text.strip().lstrip("```json").lstrip("```").rstrip("```").strip()
         parsed_data = json.loads(cleaned_json_text)
         
         cron_expr = parsed_data["cron"]
         ai_prompt = parsed_data["prompt"]
         
-        # Сохраняем задачу
         task_id = task.add_task(message.chat.id, cron_expr, ai_prompt, CURRENT_MODEL)
         
         safe_edit_message(message.chat.id, msg_wait.message_id, 
-            f"✅ <b>Задача создана!</b>\n\n"
+            f"✅ <b>Задача успешно создана!</b>\n\n"
             f"ID: <code>{task_id}</code>\n"
-            f"CRON: <code>{cron_expr}</code>\n"
+            f"CRON: <code>{cron_expr}</code> (Время системное)\n"
             f"Модель: <b>{CURRENT_MODEL.replace('models/', '')}</b>\n"
             f"Инструкция: <i>{ai_prompt}</i>\n\n"
-            f"Для удаления: /deltask {task_id}", 
+            f"Для удаления введите: /deltask {task_id}", 
             parse_mode='HTML'
         )
         
@@ -588,10 +666,7 @@ def task_cmd(message):
 def search_cmd(message):
     if message.from_user.id not in ADMIN_IDS: return
     markup = InlineKeyboardMarkup()
-    markup.row(
-        InlineKeyboardButton("📂 Обычные базы", callback_data="search_type_regular"),
-        InlineKeyboardButton("🗄 В архивах", callback_data="search_type_archive")
-    )
+    markup.row(InlineKeyboardButton("📂 Обычные базы", callback_data="search_type_regular"), InlineKeyboardButton("🗄 В архивах", callback_data="search_type_archive"))
     bot.reply_to(message, "Где искать?", reply_markup=markup)
 
 def process_search_query(message, search_type="regular"):
@@ -1079,11 +1154,7 @@ def handle_message(message):
             check_api_rate_limit(message.chat.id, status_text)
             
             if is_gemma and role == "admin":
-                if "gemma-4" in clean_model_name.lower():
-                    react_sys = "\n\n" + PROMPTS.get("GEMMA4_ADMIN_REACT", "")
-                else:
-                    react_sys = "\n\n" + PROMPTS.get("GEMMA_ADMIN_REACT", "")
-                    
+                react_sys = get_gemma_react_prompt(clean_model_name)
                 final_text = text + react_sys
                 response = chat_agent.send_message(final_text)
                 
@@ -1105,8 +1176,6 @@ def handle_message(message):
         handle_api_error(e, message.chat.id, msg_first.message_id, message, clean_model_name)
 
 if __name__ == '__main__':
-    # Инициализируем планировщик задач, передавая ему функцию исполнения из bot.py
     task.init_scheduler(execute_scheduled_task)
     print(f"AI-Админ запущен. Допущено админов: {len(ADMIN_IDS)}.")
     bot.polling(none_stop=True)
-            
