@@ -7,11 +7,11 @@ from apscheduler.triggers.cron import CronTrigger
 TASKS_DIR = "/app/downloads/tasks"
 TASKS_FILE = os.path.join(TASKS_DIR, "tasks.json")
 
-scheduler = BackgroundScheduler(timezone="Europe/Kiev") # Можете поменять таймзону на вашу
+# Планировщик автоматически возьмет системное время (которое мы сделали Киевским)
+scheduler = BackgroundScheduler()
 execute_callback = None
 
 def init_scheduler(callback_fn):
-    """Инициализирует планировщик и загружает сохраненные задачи."""
     global execute_callback
     execute_callback = callback_fn
     
@@ -25,7 +25,6 @@ def init_scheduler(callback_fn):
     print("Планировщик задач успешно запущен.")
 
 def load_tasks():
-    """Загружает задачи из файла и добавляет их в расписание."""
     try:
         with open(TASKS_FILE, "r", encoding="utf-8") as f:
             tasks = json.load(f)
@@ -35,8 +34,8 @@ def load_tasks():
         print(f"Ошибка загрузки задач: {e}")
 
 def _schedule_job(task):
-    """Добавляет задачу непосредственно в ядро apscheduler."""
     try:
+        # Триггер автоматически возьмет системное время
         trigger = CronTrigger.from_crontab(task["cron"])
         scheduler.add_job(
             execute_callback,
@@ -49,8 +48,7 @@ def _schedule_job(task):
         print(f"Не удалось запланировать задачу {task['id']}: {e}")
 
 def add_task(chat_id, cron_expr, prompt, model):
-    """Создает новую задачу, сохраняет в файл и запускает."""
-    task_id = str(uuid.uuid4())[:8] # Генерируем короткий уникальный ID
+    task_id = str(uuid.uuid4())[:8]
     task = {
         "id": task_id,
         "chat_id": chat_id,
@@ -71,13 +69,11 @@ def add_task(chat_id, cron_expr, prompt, model):
     return task_id
 
 def get_all_tasks(chat_id):
-    """Возвращает список всех задач для конкретного чата."""
     with open(TASKS_FILE, "r", encoding="utf-8") as f:
         tasks = json.load(f)
     return [t for t in tasks if t["chat_id"] == chat_id]
 
 def delete_task(chat_id, task_id):
-    """Удаляет задачу по ID."""
     with open(TASKS_FILE, "r", encoding="utf-8") as f:
         tasks = json.load(f)
         
