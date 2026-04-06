@@ -64,7 +64,7 @@ STATUS_MSG = {}
 # ТРЕКЕРЫ И ФЛАГИ
 TURN_STATS = {}
 CONSECUTIVE_SLEEPS = {}
-ABORT_FLAGS = {} # НОВОЕ: Глобальный словарь для аварийной остановки
+ABORT_FLAGS = {} 
 
 # ─────────────────────────────────────────────
 #  КОНФИГУРАЦИЯ: ПРОМПТЫ, МОДЕЛИ, ЛИМИТЫ
@@ -92,7 +92,6 @@ API_REQUEST_HISTORY = {1: deque(), 2: deque(), 3: deque()}
 API_TOKEN_HISTORY = {1: deque(), 2: deque(), 3: deque()}
 
 def load_limits_state():
-    """Загружает сохраненные лимиты RPD из временной папки."""
     global API_RPD_HISTORY
     os.makedirs(os.path.dirname(LIMITS_STATE_FILE), exist_ok=True)
     if os.path.exists(LIMITS_STATE_FILE):
@@ -110,7 +109,6 @@ def load_limits_state():
             API_RPD_HISTORY[i] = {"date": today_str, "usage": {}}
 
 def save_limits_state():
-    """Сохраняет лимиты RPD для выживания при редеплое."""
     os.makedirs(os.path.dirname(LIMITS_STATE_FILE), exist_ok=True)
     try:
         with open(LIMITS_STATE_FILE, "w", encoding="utf-8") as f:
@@ -182,9 +180,7 @@ def log_admin_action(user_id, action):
 # ─────────────────────────────────────────────
 
 def set_status(chat_id, text: str, show_abort=False):
-    """Обновляет статус и показывает кнопку аварийной остановки, если запрошено."""
     global STATUS_MSG
-    
     markup = None
     if show_abort:
         markup = InlineKeyboardMarkup()
@@ -218,11 +214,9 @@ def check_api_rate_limit(chat_id, current_status_text, model_name=None):
     if not model_name: return
 
     clean_name = model_name.replace('models/', '')
-    
     rpm_limit = MODEL_RPM_LIMITS.get(clean_name)
     tpm_limit = MODEL_TPM_LIMITS.get(clean_name)
     rpd_limit = MODEL_RPD_LIMITS.get(clean_name)
-    
     now = time.time()
     
     today_str = datetime.utcnow().strftime("%Y-%m-%d")
@@ -265,12 +259,10 @@ def check_api_rate_limit(chat_id, current_status_text, model_name=None):
     save_limits_state() 
 
 def switch_api_key(chat_id, reason):
-    """Ищет следующий доступный ключ, переключает его и сообщает пользователю."""
     global CURRENT_KEY_NUM, CURRENT_MODEL
     old_key = CURRENT_KEY_NUM
     keys = [1, 2, 3]
     idx = keys.index(old_key)
-    
     clean_name = CURRENT_MODEL.replace('models/', '') if CURRENT_MODEL else ""
     
     for i in range(1, 3):
@@ -294,7 +286,6 @@ def switch_api_key(chat_id, reason):
     return False
 
 def safe_send_message(agent, chat_id, prompt_or_parts, status_text="🤖 <b>Обрабатываю запрос...</b>", is_advisor=False, model_name=None):
-    """Обертка отправки в Google API. Точно трекает лимиты и делает авто-ретрай на другие ключи."""
     max_retries = 3
     for attempt in range(max_retries):
         try:
@@ -472,14 +463,18 @@ def list_my_tasks_tool() -> str:
     for t in tasks: res += f"- ID: {t['id']}, CRON: {t['cron']}, Prompt: {t['prompt']}\n"
     return res
 
-def sleep_tool(seconds: int) -> str:
-    """Пауза в выполнении с возможностью моментального аварийного прерывания."""
+def sleep_tool(seconds) -> str:
     global CURRENT_CHAT_ID
-    if CURRENT_CHAT_ID:
-        ACTION_LOGS.setdefault(CURRENT_CHAT_ID, []).append(("sleep", seconds))
-        set_status(CURRENT_CHAT_ID, f"💤 <b>ИИ ожидает {seconds} сек...</b>", show_abort=True)
+    try:
+        sec_val = int(float(seconds))
+    except:
+        sec_val = 5
         
-    max_sleep = min(seconds, 300)
+    if CURRENT_CHAT_ID:
+        ACTION_LOGS.setdefault(CURRENT_CHAT_ID, []).append(("sleep", sec_val))
+        set_status(CURRENT_CHAT_ID, f"💤 <b>ИИ ожидает {sec_val} сек...</b>", show_abort=True)
+        
+    max_sleep = min(sec_val, 300)
     for _ in range(max_sleep):
         if CURRENT_CHAT_ID and ABORT_FLAGS.get(CURRENT_CHAT_ID):
             return "Process interrupted by user during sleep."
@@ -579,8 +574,16 @@ def init_models(model_name, role="admin", mode="auto"):
             system_instruction=PROMPTS.get("GEMINI_ADVISOR", "")
         )
 
-def handle_api_error(chat_id, message_id, clean_model_name):
-    safe_edit_message(chat_id, message_id, f"⚠️ <b>Лимиты API исчерпаны на всех ключах!</b>\n\nВсе доступные ключи для модели <code>{clean_model_name}</code> достигли квоты. Попробуйте позже или выберите другую модель.", reply_markup=get_models_keyboard())
+def handle_api_error(e, chat_id, message_id, clean_model_name):
+    """Показывает реальные ошибки в чат."""
+    error_text = str(e)
+    
+    if "Все доступные ключи исчерпали" in error_text or "Все ключи исчерпали квоту" in error_text:
+        safe_edit_message(chat_id, message_id, f"⚠️ <b>Лимиты API исчерпаны!</b>\n\n{html.escape(error_text)}\nСмените модель.", reply_markup=get_models_keyboard())
+    elif "Сбой синхронизации API" in error_text:
+        safe_edit_message(chat_id, message_id, f"⚠️ <b>Сбой синхронизации API!</b>\nКонтекст был поврежден. Память ИИ автоматически очищена. Повторите запрос.")
+    else:
+        safe_edit_message(chat_id, message_id, f"❌ Ошибка ИИ: {html.escape(error_text)}")
 
 def trim_chat_history(agent, model_name=None):
     if not model_name: model_name = CURRENT_MODEL
@@ -663,7 +666,7 @@ def execute_scheduled_task(chat_id, prompt, model_name, task_id):
         
     except Exception as e:
         clear_status(chat_id)
-        bot.send_message(chat_id, f"❌ Ошибка фоновой задачи <code>{task_id}</code>: {e}", parse_mode='HTML')
+        handle_api_error(e, chat_id, msg_first.message_id, model_name.replace('models/', ''))
         task.log_task_event(f"ERROR: Task ID={task_id} failed: {e}")
 
 # ─────────────────────────────────────────────
@@ -965,7 +968,7 @@ def process_action_request(chat_id, action):
     if action["name"] in ["sleep", "sleep_tool"]:
         CONSECUTIVE_SLEEPS[chat_id] = CONSECUTIVE_SLEEPS.get(chat_id, 0) + 1
         if CONSECUTIVE_SLEEPS[chat_id] > 3:
-            action["name"] = "sleep_error" 
+            action["is_sleep_error"] = True 
     else:
         CONSECUTIVE_SLEEPS[chat_id] = 0
 
@@ -987,16 +990,14 @@ def execute_pending_action(chat_id, action):
         
     res = "Нет результата."
     
-    if action["name"] == "sleep_error":
+    if action.get("is_sleep_error"):
         res = "ERROR: You have slept 3 times consecutively. You are not allowed to sleep again. You must perform a different action or give the final text response."
     elif action["type"] == "react":
         if action["name"] == "bash": res = execute_bash(action["val"])
         elif action["name"] == "search": res = search_web_tool(action["val"])
         elif action["name"] == "download": res = download_file_tool(action["val"])
         elif action["name"] == "file": res = send_file_to_telegram(action["val"])
-        elif action["name"] == "sleep": 
-            try: res = sleep_tool(int(action["val"]))
-            except: res = sleep_tool(5)
+        elif action["name"] == "sleep": res = sleep_tool(action["val"])
     elif action["type"] == "native":
         fn_name = action["name"]
         args = action["args"]
@@ -1006,9 +1007,7 @@ def execute_pending_action(chat_id, action):
         elif fn_name == "send_file_to_telegram": res = send_file_to_telegram(args.get("filepath", ""))
         elif fn_name == "delete_scheduled_task_tool": res = delete_scheduled_task_tool(args.get("task_id", ""))
         elif fn_name == "list_my_tasks_tool": res = list_my_tasks_tool()
-        elif fn_name == "sleep_tool": 
-            try: res = sleep_tool(int(args.get("seconds", 5)))
-            except: res = sleep_tool(5)
+        elif fn_name == "sleep_tool": res = sleep_tool(args.get("seconds", 5))
         
     status_text = "🧠 <b>Анализирую результат...</b>"
     set_status(chat_id, status_text, show_abort=True)
@@ -1030,7 +1029,7 @@ def execute_pending_action(chat_id, action):
         parse_and_route_response(chat_id, response, action["msg_id"], action["orig_text"])
     except Exception as e:
         clear_status(chat_id)
-        handle_api_error(chat_id, action["msg_id"], CURRENT_MODEL.replace('models/', ''))
+        handle_api_error(e, chat_id, action["msg_id"], CURRENT_MODEL.replace('models/', ''))
 
 # ─────────────────────────────────────────────
 #  ОБРАБОТКА CALLBACKS (КНОПКИ)
@@ -1255,7 +1254,7 @@ def handle_query(call):
                 parse_and_route_response(call.message.chat.id, resp, action["msg_id"], action["orig_text"])
             except Exception as e:
                 clear_status(call.message.chat.id)
-                handle_api_error(call.message.chat.id, action["msg_id"], CURRENT_MODEL.replace('models/', ''))
+                handle_api_error(e, call.message.chat.id, action["msg_id"], CURRENT_MODEL.replace('models/', ''))
         return
 
     if data in ["file_yes", "file_no", "file_ai"]:
@@ -1313,7 +1312,7 @@ def handle_query(call):
 
             except Exception as e:
                 clear_status(call.message.chat.id)
-                handle_api_error(call.message.chat.id, call.message.message_id, clean_name)
+                handle_api_error(e, call.message.chat.id, call.message.message_id, clean_name)
             PENDING_FILES.pop(call.message.chat.id, None)
             return
 
@@ -1386,7 +1385,7 @@ def handle_message(message):
                 send_long_text(message.chat.id, response.text, first_msg_id=msg_first.message_id, is_code=True)
             except Exception as e:
                 clear_status(message.chat.id)
-                handle_api_error(message.chat.id, msg_first.message_id, clean_model_name)
+                handle_api_error(e, message.chat.id, msg_first.message_id, clean_model_name)
             return
 
     ACTION_LOGS[CURRENT_CHAT_ID] = []
@@ -1452,7 +1451,7 @@ def handle_message(message):
 
     except Exception as e:
         clear_status(message.chat.id)
-        handle_api_error(message.chat.id, msg_first.message_id, clean_model_name)
+        handle_api_error(e, message.chat.id, msg_first.message_id, clean_model_name)
 
 if __name__ == '__main__':
     task.init_scheduler(execute_scheduled_task)
