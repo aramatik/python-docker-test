@@ -52,14 +52,18 @@ PENDING_FILES = {}
 PENDING_SEARCH_RESULTS = {}
 
 # Единые настройки для ВСЕХ моделей
-MODEL_ROLE = {}  # {chat_id: "admin" | "chat"}
-MODEL_MODE = {}  # {chat_id: "auto" | "semi"}
+MODEL_ROLE = {}  
+MODEL_MODE = {}  
 PENDING_ACTION = {} 
 
 ACTION_LOGS = {}
 LAST_ACTIONS = {} 
 VOICE_MODE = {}  
 STATUS_MSG = {}
+
+# ТРЕКЕРЫ ТЕКУЩЕГО ЗАПРОСА (для отчета)
+TURN_STATS = {}
+CONSECUTIVE_SLEEPS = {}
 
 # ─────────────────────────────────────────────
 #  КОНФИГУРАЦИЯ: ПРОМПТЫ, МОДЕЛИ, ЛИМИТЫ
@@ -167,7 +171,7 @@ def load_models_config():
 
 load_prompts_config()
 load_models_config()
-load_limits_state() # Инициализация памяти лимитов
+load_limits_state()
 
 def log_admin_action(user_id, action):
     print(f"[ADMIN {user_id}] {action}")
@@ -213,7 +217,6 @@ def check_api_rate_limit(chat_id, current_status_text, model_name=None):
     
     now = time.time()
     
-    # RPD (Дневные лимиты)
     today_str = datetime.utcnow().strftime("%Y-%m-%d")
     key_data = API_RPD_HISTORY[CURRENT_KEY_NUM]
     
@@ -226,7 +229,6 @@ def check_api_rate_limit(chat_id, current_status_text, model_name=None):
         if current_rpd >= rpd_limit:
             raise Exception(f"RPD_LIMIT_REACHED|{clean_name}|{rpd_limit}")
             
-    # RPM (Лимиты в минуту)
     if rpm_limit:
         history_rpm = API_REQUEST_HISTORY.setdefault(CURRENT_KEY_NUM, deque())
         while history_rpm and now - history_rpm[0] > 60.5: history_rpm.popleft()
@@ -238,7 +240,6 @@ def check_api_rate_limit(chat_id, current_status_text, model_name=None):
                 if chat_id: set_status(chat_id, current_status_text)
                 now = time.time()
 
-    # TPM (Токены в минуту)
     if tpm_limit:
         history_tpm = API_TOKEN_HISTORY.setdefault(CURRENT_KEY_NUM, deque())
         while history_tpm and now - history_tpm[0][0] > 60.5: history_tpm.popleft()
@@ -253,7 +254,7 @@ def check_api_rate_limit(chat_id, current_status_text, model_name=None):
 
     API_REQUEST_HISTORY[CURRENT_KEY_NUM].append(now)
     key_data["usage"][clean_name] = key_data["usage"].get(clean_name, 0) + 1
-    save_limits_state() # Сохраняем RPD на диск
+    save_limits_state() 
 
 def switch_api_key(chat_id, reason):
     """Ищет следующий доступный ключ, переключает его и сообщает пользователю."""
@@ -269,7 +270,6 @@ def switch_api_key(chat_id, reason):
         target_key = API_KEY_1 if next_key == 1 else (API_KEY_2 if next_key == 2 else API_KEY_3)
         if not target_key: continue
         
-        # Проверяем, не исчерпан ли RPD на этом новом ключе
         rpd_limit = MODEL_RPD_LIMITS.get(clean_name)
         if rpd_limit:
             today_str = datetime.utcnow().strftime("%Y-%m-%d")
@@ -286,7 +286,7 @@ def switch_api_key(chat_id, reason):
     return False
 
 def safe_send_message(agent, chat_id, prompt_or_parts, status_text="🤖 <b>Обрабатываю запрос...</b>", is_advisor=False, model_name=None):
-    """Умная обертка для отправки сообщений. Обрабатывает лимиты и ретраи при ошибках."""
+    """Обертка отправки в Google API. Точно трекает лимиты и делает авто-ретрай на другие ключи."""
     max_retries = 3
     for attempt in range(max_retries):
         try:
@@ -297,6 +297,12 @@ def safe_send_message(agent, chat_id, prompt_or_parts, status_text="🤖 <b>Об
             else:
                 response = agent.send_message(prompt_or_parts)
             
+            # Записываем точные траты на этот конкретный запрос
+            if chat_id in TURN_STATS:
+                TURN_STATS[chat_id]["rpd"] += 1
+                if hasattr(response, 'usage_metadata'):
+                    TURN_STATS[chat_id]["tpm"] += response.usage_metadata.total_token_count
+                    
             if hasattr(response, 'usage_metadata'):
                 track_token_usage(response.usage_metadata.total_token_count)
                 
@@ -459,6 +465,15 @@ def list_my_tasks_tool() -> str:
     for t in tasks: res += f"- ID: {t['id']}, CRON: {t['cron']}, Prompt: {t['prompt']}\n"
     return res
 
+def sleep_tool(seconds: int) -> str:
+    """Пауза в выполнении (сон) на указанное количество секунд."""
+    global CURRENT_CHAT_ID
+    if CURRENT_CHAT_ID:
+        ACTION_LOGS.setdefault(CURRENT_CHAT_ID, []).append(("sleep", seconds))
+        set_status(CURRENT_CHAT_ID, f"💤 <b>ИИ ожидает {seconds} сек...</b>")
+    time.sleep(min(seconds, 300)) # Ограничиваем один сон максимум 5 минутами
+    return f"Success: slept for {seconds} seconds."
+
 # ─────────────────────────────────────────────
 #  ЛОГИКА МОДЕЛЕЙ И УМНЫЙ ТРИММЕР
 # ─────────────────────────────────────────────
@@ -538,13 +553,13 @@ def init_models(model_name, role="admin", mode="auto"):
             )
             chat_agent = model_agent.start_chat()
         else:
-            enable_auto = (mode == "auto")
+            # ВАЖНО: Отключаем автоматический вызов функций Google, чтобы видеть каждый шаг и считать RPD вручную!
             model_agent = genai.GenerativeModel(
                 model_name=model_name,
-                tools=[execute_bash, search_web_tool, download_file_tool, send_file_to_telegram, delete_scheduled_task_tool, list_my_tasks_tool],
+                tools=[execute_bash, search_web_tool, download_file_tool, send_file_to_telegram, delete_scheduled_task_tool, list_my_tasks_tool, sleep_tool],
                 system_instruction=PROMPTS.get("GEMINI_ADMIN", "")
             )
-            chat_agent = model_agent.start_chat(enable_automatic_function_calling=enable_auto)
+            chat_agent = model_agent.start_chat(enable_automatic_function_calling=False)
 
         model_advisor = genai.GenerativeModel(
             model_name=model_name,
@@ -587,9 +602,10 @@ def trim_chat_history(agent, model_name=None):
         agent.history = agent.history[cut_idx:]
 
 def get_gemma_react_prompt(clean_model_name):
-    if "gemma-4" in clean_model_name.lower():
-        return "\n\n" + PROMPTS.get("GEMMA4_ADMIN_REACT", "")
-    return "\n\n" + PROMPTS.get("GEMMA_ADMIN_REACT", "")
+    sys_str = "\n\n" + PROMPTS.get("GEMMA4_ADMIN_REACT", "") if "gemma-4" in clean_model_name.lower() else "\n\n" + PROMPTS.get("GEMMA_ADMIN_REACT", "")
+    if "<SLEEP>" not in sys_str:
+        sys_str += "\nЕсли нужно подождать, напиши <SLEEP>секунды</SLEEP>."
+    return sys_str
 
 # ─────────────────────────────────────────────
 #  ФОНОВЫЙ ВЫПОЛНИТЕЛЬ ЗАДАЧ (SCHEDULER CALLBACK)
@@ -615,31 +631,23 @@ def execute_scheduled_task(chat_id, prompt, model_name, task_id):
         
         task_model = genai.GenerativeModel(
             model_name=model_name,
-            tools=[execute_bash, search_web_tool, download_file_tool, send_file_to_telegram, delete_scheduled_task_tool, list_my_tasks_tool],
+            tools=[execute_bash, search_web_tool, download_file_tool, send_file_to_telegram, delete_scheduled_task_tool, list_my_tasks_tool, sleep_tool],
             system_instruction=system_prompt
         )
-        task_chat = task_model.start_chat(enable_automatic_function_calling=True)
+        task_chat = task_model.start_chat(enable_automatic_function_calling=False) # Мануальный парсинг для точности лимитов
         
         global CURRENT_CHAT_ID
         CURRENT_CHAT_ID = chat_id
+        
+        # Сбрасываем статистику сессии
         ACTION_LOGS[chat_id] = []
+        TURN_STATS[chat_id] = {"rpd": 0, "tpm": 0}
+        CONSECUTIVE_SLEEPS[chat_id] = 0
         
         response = safe_send_message(task_chat, chat_id, prompt, status_text, model_name=model_name)
-            
-        clear_status(chat_id)
         
-        markup = None
-        if ACTION_LOGS.get(chat_id):
-            LAST_ACTIONS[msg_first.message_id] = ACTION_LOGS[chat_id].copy()
-            markup = InlineKeyboardMarkup()
-            markup.add(InlineKeyboardButton("🛠 Выполненные действия", callback_data=f"show_acts_{msg_first.message_id}"))
-        
-        prefix = f"⏰ <b>Запуск фоновой задачи:</b> <code>{task_id}</code>\n\n"
-        send_long_text(chat_id, response.text, first_msg_id=msg_first.message_id, prefix=prefix, reply_markup=markup)
-        
-        used_actions = ACTION_LOGS.get(chat_id, [])
-        log_actions_str = ", ".join([f"{a[0]}: {str(a[1])[:30]}..." for a in used_actions]) if used_actions else "No tools used"
-        task.log_task_event(f"EXECUTE: Chat={chat_id} | ID={task_id} | Actions: [{log_actions_str}]")
+        # Передаем управление в единый маршрутизатор (он обработает функции, если они есть, и завершит цикл)
+        parse_and_route_response(chat_id, response, msg_first.message_id, prompt)
         
     except Exception as e:
         clear_status(chat_id)
@@ -886,11 +894,13 @@ def parse_and_route_response(chat_id, response, first_msg_id, original_text):
         search_match = re.search(r'<SEARCH>(.*?)</SEARCH>', response_text, re.DOTALL | re.IGNORECASE)
         dl_match = re.search(r'<DOWNLOAD>(.*?)</DOWNLOAD>', response_text, re.DOTALL | re.IGNORECASE)
         file_match = re.search(r'<FILE>(.*?)</FILE>', response_text, re.DOTALL | re.IGNORECASE)
+        sleep_match = re.search(r'<SLEEP>(.*?)</SLEEP>', response_text, re.DOTALL | re.IGNORECASE)
         
         if bash_match: action = {"type": "react", "name": "bash", "val": bash_match.group(1).strip(), "disp_name": "Команда BASH", "disp_val": bash_match.group(1).strip()}
         elif search_match: action = {"type": "react", "name": "search", "val": search_match.group(1).strip(), "disp_name": "Поиск в сети", "disp_val": search_match.group(1).strip()}
         elif dl_match: action = {"type": "react", "name": "download", "val": dl_match.group(1).strip(), "disp_name": "Скачивание файла", "disp_val": dl_match.group(1).strip()}
         elif file_match: action = {"type": "react", "name": "file", "val": file_match.group(1).strip(), "disp_name": "Отправка файла в чат", "disp_val": file_match.group(1).strip()}
+        elif sleep_match: action = {"type": "react", "name": "sleep", "val": sleep_match.group(1).strip(), "disp_name": "Пауза/Сон", "disp_val": sleep_match.group(1).strip()}
     else:
         if response.parts:
             for part in response.parts:
@@ -905,6 +915,7 @@ def parse_and_route_response(chat_id, response, first_msg_id, original_text):
                     elif fn_name == "send_file_to_telegram": disp_name, disp_val = "Отправка файла в чат", fn_args.get("filepath", "")
                     elif fn_name == "delete_scheduled_task_tool": disp_name, disp_val = "Удаление задачи", fn_args.get("task_id", "")
                     elif fn_name == "list_my_tasks_tool": disp_name, disp_val = "Список задач", ""
+                    elif fn_name == "sleep_tool": disp_name, disp_val = "Пауза/Сон", fn_args.get("seconds", "")
                     
                     action = {"type": "native", "name": fn_name, "args": fn_args, "disp_name": disp_name, "disp_val": disp_val}
                     break
@@ -918,9 +929,16 @@ def parse_and_route_response(chat_id, response, first_msg_id, original_text):
 def finish_response(chat_id, text, msg_id, clean_model_name):
     markup = None
     if ACTION_LOGS.get(chat_id):
-        LAST_ACTIONS[msg_id] = ACTION_LOGS[chat_id].copy()
+        stats = TURN_STATS.get(chat_id, {"rpd": 0, "tpm": 0})
+        LAST_ACTIONS[msg_id] = {
+            "actions": ACTION_LOGS[chat_id].copy(),
+            "stats": stats
+        }
         markup = InlineKeyboardMarkup()
         markup.add(InlineKeyboardButton("🛠 Выполненные действия", callback_data=f"show_acts_{msg_id}"))
+    
+    # Для фоновых задач сохраняем красивый префикс, если это фоновая задача (через msg_id в базе? Нет, просто добавим при вызове)
+    # Но так как execute_scheduled_task задает msg_first, мы просто вклеиваем ответ.
     
     send_long_text(chat_id, text, first_msg_id=msg_id, prefix=f"<b>{clean_model_name}:</b>\n\n", reply_markup=markup)
     if VOICE_MODE.get(chat_id): generate_and_send_voice(chat_id, text)
@@ -928,6 +946,15 @@ def finish_response(chat_id, text, msg_id, clean_model_name):
 
 def process_action_request(chat_id, action):
     mode = MODEL_MODE.get(chat_id, "semi")
+    
+    # Считаем количество засыпаний подряд
+    if action["name"] in ["sleep", "sleep_tool"]:
+        CONSECUTIVE_SLEEPS[chat_id] = CONSECUTIVE_SLEEPS.get(chat_id, 0) + 1
+        if CONSECUTIVE_SLEEPS[chat_id] > 3:
+            action["name"] = "sleep_error" # Блокируем фактический сон
+    else:
+        CONSECUTIVE_SLEEPS[chat_id] = 0
+
     if mode == "semi":
         PENDING_ACTION[chat_id] = action
         clear_status(chat_id)
@@ -940,11 +967,17 @@ def process_action_request(chat_id, action):
 def execute_pending_action(chat_id, action):
     global chat_agent
     res = "Нет результата."
-    if action["type"] == "react":
+    
+    if action["name"] == "sleep_error":
+        res = "ERROR: You have slept 3 times consecutively. You are not allowed to sleep again. You must perform a different action or give the final text response."
+    elif action["type"] == "react":
         if action["name"] == "bash": res = execute_bash(action["val"])
         elif action["name"] == "search": res = search_web_tool(action["val"])
         elif action["name"] == "download": res = download_file_tool(action["val"])
         elif action["name"] == "file": res = send_file_to_telegram(action["val"])
+        elif action["name"] == "sleep": 
+            try: res = sleep_tool(int(action["val"]))
+            except: res = sleep_tool(5)
     elif action["type"] == "native":
         fn_name = action["name"]
         args = action["args"]
@@ -954,6 +987,9 @@ def execute_pending_action(chat_id, action):
         elif fn_name == "send_file_to_telegram": res = send_file_to_telegram(args.get("filepath", ""))
         elif fn_name == "delete_scheduled_task_tool": res = delete_scheduled_task_tool(args.get("task_id", ""))
         elif fn_name == "list_my_tasks_tool": res = list_my_tasks_tool()
+        elif fn_name == "sleep_tool": 
+            try: res = sleep_tool(int(args.get("seconds", 5)))
+            except: res = sleep_tool(5)
         
     status_text = "🧠 <b>Анализирую результат...</b>"
     set_status(chat_id, status_text)
@@ -965,7 +1001,8 @@ def execute_pending_action(chat_id, action):
             if hasattr(chat_agent, 'history') and len(chat_agent.history) >= 2:
                 chat_agent.history[-2].parts[0].text = f"[Система сообщила результат действия {action['name']}]"
         elif action["type"] == "native":
-            response = safe_send_message(chat_agent, chat_id, {"function_response": {"name": action["name"], "response": {"result": str(res)}}}, status_text)
+            func_response = {"function_response": {"name": action["name"], "response": {"result": str(res)}}}
+            response = safe_send_message(chat_agent, chat_id, func_response, status_text)
             
         parse_and_route_response(chat_id, response, action["msg_id"], action["orig_text"])
     except Exception as e:
@@ -983,7 +1020,6 @@ def handle_query(call):
     global CURRENT_CHAT_ID, MODEL_ROLE, MODEL_MODE, PENDING_ACTION
     data = call.data
 
-    # Обработка меню /status
     if data.startswith("status_key_"):
         key_num = int(data.split("_")[2])
         
@@ -1002,7 +1038,7 @@ def handle_query(call):
             
         text = f"📊 <b>Статистика KEY {key_num}</b>\n\n"
         text += f"⚡ <b>Текущая нагрузка (за 1 мин):</b>\n"
-        text += f"• Запросов (RPM): {len(valid_rpm)}\n"
+        text += f"• API Запросов (RPM): {len(valid_rpm)}\n"
         text += f"• Токенов (TPM): ~{valid_tpm}\n\n"
         
         text += f"📅 <b>Использование за день (RPD) [UTC]:</b>\n"
@@ -1045,10 +1081,19 @@ def handle_query(call):
     if data.startswith("show_acts_"):
         try: target_msg_id = int(data.split("_")[2])
         except: target_msg_id = 0
-        actions = LAST_ACTIONS.get(target_msg_id)
-        if not actions:
+        action_data = LAST_ACTIONS.get(target_msg_id)
+        
+        if not action_data:
             bot.answer_callback_query(call.id, "❌ Данные об этих действиях устарели.", show_alert=True)
             return
+
+        # Поддержка старой структуры (когда LAST_ACTIONS был просто списком)
+        if isinstance(action_data, list):
+            actions = action_data
+            stats = {"rpd": "?", "tpm": "?"}
+        else:
+            actions = action_data.get("actions", [])
+            stats = action_data.get("stats", {"rpd": "?", "tpm": "?"})
 
         log_text = ""
         bash_commands = []
@@ -1059,10 +1104,15 @@ def handle_query(call):
             elif act_type == "file": log_text += f"📤 <b>Отправлен файл:</b> <i>{html.escape(act_val)}</i>\n"
             elif act_type == "delete_task": log_text += f"🗑 <b>Удалил задачу:</b> <i>ID {html.escape(act_val)}</i>\n"
             elif act_type == "list_tasks": log_text += f"📋 <b>Просмотрел активные задачи</b>\n"
+            elif act_type == "sleep": log_text += f"💤 <b>Пауза:</b> <i>{act_val} сек.</i>\n"
 
         if bash_commands:
             bash_str = "\n".join(bash_commands)
             log_text += f'\n<pre><code class="language-bash">{html.escape(bash_str)}</code></pre>'
+
+        log_text += f"\n📊 <b>Затраты на запрос:</b>\n"
+        log_text += f"• API Запросов: {stats['rpd']}\n"
+        log_text += f"• Токенов: {stats['tpm']}\n"
 
         hide_markup = InlineKeyboardMarkup()
         hide_markup.add(InlineKeyboardButton("❌ Скрыть", callback_data="hide_message"))
@@ -1203,6 +1253,7 @@ def handle_query(call):
             is_gemma = "gemma" in clean_name.lower()
             CURRENT_CHAT_ID = call.message.chat.id
             ACTION_LOGS[CURRENT_CHAT_ID] = []
+            TURN_STATS[CURRENT_CHAT_ID] = {"rpd": 0, "tpm": 0}
             STATUS_MSG.pop(CURRENT_CHAT_ID, None)  
             safe_edit_message(call.message.chat.id, call.message.message_id, f"<b>{clean_name}:</b>\n🧠 Читаю файл...")
             status_text = "🧠 <b>Анализирую файл...</b>"
@@ -1287,6 +1338,10 @@ def handle_message(message):
             msg_first = bot.send_message(message.chat.id, f"<b>{clean_model_name}:</b>", parse_mode='HTML')
             status_text = "🧠 <b>Думаю...</b>"
             set_status(message.chat.id, status_text)
+            
+            TURN_STATS[message.chat.id] = {"rpd": 0, "tpm": 0}
+            CONSECUTIVE_SLEEPS[message.chat.id] = 0
+            
             try:
                 response = safe_send_message(model_advisor, message.chat.id, task_cmd, status_text, is_advisor=True)
                 clear_status(message.chat.id)
@@ -1298,6 +1353,8 @@ def handle_message(message):
 
     ACTION_LOGS[CURRENT_CHAT_ID] = []
     STATUS_MSG.pop(CURRENT_CHAT_ID, None)
+    TURN_STATS[CURRENT_CHAT_ID] = {"rpd": 0, "tpm": 0}
+    CONSECUTIVE_SLEEPS[CURRENT_CHAT_ID] = 0
 
     msg_first = bot.send_message(message.chat.id, f"<b>{clean_model_name}:</b>", parse_mode='HTML')
     status_text = "🤖 <b>Обрабатываю запрос...</b>"
@@ -1363,4 +1420,3 @@ if __name__ == '__main__':
     task.init_scheduler(execute_scheduled_task)
     print(f"AI-Админ запущен. Допущено админов: {len(ADMIN_IDS)}.")
     bot.polling(none_stop=True)
-                               
