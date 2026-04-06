@@ -329,6 +329,15 @@ def safe_send_message(agent, chat_id, prompt_or_parts, status_text="🤖 <b>Об
                 
     raise Exception("Превышено количество попыток переключения ключей.")
 
+def handle_api_error(e, chat_id, message_id, clean_model_name):
+    error_text = str(e)
+    if "Все доступные ключи исчерпали" in error_text or "Все ключи исчерпали квоту" in error_text or "Превышено количество попыток" in error_text:
+        safe_edit_message(chat_id, message_id, f"⚠️ <b>Лимиты API исчерпаны!</b>\n\n{html.escape(error_text)}\nСмените модель.", reply_markup=get_models_keyboard())
+    elif "Сбой синхронизации API" in error_text or "function response turn comes immediately after" in error_text:
+        safe_edit_message(chat_id, message_id, f"⚠️ <b>Сбой синхронизации API!</b>\nКонтекст был поврежден. Память ИИ автоматически очищена. Повторите запрос.")
+    else:
+        safe_edit_message(chat_id, message_id, f"❌ Ошибка ИИ: {html.escape(error_text)}")
+
 # ─────────────────────────────────────────────
 #  ФУНКЦИИ ВЫВОДА
 # ─────────────────────────────────────────────
@@ -561,29 +570,19 @@ def init_models(model_name, role="admin", mode="auto"):
             )
             chat_agent = model_agent.start_chat()
         else:
-            enable_auto = (mode == "auto")
+            sys_prompt = PROMPTS.get("GEMINI_ADMIN", "") + "\n\n[IMPORTANT] Return EXACTLY ONE tool call per response. Do NOT use parallel function calling."
+            # ВАЖНО: Отключаем авто-вызов Google API для точного трекинга
             model_agent = genai.GenerativeModel(
                 model_name=model_name,
                 tools=[execute_bash, search_web_tool, download_file_tool, send_file_to_telegram, delete_scheduled_task_tool, list_my_tasks_tool, sleep_tool],
-                system_instruction=PROMPTS.get("GEMINI_ADMIN", "")
+                system_instruction=sys_prompt
             )
-            chat_agent = model_agent.start_chat(enable_automatic_function_calling=enable_auto)
+            chat_agent = model_agent.start_chat(enable_automatic_function_calling=False)
 
         model_advisor = genai.GenerativeModel(
             model_name=model_name,
             system_instruction=PROMPTS.get("GEMINI_ADVISOR", "")
         )
-
-def handle_api_error(e, chat_id, message_id, clean_model_name):
-    """Показывает реальные ошибки в чат."""
-    error_text = str(e)
-    
-    if "Все доступные ключи исчерпали" in error_text or "Все ключи исчерпали квоту" in error_text:
-        safe_edit_message(chat_id, message_id, f"⚠️ <b>Лимиты API исчерпаны!</b>\n\n{html.escape(error_text)}\nСмените модель.", reply_markup=get_models_keyboard())
-    elif "Сбой синхронизации API" in error_text:
-        safe_edit_message(chat_id, message_id, f"⚠️ <b>Сбой синхронизации API!</b>\nКонтекст был поврежден. Память ИИ автоматически очищена. Повторите запрос.")
-    else:
-        safe_edit_message(chat_id, message_id, f"❌ Ошибка ИИ: {html.escape(error_text)}")
 
 def trim_chat_history(agent, model_name=None):
     if not model_name: model_name = CURRENT_MODEL
@@ -641,7 +640,8 @@ def execute_scheduled_task(chat_id, prompt, model_name, task_id):
             f"3. State Management: You have no memory of previous runs. If you need to keep track of counts or data between executions, you MUST use the `execute_bash` tool to read/write to a text file in `/app/downloads/tasks/state_{task_id}.txt`.\n"
             f"4. Self-Deletion: If your instructions say to stop or delete the task after a certain condition, use the `delete_scheduled_task_tool(task_id)` passing your ID: {task_id}.\n"
             f"5. Try to combine your bash commands into a single script execution to save time. Do not make more than 1-2 bash calls per execution.\n"
-            f"6. Complete the user's prompt using your tools, and provide the final report."
+            f"6. Complete the user's prompt using your tools, and provide the final report.\n"
+            f"7. Return EXACTLY ONE tool call at a time. Do NOT use parallel function calling."
         )
         
         system_prompt = PROMPTS.get("GEMINI_ADMIN", "") + task_specific_instructions
@@ -924,22 +924,27 @@ def parse_and_route_response(chat_id, response, first_msg_id, original_text):
         elif sleep_match: action = {"type": "react", "name": "sleep", "val": sleep_match.group(1).strip(), "disp_name": "Пауза/Сон", "disp_val": sleep_match.group(1).strip()}
     else:
         if response.parts:
+            function_calls = []
             for part in response.parts:
                 if hasattr(part, 'function_call') and part.function_call:
-                    fn_name = part.function_call.name
-                    fn_args = {key: val for key, val in part.function_call.args.items()}
-                    disp_name = fn_name
-                    disp_val = str(fn_args)
-                    if fn_name == "execute_bash": disp_name, disp_val = "Команда BASH", fn_args.get("command", "")
-                    elif fn_name == "search_web_tool": disp_name, disp_val = "Поиск в сети", fn_args.get("query", "")
-                    elif fn_name == "download_file_tool": disp_name, disp_val = "Скачивание файла", fn_args.get("url", "")
-                    elif fn_name == "send_file_to_telegram": disp_name, disp_val = "Отправка файла в чат", fn_args.get("filepath", "")
-                    elif fn_name == "delete_scheduled_task_tool": disp_name, disp_val = "Удаление задачи", fn_args.get("task_id", "")
-                    elif fn_name == "list_my_tasks_tool": disp_name, disp_val = "Список задач", ""
-                    elif fn_name == "sleep_tool": disp_name, disp_val = "Пауза/Сон", fn_args.get("seconds", "")
-                    
-                    action = {"type": "native", "name": fn_name, "args": fn_args, "disp_name": disp_name, "disp_val": disp_val}
-                    break
+                    function_calls.append(part.function_call)
+            
+            if function_calls:
+                first_call = function_calls[0]
+                fn_name = first_call.name
+                fn_args = {key: val for key, val in first_call.args.items()}
+                disp_name = fn_name
+                disp_val = str(fn_args)
+                if fn_name == "execute_bash": disp_name, disp_val = "Команда BASH", fn_args.get("command", "")
+                elif fn_name == "search_web_tool": disp_name, disp_val = "Поиск в сети", fn_args.get("query", "")
+                elif fn_name == "download_file_tool": disp_name, disp_val = "Скачивание файла", fn_args.get("url", "")
+                elif fn_name == "send_file_to_telegram": disp_name, disp_val = "Отправка файла в чат", fn_args.get("filepath", "")
+                elif fn_name == "delete_scheduled_task_tool": disp_name, disp_val = "Удаление задачи", fn_args.get("task_id", "")
+                elif fn_name == "list_my_tasks_tool": disp_name, disp_val = "Список задач", ""
+                elif fn_name == "sleep_tool": disp_name, disp_val = "Пауза/Сон", fn_args.get("seconds", "")
+                
+                action = {"type": "native", "name": fn_name, "args": fn_args, "disp_name": disp_name, "disp_val": disp_val, "all_calls": function_calls}
+
     if action:
         action["msg_id"] = first_msg_id
         action["orig_text"] = original_text
@@ -1022,9 +1027,13 @@ def execute_pending_action(chat_id, action):
             response = safe_send_message(chat_agent, chat_id, followup_prompt, status_text)
             if hasattr(chat_agent, 'history') and len(chat_agent.history) >= 2:
                 chat_agent.history[-2].parts[0].text = f"[Система сообщила результат действия {action['name']}]"
+                
         elif action["type"] == "native":
-            func_response = {"function_response": {"name": action["name"], "response": {"result": str(res)}}}
-            response = safe_send_message(chat_agent, chat_id, func_response, status_text)
+            func_responses = [{"function_response": {"name": action["name"], "response": {"result": str(res)}}}]
+            if "all_calls" in action and len(action["all_calls"]) > 1:
+                for extra in action["all_calls"][1:]:
+                    func_responses.append({"function_response": {"name": extra.name, "response": {"result": "Ignored. Execute ONE function at a time."}}})
+            response = safe_send_message(chat_agent, chat_id, func_responses, status_text)
             
         parse_and_route_response(chat_id, response, action["msg_id"], action["orig_text"])
     except Exception as e:
@@ -1250,7 +1259,11 @@ def handle_query(call):
                 if action["type"] == "react":
                     resp = safe_send_message(chat_agent, call.message.chat.id, "ПОЛЬЗОВАТЕЛЬ ЗАПРЕТИЛ ВЫПОЛНЕНИЕ ЭТОЙ ОПЕРАЦИИ. Ответь пользователю.", status_text)
                 elif action["type"] == "native":
-                    resp = safe_send_message(chat_agent, call.message.chat.id, {"function_response": {"name": action["name"], "response": {"result": "ERROR: User denied permission to execute."}}}, status_text)
+                    func_responses = [{"function_response": {"name": action["name"], "response": {"result": "ERROR: User denied permission to execute."}}}]
+                    if "all_calls" in action and len(action["all_calls"]) > 1:
+                        for extra in action["all_calls"][1:]:
+                            func_responses.append({"function_response": {"name": extra.name, "response": {"result": "Ignored."}}})
+                    resp = safe_send_message(chat_agent, call.message.chat.id, func_responses, status_text)
                 parse_and_route_response(call.message.chat.id, resp, action["msg_id"], action["orig_text"])
             except Exception as e:
                 clear_status(call.message.chat.id)
