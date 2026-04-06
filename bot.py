@@ -72,23 +72,52 @@ MODELS_FILE = "models.txt"
 MODEL_RPM_LIMITS = {}
 MODEL_RESTRICTED_KEYS = {} 
 MODEL_TPM_LIMITS = {}
-MODEL_RPD_LIMITS = {} # НОВОЕ: Лимиты запросов в день
+MODEL_RPD_LIMITS = {}
 PRIORITY_MODELS = []
 
-# НОВОЕ: Трекер RPD по ключам и датам
+# Файл персистентного хранения RPD
+LIMITS_STATE_FILE = "/app/downloads/temp/api_limits.json"
+
 API_RPD_HISTORY = {
     1: {"date": "", "usage": {}},
     2: {"date": "", "usage": {}},
     3: {"date": "", "usage": {}}
 }
+API_REQUEST_HISTORY = {1: deque(), 2: deque(), 3: deque()}
+API_TOKEN_HISTORY = {1: deque(), 2: deque(), 3: deque()}
+
+def load_limits_state():
+    """Загружает сохраненные лимиты RPD из временной папки."""
+    global API_RPD_HISTORY
+    os.makedirs(os.path.dirname(LIMITS_STATE_FILE), exist_ok=True)
+    if os.path.exists(LIMITS_STATE_FILE):
+        try:
+            with open(LIMITS_STATE_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                for k, v in data.items():
+                    API_RPD_HISTORY[int(k)] = v
+        except Exception as e: 
+            print(f"Ошибка загрузки лимитов: {e}")
+    
+    today_str = datetime.utcnow().strftime("%Y-%m-%d")
+    for i in [1, 2, 3]:
+        if i not in API_RPD_HISTORY or API_RPD_HISTORY[i].get("date") != today_str:
+            API_RPD_HISTORY[i] = {"date": today_str, "usage": {}}
+
+def save_limits_state():
+    """Сохраняет лимиты RPD для выживания при редеплое."""
+    os.makedirs(os.path.dirname(LIMITS_STATE_FILE), exist_ok=True)
+    try:
+        with open(LIMITS_STATE_FILE, "w", encoding="utf-8") as f:
+            json.dump(API_RPD_HISTORY, f, ensure_ascii=False, indent=4)
+    except Exception as e:
+        print(f"Ошибка сохранения лимитов: {e}")
 
 def load_prompts_config():
     global PROMPTS
     PROMPTS.clear()
     if not os.path.exists(PROMPTS_FILE):
-        print(f"⚠️ Файл {PROMPTS_FILE} не найден! Создан пустой. Пожалуйста, заполните его.")
-        with open(PROMPTS_FILE, "w", encoding="utf-8") as f:
-            f.write("")
+        with open(PROMPTS_FILE, "w", encoding="utf-8") as f: f.write("")
 
     with open(PROMPTS_FILE, "r", encoding="utf-8") as f:
         current_key = None
@@ -111,7 +140,6 @@ def load_models_config():
     MODEL_RPD_LIMITS.clear()
     
     if not os.path.exists(MODELS_FILE):
-        print(f"⚠️ Файл {MODELS_FILE} не найден! Создан дефолтный.")
         default_content = "gemini-2.5-flash-lite [RPM:10, TPM:250000, RPD:20, KEY:2,3]\n"
         with open(MODELS_FILE, "w", encoding="utf-8") as f: f.write(default_content)
     
@@ -139,15 +167,13 @@ def load_models_config():
 
 load_prompts_config()
 load_models_config()
-
-API_REQUEST_HISTORY = {1: deque(), 2: deque(), 3: deque()}
-API_TOKEN_HISTORY = {1: deque(), 2: deque(), 3: deque()}
+load_limits_state() # Инициализация памяти лимитов
 
 def log_admin_action(user_id, action):
     print(f"[ADMIN {user_id}] {action}")
 
 # ─────────────────────────────────────────────
-#  Live-статус и Трекер Лимитов
+#  Live-статус, Трекер Лимитов и Авто-Переключение
 # ─────────────────────────────────────────────
 
 def set_status(chat_id, text: str):
@@ -157,19 +183,18 @@ def set_status(chat_id, text: str):
         try:
             bot.edit_message_text(chat_id=chat_id, message_id=msg_id, text=text, parse_mode='HTML')
             return
-        except Exception as e:
-            if "message is not modified" in str(e).lower(): return
+        except:
             STATUS_MSG.pop(chat_id, None)
     try:
         msg = bot.send_message(chat_id, text, parse_mode='HTML')
         STATUS_MSG[chat_id] = msg.message_id
-    except Exception: pass
+    except: pass
 
 def clear_status(chat_id):
     msg_id = STATUS_MSG.pop(chat_id, None)
     if msg_id:
         try: bot.delete_message(chat_id, msg_id)
-        except Exception: pass
+        except: pass
 
 def track_token_usage(token_count):
     global CURRENT_KEY_NUM
@@ -177,7 +202,6 @@ def track_token_usage(token_count):
 
 def check_api_rate_limit(chat_id, current_status_text, model_name=None):
     global CURRENT_KEY_NUM
-    
     if model_name is None: model_name = CURRENT_MODEL
     if not model_name: return
 
@@ -189,7 +213,7 @@ def check_api_rate_limit(chat_id, current_status_text, model_name=None):
     
     now = time.time()
     
-    # ПРОВЕРКА И ОБНОВЛЕНИЕ ДНЕВНОГО ЛИМИТА (RPD) по UTC
+    # RPD (Дневные лимиты)
     today_str = datetime.utcnow().strftime("%Y-%m-%d")
     key_data = API_RPD_HISTORY[CURRENT_KEY_NUM]
     
@@ -201,7 +225,8 @@ def check_api_rate_limit(chat_id, current_status_text, model_name=None):
         current_rpd = key_data["usage"].get(clean_name, 0)
         if current_rpd >= rpd_limit:
             raise Exception(f"RPD_LIMIT_REACHED|{clean_name}|{rpd_limit}")
-    
+            
+    # RPM (Лимиты в минуту)
     if rpm_limit:
         history_rpm = API_REQUEST_HISTORY.setdefault(CURRENT_KEY_NUM, deque())
         while history_rpm and now - history_rpm[0] > 60.5: history_rpm.popleft()
@@ -213,11 +238,12 @@ def check_api_rate_limit(chat_id, current_status_text, model_name=None):
                 if chat_id: set_status(chat_id, current_status_text)
                 now = time.time()
 
+    # TPM (Токены в минуту)
     if tpm_limit:
         history_tpm = API_TOKEN_HISTORY.setdefault(CURRENT_KEY_NUM, deque())
         while history_tpm and now - history_tpm[0][0] > 60.5: history_tpm.popleft()
         current_tpm = sum(count for _, count in history_tpm)
-        if current_tpm > (tpm_limit - 1000): # Буфер 1000 токенов
+        if current_tpm > (tpm_limit - 1000): 
             wait_time = 60.5 - (now - history_tpm[0][0])
             if wait_time > 0:
                 if chat_id: set_status(chat_id, f"{current_status_text}\n⏳ <i>Тайм-аут токенов: ожидание {wait_time:.1f}с (использовано {current_tpm}/{tpm_limit} TPM)</i>")
@@ -225,9 +251,79 @@ def check_api_rate_limit(chat_id, current_status_text, model_name=None):
                 if chat_id: set_status(chat_id, current_status_text)
                 now = time.time()
 
-    # Фиксируем успешный запрос в счетчиках
     API_REQUEST_HISTORY[CURRENT_KEY_NUM].append(now)
     key_data["usage"][clean_name] = key_data["usage"].get(clean_name, 0) + 1
+    save_limits_state() # Сохраняем RPD на диск
+
+def switch_api_key(chat_id, reason):
+    """Ищет следующий доступный ключ, переключает его и сообщает пользователю."""
+    global CURRENT_KEY_NUM, CURRENT_MODEL
+    old_key = CURRENT_KEY_NUM
+    keys = [1, 2, 3]
+    idx = keys.index(old_key)
+    
+    clean_name = CURRENT_MODEL.replace('models/', '') if CURRENT_MODEL else ""
+    
+    for i in range(1, 3):
+        next_key = keys[(idx + i) % 3]
+        target_key = API_KEY_1 if next_key == 1 else (API_KEY_2 if next_key == 2 else API_KEY_3)
+        if not target_key: continue
+        
+        # Проверяем, не исчерпан ли RPD на этом новом ключе
+        rpd_limit = MODEL_RPD_LIMITS.get(clean_name)
+        if rpd_limit:
+            today_str = datetime.utcnow().strftime("%Y-%m-%d")
+            key_data = API_RPD_HISTORY.get(next_key, {"date": today_str, "usage": {}})
+            if key_data["date"] == today_str and key_data["usage"].get(clean_name, 0) >= rpd_limit:
+                continue 
+        
+        CURRENT_KEY_NUM = next_key
+        genai.configure(api_key=target_key)
+        if chat_id:
+            bot.send_message(chat_id, f"🔄 <b>Авто-переключение ключа!</b>\n<i>{reason}</i>\nТеперь активен: <b>KEY {CURRENT_KEY_NUM}</b>", parse_mode='HTML')
+        return True
+        
+    return False
+
+def safe_send_message(agent, chat_id, prompt_or_parts, status_text="🤖 <b>Обрабатываю запрос...</b>", is_advisor=False, model_name=None):
+    """Умная обертка для отправки сообщений. Обрабатывает лимиты и ретраи при ошибках."""
+    max_retries = 3
+    for attempt in range(max_retries):
+        try:
+            check_api_rate_limit(chat_id, status_text, model_name)
+            
+            if is_advisor:
+                response = agent.generate_content(prompt_or_parts)
+            else:
+                response = agent.send_message(prompt_or_parts)
+            
+            if hasattr(response, 'usage_metadata'):
+                track_token_usage(response.usage_metadata.total_token_count)
+                
+            if not is_advisor:
+                trim_chat_history(agent, model_name)
+                
+            return response
+            
+        except Exception as e:
+            error_text = str(e)
+            if "RPD_LIMIT_REACHED" in error_text:
+                if switch_api_key(chat_id, f"Достигнут дневной лимит (RPD) на ключе {CURRENT_KEY_NUM}."):
+                    continue
+                else: raise Exception("Все доступные ключи исчерпали дневной лимит (RPD) для этой модели.")
+                
+            elif "429" in error_text or "Quota exceeded" in error_text:
+                if switch_api_key(chat_id, f"Превышена квота API (Ошибка 429) на ключе {CURRENT_KEY_NUM}."):
+                    continue
+                else: raise Exception("Все ключи исчерпали квоту API (429). Попробуйте позже.")
+                
+            elif "function response turn comes immediately after a function call" in error_text:
+                if not is_advisor and hasattr(agent, 'history'): agent.history.clear()
+                raise Exception("Сбой синхронизации API! Контекст был поврежден. Память очищена.")
+            else:
+                raise e
+                
+    raise Exception("Превышено количество попыток переключения ключей.")
 
 # ─────────────────────────────────────────────
 #  ФУНКЦИИ ВЫВОДА
@@ -235,8 +331,7 @@ def check_api_rate_limit(chat_id, current_status_text, model_name=None):
 
 def safe_edit_message(chat_id, message_id, text, parse_mode='HTML', reply_markup=None):
     try: bot.edit_message_text(chat_id=chat_id, message_id=message_id, text=text, parse_mode=parse_mode, reply_markup=reply_markup)
-    except Exception as e:
-        if "message is not modified" in str(e).lower(): raise e
+    except Exception: pass
 
 def send_long_text(chat_id, text, first_msg_id=None, is_code=False, prefix="", reply_markup=None):
     if not text: return
@@ -282,7 +377,6 @@ def generate_and_send_voice(chat_id, text):
         mp3_path = f"temp_tts_{chat_id}_{i}.mp3"
         ogg_path = f"temp_tts_{chat_id}_{i}.ogg"
         msg_wait_voice = None
-
         try:
             part_text = f" [часть {i+1}/{total_chunks}]" if total_chunks > 1 else ""
             msg_wait_voice = bot.send_message(chat_id, f"🎙 <i>Отправка голосового сообщения{part_text}...</i>", parse_mode='HTML')
@@ -297,9 +391,7 @@ def generate_and_send_voice(chat_id, text):
                     with open(ogg_path, 'rb') as voice_file: bot.send_voice(chat_id, voice_file)
         except Exception as e: print(f"Ошибка синтеза: {e}")
         finally:
-            if msg_wait_voice:
-                try: bot.delete_message(chat_id, msg_wait_voice.message_id)
-                except Exception: pass
+            if msg_wait_voice: clear_status(chat_id)
             if os.path.exists(mp3_path): os.remove(mp3_path)
             if os.path.exists(ogg_path): os.remove(ogg_path)
 
@@ -308,13 +400,11 @@ def generate_and_send_voice(chat_id, text):
 # ─────────────────────────────────────────────
 
 def execute_bash(command: str) -> str:
-    """Выполняет bash команду на сервере."""
     if CURRENT_CHAT_ID:
         ACTION_LOGS.setdefault(CURRENT_CHAT_ID, []).append(("bash", command))
         short_cmd = command if len(command) <= 80 else command[:77] + "…"
         status_text = f"⚙️ <b>Выполняю команду:</b>\n<code>{html.escape(short_cmd)}</code>"
         set_status(CURRENT_CHAT_ID, status_text)
-        check_api_rate_limit(CURRENT_CHAT_ID, status_text) 
     try:
         result = subprocess.run(command, shell=True, capture_output=True, text=True, timeout=30)
         output = result.stdout if result.stdout else result.stderr
@@ -322,27 +412,22 @@ def execute_bash(command: str) -> str:
     except Exception as e: return f"Ошибка: {str(e)}"
 
 def search_web_tool(query: str) -> str:
-    """Ищет информацию в интернете."""
     if CURRENT_CHAT_ID:
         ACTION_LOGS.setdefault(CURRENT_CHAT_ID, []).append(("search", query))
         short_q = query if len(query) <= 80 else query[:77] + "…"
         status_text = f"🔍 <b>Ищу в интернете:</b>\n<i>{html.escape(short_q)}</i>"
         set_status(CURRENT_CHAT_ID, status_text)
-        check_api_rate_limit(CURRENT_CHAT_ID, status_text) 
     return web_search.search_web(query)
 
 def download_file_tool(url: str) -> str:
-    """Скачивает файл по URL на сервер."""
     if CURRENT_CHAT_ID:
         ACTION_LOGS.setdefault(CURRENT_CHAT_ID, []).append(("download", url))
         short_url = url if len(url) <= 70 else url[:67] + "…"
         status_text = f"⬇️ <b>Скачиваю файл:</b>\n<code>{html.escape(short_url)}</code>"
         set_status(CURRENT_CHAT_ID, status_text)
-        check_api_rate_limit(CURRENT_CHAT_ID, status_text) 
     return web_search.download_file_tool(url)
 
 def send_file_to_telegram(filepath: str) -> str:
-    """Отправляет файл с сервера в чат пользователю."""
     global CURRENT_CHAT_ID
     if CURRENT_CHAT_ID:
         ACTION_LOGS.setdefault(CURRENT_CHAT_ID, []).append(("file", filepath))
@@ -357,28 +442,21 @@ def send_file_to_telegram(filepath: str) -> str:
     except Exception as e: return f"Ошибка отправки файла: {str(e)}"
 
 def delete_scheduled_task_tool(task_id: str) -> str:
-    """Удаляет фоновую задачу по её ID (используется для само-остановки циклических задач)."""
     global CURRENT_CHAT_ID
     if not CURRENT_CHAT_ID: return "Error: Chat ID unknown."
-    
     ACTION_LOGS.setdefault(CURRENT_CHAT_ID, []).append(("delete_task", task_id))
-    
     if task.delete_task(CURRENT_CHAT_ID, task_id, deleted_by="AI_AGENT"):
         return f"Success: Task {task_id} has been permanently deleted from the schedule."
     return f"Error: Task {task_id} not found or already deleted."
 
 def list_my_tasks_tool() -> str:
-    """Возвращает список всех активных фоновых задач текущего чата."""
     global CURRENT_CHAT_ID
     if not CURRENT_CHAT_ID: return "Error: Chat ID unknown."
-    
     ACTION_LOGS.setdefault(CURRENT_CHAT_ID, []).append(("list_tasks", "all"))
     tasks = task.get_all_tasks(CURRENT_CHAT_ID)
     if not tasks: return "No active scheduled tasks."
-    
     res = "Active Tasks:\n"
-    for t in tasks:
-        res += f"- ID: {t['id']}, CRON: {t['cron']}, Prompt: {t['prompt']}\n"
+    for t in tasks: res += f"- ID: {t['id']}, CRON: {t['cron']}, Prompt: {t['prompt']}\n"
     return res
 
 # ─────────────────────────────────────────────
@@ -473,62 +551,26 @@ def init_models(model_name, role="admin", mode="auto"):
             system_instruction=PROMPTS.get("GEMINI_ADVISOR", "")
         )
 
-def handle_api_error(e, chat_id, message_id, original_message, clean_model_name):
-    error_text = str(e)
-    
-    if "RPD_LIMIT_REACHED" in error_text:
-        parts = error_text.split("|")
-        mod_name = parts[1] if len(parts) > 1 else clean_model_name
-        limit = parts[2] if len(parts) > 2 else "?"
-        safe_edit_message(chat_id, message_id, f"⚠️ <b>Дневной лимит исчерпан!</b>\n\nМодель <code>{mod_name}</code> достигла лимита в {limit} RPD на текущем ключе (KEY {CURRENT_KEY_NUM}).\nСмените ключ (/changekey) или выберите другую модель.", reply_markup=get_models_keyboard())
-        return
-    
-    if "function response turn comes immediately after a function call" in error_text:
-        global chat_agent
-        if chat_agent:
-            chat_agent.history.clear()
-        safe_edit_message(chat_id, message_id, "⚠️ <b>Сбой синхронизации API!</b>\nКонтекст был поврежден (прерван вызов функции). Память ИИ автоматически очищена. Пожалуйста, повторите ваш последний запрос.")
-        return
-
-    if "429" in error_text or "Quota exceeded" in error_text:
-        global PENDING_RETRY_MESSAGE
-        PENDING_RETRY_MESSAGE = original_message
-        delay_match = re.search(r'retry in ([\d\.]+)s', error_text)
-        delay_str = f"<b>{float(delay_match.group(1)):.0f} сек.</b>" if delay_match else "некоторое время"
-        pretty_error = (f"⚠️ <b>Ошибка 429: Лимит API!</b>\n\nМодель <code>{clean_model_name}</code> уперлась в квоту.\n"
-                        f"⏳ Блокировка спадет через: {delay_str}")
-        safe_edit_message(chat_id, message_id, pretty_error, reply_markup=get_models_keyboard())
-    else:
-        safe_edit_message(chat_id, message_id, f"❌ Ошибка ИИ: {html.escape(error_text)}")
+def handle_api_error(chat_id, message_id, clean_model_name):
+    safe_edit_message(chat_id, message_id, f"⚠️ <b>Лимиты API исчерпаны на всех ключах!</b>\n\nВсе доступные ключи для модели <code>{clean_model_name}</code> достигли квоты. Попробуйте позже или выберите другую модель.", reply_markup=get_models_keyboard())
 
 def trim_chat_history(agent, model_name=None):
-    """
-    Умная обрезка истории в зависимости от лимита TPM конкретной модели.
-    """
-    if not model_name: 
-        model_name = CURRENT_MODEL
-    if not model_name: 
-        return
+    if not model_name: model_name = CURRENT_MODEL
+    if not model_name: return
         
     clean_name = model_name.replace('models/', '')
-    tpm_limit = MODEL_TPM_LIMITS.get(clean_name, 15000) # По умолчанию консервативно
+    tpm_limit = MODEL_TPM_LIMITS.get(clean_name, 15000)
     
-    # Вычисляем безопасный размер памяти (1 ответ ~ 500-1000 токенов в контексте)
-    if tpm_limit >= 200000:
-        max_history = 40
-    elif tpm_limit >= 100000:
-        max_history = 20
-    elif tpm_limit >= 30000:
-        max_history = 10
-    else:
-        max_history = 6
+    if tpm_limit >= 200000: max_history = 40
+    elif tpm_limit >= 100000: max_history = 20
+    elif tpm_limit >= 30000: max_history = 10
+    else: max_history = 6
         
     if not hasattr(agent, 'history') or len(agent.history) <= max_history:
         return
         
     cut_idx = len(agent.history) - max_history
     
-    # Ищем безопасное место для разреза (не разбивая пару call->response)
     while cut_idx < len(agent.history):
         msg = agent.history[cut_idx]
         if msg.role == 'user':
@@ -537,7 +579,6 @@ def trim_chat_history(agent, model_name=None):
                 if hasattr(part, 'function_response') and part.function_response:
                     is_function_response = True
                     break
-            
             if not is_function_response:
                 break 
         cut_idx += 1
@@ -555,10 +596,8 @@ def get_gemma_react_prompt(clean_model_name):
 # ─────────────────────────────────────────────
 
 def execute_scheduled_task(chat_id, prompt, model_name, task_id):
-    """Эта функция вызывается модулем task.py по расписанию CRON."""
     try:
         msg_first = bot.send_message(chat_id, f"⏰ <b>Запуск фоновой задачи:</b> <code>{task_id}</code>", parse_mode='HTML')
-        
         status_text = "🤖 <b>Выполняю фоновую задачу...</b>"
         set_status(chat_id, status_text)
         
@@ -567,7 +606,7 @@ def execute_scheduled_task(chat_id, prompt, model_name, task_id):
             f"1. You are currently running as a background scheduled task.\n"
             f"2. Your unique Task ID is: {task_id}\n"
             f"3. State Management: You have no memory of previous runs. If you need to keep track of counts or data between executions, you MUST use the `execute_bash` tool to read/write to a text file in `/app/downloads/tasks/state_{task_id}.txt`.\n"
-            f"4. Self-Deletion: If your instructions say to stop or delete the task after a certain condition (e.g., 'after 5 times'), use the `delete_scheduled_task_tool(task_id)` passing your ID: {task_id}.\n"
+            f"4. Self-Deletion: If your instructions say to stop or delete the task after a certain condition, use the `delete_scheduled_task_tool(task_id)` passing your ID: {task_id}.\n"
             f"5. Try to combine your bash commands into a single script execution to save time. Do not make more than 1-2 bash calls per execution.\n"
             f"6. Complete the user's prompt using your tools, and provide the final report."
         )
@@ -579,19 +618,13 @@ def execute_scheduled_task(chat_id, prompt, model_name, task_id):
             tools=[execute_bash, search_web_tool, download_file_tool, send_file_to_telegram, delete_scheduled_task_tool, list_my_tasks_tool],
             system_instruction=system_prompt
         )
-        
         task_chat = task_model.start_chat(enable_automatic_function_calling=True)
         
         global CURRENT_CHAT_ID
         CURRENT_CHAT_ID = chat_id
-        
         ACTION_LOGS[chat_id] = []
         
-        check_api_rate_limit(chat_id, status_text, model_name)
-        response = task_chat.send_message(prompt)
-        
-        if hasattr(response, 'usage_metadata'): 
-            track_token_usage(response.usage_metadata.total_token_count)
+        response = safe_send_message(task_chat, chat_id, prompt, status_text, model_name=model_name)
             
         clear_status(chat_id)
         
@@ -755,7 +788,7 @@ def task_cmd(message):
     msg_wait = bot.send_message(message.chat.id, "🧠 <i>Анализирую расписание...</i>", parse_mode='HTML')
     
     try:
-        now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        now_str = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
         parse_prompt = (
             "Convert the user's task request into a standard CRON expression and a clear system prompt for an AI agent. "
             "Return ONLY a raw JSON object with keys 'cron' and 'prompt'. No markdown formatting, no comments. "
@@ -926,21 +959,18 @@ def execute_pending_action(chat_id, action):
     set_status(chat_id, status_text)
     
     try:
-        check_api_rate_limit(chat_id, status_text)
         if action["type"] == "react":
             followup_prompt = f"РЕЗУЛЬТАТ ВЫПОЛНЕНИЯ ({action['name']}):\n{res}\nОсновываясь на этом, дай финальный ответ или вызови новый тег."
-            response = chat_agent.send_message(followup_prompt)
+            response = safe_send_message(chat_agent, chat_id, followup_prompt, status_text)
             if hasattr(chat_agent, 'history') and len(chat_agent.history) >= 2:
                 chat_agent.history[-2].parts[0].text = f"[Система сообщила результат действия {action['name']}]"
         elif action["type"] == "native":
-            response = chat_agent.send_message({"function_response": {"name": action["name"], "response": {"result": str(res)}}})
+            response = safe_send_message(chat_agent, chat_id, {"function_response": {"name": action["name"], "response": {"result": str(res)}}}, status_text)
             
-        if hasattr(response, 'usage_metadata'): track_token_usage(response.usage_metadata.total_token_count)
-        trim_chat_history(chat_agent)
         parse_and_route_response(chat_id, response, action["msg_id"], action["orig_text"])
     except Exception as e:
         clear_status(chat_id)
-        bot.send_message(chat_id, f"❌ Ошибка ИИ (Loop): {e}")
+        handle_api_error(chat_id, action["msg_id"], CURRENT_MODEL.replace('models/', ''))
 
 # ─────────────────────────────────────────────
 #  ОБРАБОТКА CALLBACKS (КНОПКИ)
@@ -965,7 +995,7 @@ def handle_query(call):
         valid_tpm = sum(count for t, count in history_tpm if now - t <= 60.5)
         
         today_str = datetime.utcnow().strftime("%Y-%m-%d")
-        key_data = API_RPD_HISTORY[key_num]
+        key_data = API_RPD_HISTORY.get(key_num, {"date": today_str, "usage": {}})
         if key_data["date"] != today_str:
             key_data["date"] = today_str
             key_data["usage"] = {}
@@ -1132,15 +1162,14 @@ def handle_query(call):
             status_text = "🧠 <b>Сообщаю об отмене...</b>"
             set_status(call.message.chat.id, status_text)
             try:
-                check_api_rate_limit(call.message.chat.id, status_text)
                 if action["type"] == "react":
-                    resp = chat_agent.send_message("ПОЛЬЗОВАТЕЛЬ ЗАПРЕТИЛ ВЫПОЛНЕНИЕ ЭТОЙ ОПЕРАЦИИ. Ответь пользователю.")
+                    resp = safe_send_message(chat_agent, call.message.chat.id, "ПОЛЬЗОВАТЕЛЬ ЗАПРЕТИЛ ВЫПОЛНЕНИЕ ЭТОЙ ОПЕРАЦИИ. Ответь пользователю.", status_text)
                 elif action["type"] == "native":
-                    resp = chat_agent.send_message({"function_response": {"name": action["name"], "response": {"result": "ERROR: User denied permission to execute."}}})
+                    resp = safe_send_message(chat_agent, call.message.chat.id, {"function_response": {"name": action["name"], "response": {"result": "ERROR: User denied permission to execute."}}}, status_text)
                 parse_and_route_response(call.message.chat.id, resp, action["msg_id"], action["orig_text"])
             except Exception as e:
                 clear_status(call.message.chat.id)
-                bot.send_message(call.message.chat.id, f"❌ Ошибка ИИ: {e}")
+                handle_api_error(call.message.chat.id, action["msg_id"], CURRENT_MODEL.replace('models/', ''))
         return
 
     if data in ["file_yes", "file_no", "file_ai"]:
@@ -1187,19 +1216,16 @@ def handle_query(call):
                 gemini_file = genai.upload_file(path=temp_file_name, mime_type=mime) if mime else genai.upload_file(path=temp_file_name)
 
                 if is_gemma:
-                    response = chat_agent.send_message("Я текстовая модель Gemma, я пока не умею читать файлы напрямую.")
+                    response = safe_send_message(chat_agent, call.message.chat.id, "Я текстовая модель Gemma, я пока не умею читать файлы напрямую.", status_text)
                     parse_and_route_response(call.message.chat.id, response, call.message.message_id, "file")
                 else:
-                    check_api_rate_limit(call.message.chat.id, status_text)
-                    response = chat_agent.send_message([gemini_file, "Проанализируй этот файл. Расскажи, что в нём, либо выполни инструкции."])
-                    trim_chat_history(chat_agent)
+                    response = safe_send_message(chat_agent, call.message.chat.id, [gemini_file, "Проанализируй этот файл. Расскажи, что в нём, либо выполни инструкции."], status_text)
                     parse_and_route_response(call.message.chat.id, response, call.message.message_id, "file")
                 os.remove(temp_file_name)
 
             except Exception as e:
                 clear_status(call.message.chat.id)
-                err_msg = bot.send_message(call.message.chat.id, "❌")
-                handle_api_error(e, call.message.chat.id, err_msg.message_id, None, clean_name)
+                handle_api_error(call.message.chat.id, call.message.message_id, clean_name)
             PENDING_FILES.pop(call.message.chat.id, None)
             return
 
@@ -1262,13 +1288,12 @@ def handle_message(message):
             status_text = "🧠 <b>Думаю...</b>"
             set_status(message.chat.id, status_text)
             try:
-                check_api_rate_limit(message.chat.id, status_text)
-                response = model_advisor.generate_content(task_cmd)
+                response = safe_send_message(model_advisor, message.chat.id, task_cmd, status_text, is_advisor=True)
                 clear_status(message.chat.id)
                 send_long_text(message.chat.id, response.text, first_msg_id=msg_first.message_id, is_code=True)
             except Exception as e:
                 clear_status(message.chat.id)
-                handle_api_error(e, message.chat.id, msg_first.message_id, message, clean_model_name)
+                handle_api_error(message.chat.id, msg_first.message_id, clean_model_name)
             return
 
     ACTION_LOGS[CURRENT_CHAT_ID] = []
@@ -1290,16 +1315,11 @@ def handle_message(message):
             set_status(message.chat.id, status_text)
             
             if is_gemma:
-                response = chat_agent.send_message("Я текстовая модель Gemma и не умею слушать звук.")
-                if hasattr(response, 'usage_metadata'): track_token_usage(response.usage_metadata.total_token_count)
+                response = safe_send_message(chat_agent, message.chat.id, "Я текстовая модель Gemma и не умею слушать звук.", status_text)
             else:
                 base_prompt = "Прослушай этот аудиофайл. Если в нём звучит команда для сервера — выполни её. Если обычный разговор — ответь."
                 prompt = f"{text}\n\n{base_prompt}" if text else base_prompt
-                
-                check_api_rate_limit(message.chat.id, status_text)
-                response = chat_agent.send_message([audio_file, prompt])
-                if hasattr(response, 'usage_metadata'): track_token_usage(response.usage_metadata.total_token_count)
-                trim_chat_history(chat_agent)
+                response = safe_send_message(chat_agent, message.chat.id, [audio_file, prompt], status_text)
 
             os.remove(voice_path)
 
@@ -1314,43 +1334,33 @@ def handle_message(message):
             set_status(message.chat.id, status_text)
             
             if is_gemma:
-                response = chat_agent.send_message("Я текстовая модель Gemma и не умею смотреть картинки.")
-                if hasattr(response, 'usage_metadata'): track_token_usage(response.usage_metadata.total_token_count)
+                response = safe_send_message(chat_agent, message.chat.id, "Я текстовая модель Gemma и не умею смотреть картинки.", status_text)
             else:
                 prompt = text if text else "Проанализируй это изображение."
-                check_api_rate_limit(message.chat.id, status_text)
-                response = chat_agent.send_message([img_file, prompt])
-                if hasattr(response, 'usage_metadata'): track_token_usage(response.usage_metadata.total_token_count)
-                trim_chat_history(chat_agent)
+                response = safe_send_message(chat_agent, message.chat.id, [img_file, prompt], status_text)
 
             os.remove(photo_path)
 
         else:
-            check_api_rate_limit(message.chat.id, status_text)
-            
             if is_gemma and role == "admin":
                 react_sys = get_gemma_react_prompt(clean_model_name)
                 final_text = text + react_sys
-                response = chat_agent.send_message(final_text)
+                response = safe_send_message(chat_agent, message.chat.id, final_text, status_text)
                 
                 if hasattr(chat_agent, 'history') and len(chat_agent.history) >= 2:
                     chat_agent.history[-2].parts[0].text = text 
                 
-                if hasattr(response, 'usage_metadata'): track_token_usage(response.usage_metadata.total_token_count)
-                trim_chat_history(chat_agent) 
-                
             else:
-                response = chat_agent.send_message(text)
-                if hasattr(response, 'usage_metadata'): track_token_usage(response.usage_metadata.total_token_count)
-                trim_chat_history(chat_agent) 
+                response = safe_send_message(chat_agent, message.chat.id, text, status_text)
 
         parse_and_route_response(message.chat.id, response, msg_first.message_id, text)
 
     except Exception as e:
         clear_status(message.chat.id)
-        handle_api_error(e, message.chat.id, msg_first.message_id, message, clean_model_name)
+        handle_api_error(message.chat.id, msg_first.message_id, clean_model_name)
 
 if __name__ == '__main__':
     task.init_scheduler(execute_scheduled_task)
     print(f"AI-Админ запущен. Допущено админов: {len(ADMIN_IDS)}.")
     bot.polling(none_stop=True)
+                               
