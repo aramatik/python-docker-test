@@ -72,7 +72,15 @@ MODELS_FILE = "models.txt"
 MODEL_RPM_LIMITS = {}
 MODEL_RESTRICTED_KEYS = {} 
 MODEL_TPM_LIMITS = {}
+MODEL_RPD_LIMITS = {} # НОВОЕ: Лимиты запросов в день
 PRIORITY_MODELS = []
+
+# НОВОЕ: Трекер RPD по ключам и датам
+API_RPD_HISTORY = {
+    1: {"date": "", "usage": {}},
+    2: {"date": "", "usage": {}},
+    3: {"date": "", "usage": {}}
+}
 
 def load_prompts_config():
     global PROMPTS
@@ -95,15 +103,17 @@ def load_prompts_config():
         if current_key: PROMPTS[current_key] = "\n".join(current_text).strip()
 
 def load_models_config():
-    global PRIORITY_MODELS, MODEL_RPM_LIMITS, MODEL_RESTRICTED_KEYS, MODEL_TPM_LIMITS
+    global PRIORITY_MODELS, MODEL_RPM_LIMITS, MODEL_RESTRICTED_KEYS, MODEL_TPM_LIMITS, MODEL_RPD_LIMITS
     PRIORITY_MODELS.clear()
     MODEL_RPM_LIMITS.clear()
     MODEL_RESTRICTED_KEYS.clear()
     MODEL_TPM_LIMITS.clear()
+    MODEL_RPD_LIMITS.clear()
     
     if not os.path.exists(MODELS_FILE):
-        print(f"⚠️ Файл {MODELS_FILE} не найден! Создан пустой. Пожалуйста, заполните его.")
-        with open(MODELS_FILE, "w", encoding="utf-8") as f: f.write("")
+        print(f"⚠️ Файл {MODELS_FILE} не найден! Создан дефолтный.")
+        default_content = "gemini-2.5-flash-lite [RPM:10, TPM:250000, RPD:20, KEY:2,3]\n"
+        with open(MODELS_FILE, "w", encoding="utf-8") as f: f.write(default_content)
     
     with open(MODELS_FILE, "r", encoding="utf-8") as f:
         for line in f:
@@ -120,6 +130,9 @@ def load_models_config():
                 
                 tpm_match = re.search(r'TPM:(\d+)', line)
                 if tpm_match: MODEL_TPM_LIMITS[model_name] = int(tpm_match.group(1))
+                
+                rpd_match = re.search(r'RPD:(\d+)', line)
+                if rpd_match: MODEL_RPD_LIMITS[model_name] = int(rpd_match.group(1))
                     
                 key_match = re.search(r'KEY:([\d,]+)', line)
                 if key_match: MODEL_RESTRICTED_KEYS[model_name] = [int(k) for k in key_match.group(1).split(',') if k.isdigit()]
@@ -162,16 +175,32 @@ def track_token_usage(token_count):
     global CURRENT_KEY_NUM
     if token_count: API_TOKEN_HISTORY[CURRENT_KEY_NUM].append((time.time(), token_count))
 
-def check_api_rate_limit(chat_id, current_status_text):
-    global CURRENT_MODEL, CURRENT_KEY_NUM
-    if not CURRENT_MODEL: return
+def check_api_rate_limit(chat_id, current_status_text, model_name=None):
+    global CURRENT_KEY_NUM
+    
+    if model_name is None: model_name = CURRENT_MODEL
+    if not model_name: return
 
-    clean_name = CURRENT_MODEL.replace('models/', '')
+    clean_name = model_name.replace('models/', '')
     
     rpm_limit = MODEL_RPM_LIMITS.get(clean_name)
     tpm_limit = MODEL_TPM_LIMITS.get(clean_name)
+    rpd_limit = MODEL_RPD_LIMITS.get(clean_name)
     
     now = time.time()
+    
+    # ПРОВЕРКА И ОБНОВЛЕНИЕ ДНЕВНОГО ЛИМИТА (RPD) по UTC
+    today_str = datetime.utcnow().strftime("%Y-%m-%d")
+    key_data = API_RPD_HISTORY[CURRENT_KEY_NUM]
+    
+    if key_data["date"] != today_str:
+        key_data["date"] = today_str
+        key_data["usage"] = {}
+        
+    if rpd_limit:
+        current_rpd = key_data["usage"].get(clean_name, 0)
+        if current_rpd >= rpd_limit:
+            raise Exception(f"RPD_LIMIT_REACHED|{clean_name}|{rpd_limit}")
     
     if rpm_limit:
         history_rpm = API_REQUEST_HISTORY.setdefault(CURRENT_KEY_NUM, deque())
@@ -196,7 +225,9 @@ def check_api_rate_limit(chat_id, current_status_text):
                 if chat_id: set_status(chat_id, current_status_text)
                 now = time.time()
 
+    # Фиксируем успешный запрос в счетчиках
     API_REQUEST_HISTORY[CURRENT_KEY_NUM].append(now)
+    key_data["usage"][clean_name] = key_data["usage"].get(clean_name, 0) + 1
 
 # ─────────────────────────────────────────────
 #  ФУНКЦИИ ВЫВОДА
@@ -378,6 +409,7 @@ def get_models_lists():
             clean_best_match = best_match.replace('models/', '')
             if p in MODEL_RPM_LIMITS: MODEL_RPM_LIMITS[clean_best_match] = MODEL_RPM_LIMITS[p]
             if p in MODEL_TPM_LIMITS: MODEL_TPM_LIMITS[clean_best_match] = MODEL_TPM_LIMITS[p]
+            if p in MODEL_RPD_LIMITS: MODEL_RPD_LIMITS[clean_best_match] = MODEL_RPD_LIMITS[p]
             if p in MODEL_RESTRICTED_KEYS: MODEL_RESTRICTED_KEYS[clean_best_match] = MODEL_RESTRICTED_KEYS[p]
 
     for m in raw_models:
@@ -444,6 +476,13 @@ def init_models(model_name, role="admin", mode="auto"):
 def handle_api_error(e, chat_id, message_id, original_message, clean_model_name):
     error_text = str(e)
     
+    if "RPD_LIMIT_REACHED" in error_text:
+        parts = error_text.split("|")
+        mod_name = parts[1] if len(parts) > 1 else clean_model_name
+        limit = parts[2] if len(parts) > 2 else "?"
+        safe_edit_message(chat_id, message_id, f"⚠️ <b>Дневной лимит исчерпан!</b>\n\nМодель <code>{mod_name}</code> достигла лимита в {limit} RPD на текущем ключе (KEY {CURRENT_KEY_NUM}).\nСмените ключ (/changekey) или выберите другую модель.", reply_markup=get_models_keyboard())
+        return
+    
     if "function response turn comes immediately after a function call" in error_text:
         global chat_agent
         if chat_agent:
@@ -462,13 +501,34 @@ def handle_api_error(e, chat_id, message_id, original_message, clean_model_name)
     else:
         safe_edit_message(chat_id, message_id, f"❌ Ошибка ИИ: {html.escape(error_text)}")
 
-def trim_chat_history(agent):
-    MAX_HISTORY = 6
-    if not hasattr(agent, 'history') or len(agent.history) <= MAX_HISTORY:
+def trim_chat_history(agent, model_name=None):
+    """
+    Умная обрезка истории в зависимости от лимита TPM конкретной модели.
+    """
+    if not model_name: 
+        model_name = CURRENT_MODEL
+    if not model_name: 
         return
         
-    cut_idx = len(agent.history) - MAX_HISTORY
+    clean_name = model_name.replace('models/', '')
+    tpm_limit = MODEL_TPM_LIMITS.get(clean_name, 15000) # По умолчанию консервативно
     
+    # Вычисляем безопасный размер памяти (1 ответ ~ 500-1000 токенов в контексте)
+    if tpm_limit >= 200000:
+        max_history = 40
+    elif tpm_limit >= 100000:
+        max_history = 20
+    elif tpm_limit >= 30000:
+        max_history = 10
+    else:
+        max_history = 6
+        
+    if not hasattr(agent, 'history') or len(agent.history) <= max_history:
+        return
+        
+    cut_idx = len(agent.history) - max_history
+    
+    # Ищем безопасное место для разреза (не разбивая пару call->response)
     while cut_idx < len(agent.history):
         msg = agent.history[cut_idx]
         if msg.role == 'user':
@@ -497,10 +557,8 @@ def get_gemma_react_prompt(clean_model_name):
 def execute_scheduled_task(chat_id, prompt, model_name, task_id):
     """Эта функция вызывается модулем task.py по расписанию CRON."""
     try:
-        # 1. Создаем первичное якорное сообщение-заглушку (сюда потом запишем ответ)
         msg_first = bot.send_message(chat_id, f"⏰ <b>Запуск фоновой задачи:</b> <code>{task_id}</code>", parse_mode='HTML')
         
-        # 2. Выводим статус "шестеренки", чтобы показать, что процесс пошел
         status_text = "🤖 <b>Выполняю фоновую задачу...</b>"
         set_status(chat_id, status_text)
         
@@ -527,26 +585,22 @@ def execute_scheduled_task(chat_id, prompt, model_name, task_id):
         global CURRENT_CHAT_ID
         CURRENT_CHAT_ID = chat_id
         
-        # Сбрасываем лог действий конкретно для этого запуска
         ACTION_LOGS[chat_id] = []
         
-        check_api_rate_limit(chat_id, status_text)
+        check_api_rate_limit(chat_id, status_text, model_name)
         response = task_chat.send_message(prompt)
         
         if hasattr(response, 'usage_metadata'): 
             track_token_usage(response.usage_metadata.total_token_count)
             
-        # 3. Задача завершена — удаляем статус "шестеренки"
         clear_status(chat_id)
         
-        # 4. Прикрепляем инлайн-кнопку "Выполненные действия"
         markup = None
         if ACTION_LOGS.get(chat_id):
             LAST_ACTIONS[msg_first.message_id] = ACTION_LOGS[chat_id].copy()
             markup = InlineKeyboardMarkup()
             markup.add(InlineKeyboardButton("🛠 Выполненные действия", callback_data=f"show_acts_{msg_first.message_id}"))
         
-        # 5. Вклеиваем ответ ИИ в наше самое первое сообщение с нужным заголовком
         prefix = f"⏰ <b>Запуск фоновой задачи:</b> <code>{task_id}</code>\n\n"
         send_long_text(chat_id, response.text, first_msg_id=msg_first.message_id, prefix=prefix, reply_markup=markup)
         
@@ -578,6 +632,7 @@ def send_help(message):
         "🔸 /help — Показать эту справку\n"
         "🔸 /gemini — Выбрать активную модель ИИ\n"
         "🔸 /changekey — Сменить текущий API-ключ Gemini\n"
+        "🔸 /status — Посмотреть загрузку лимитов (RPM, TPM, RPD)\n"
         "🔸 /reload — Перезагрузить конфиги (models.txt, prompts.txt)\n"
         "🔸 /voice — Управление голосовыми ответами (Вкл/Выкл)\n"
         "🔸 /clear — Очистить память (контекст) текущей модели\n"
@@ -590,6 +645,17 @@ def send_help(message):
         "<code>#запрос</code> — Выполнить запрос через ИИ-советника (вернет только команду)"
     )
     bot.reply_to(message, help_text, parse_mode='HTML')
+
+@bot.message_handler(commands=['status'])
+def status_cmd(message):
+    if message.from_user.id not in ADMIN_IDS: return
+    markup = InlineKeyboardMarkup()
+    markup.add(
+        InlineKeyboardButton(text="🔑 KEY 1" + (" (Текущий)" if CURRENT_KEY_NUM == 1 else ""), callback_data="status_key_1"),
+        InlineKeyboardButton(text="🔑 KEY 2" + (" (Текущий)" if CURRENT_KEY_NUM == 2 else ""), callback_data="status_key_2"),
+        InlineKeyboardButton(text="🔑 KEY 3" + (" (Текущий)" if CURRENT_KEY_NUM == 3 else ""), callback_data="status_key_3")
+    )
+    bot.reply_to(message, "📊 Выберите ключ для просмотра статистики:", reply_markup=markup)
 
 @bot.message_handler(commands=['gemini'])
 def change_model(message):
@@ -887,6 +953,43 @@ def handle_query(call):
     global CURRENT_CHAT_ID, MODEL_ROLE, MODEL_MODE, PENDING_ACTION
     data = call.data
 
+    # Обработка меню /status
+    if data.startswith("status_key_"):
+        key_num = int(data.split("_")[2])
+        
+        now = time.time()
+        history_rpm = API_REQUEST_HISTORY[key_num]
+        valid_rpm = [t for t in history_rpm if now - t <= 60.5]
+        
+        history_tpm = API_TOKEN_HISTORY[key_num]
+        valid_tpm = sum(count for t, count in history_tpm if now - t <= 60.5)
+        
+        today_str = datetime.utcnow().strftime("%Y-%m-%d")
+        key_data = API_RPD_HISTORY[key_num]
+        if key_data["date"] != today_str:
+            key_data["date"] = today_str
+            key_data["usage"] = {}
+            
+        text = f"📊 <b>Статистика KEY {key_num}</b>\n\n"
+        text += f"⚡ <b>Текущая нагрузка (за 1 мин):</b>\n"
+        text += f"• Запросов (RPM): {len(valid_rpm)}\n"
+        text += f"• Токенов (TPM): ~{valid_tpm}\n\n"
+        
+        text += f"📅 <b>Использование за день (RPD) [UTC]:</b>\n"
+        if not key_data["usage"]:
+            text += "<i>Нет данных за сегодня.</i>\n"
+        else:
+            for mod, count in key_data["usage"].items():
+                limit = MODEL_RPD_LIMITS.get(mod, '∞')
+                text += f"• <code>{mod}</code>: {count} / {limit}\n"
+                
+        markup = InlineKeyboardMarkup()
+        markup.add(InlineKeyboardButton("🔄 Обновить", callback_data=f"status_key_{key_num}"))
+        
+        try: bot.edit_message_text(text, call.message.chat.id, call.message.message_id, parse_mode='HTML', reply_markup=markup)
+        except Exception: pass
+        return
+
     if data in ["search_type_regular", "search_type_archive"]:
         search_type = "archive" if "archive" in data else "regular"
         try: bot.delete_message(call.message.chat.id, call.message.message_id)
@@ -1119,6 +1222,7 @@ def handle_message(message):
         elif cmd == '/clear': clear_cmd(message)
         elif cmd == '/gemini': change_model(message)
         elif cmd == '/changekey': change_key_cmd(message)
+        elif cmd == '/status': status_cmd(message)
         elif cmd == '/reload': reload_configs_cmd(message)
         elif cmd == '/help': send_help(message)
         elif cmd == '/task': task_cmd(message)
