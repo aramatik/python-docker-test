@@ -191,8 +191,13 @@ def set_status(chat_id, text: str, show_abort=False):
         try:
             bot.edit_message_text(chat_id=chat_id, message_id=msg_id, text=text, parse_mode='HTML', reply_markup=markup)
             return
-        except:
-            STATUS_MSG.pop(chat_id, None)
+        except Exception as e:
+            err_str = str(e).lower()
+            # Умный фильтр: если сообщение не изменилось или Телеграм временно ограничил нас, мы НЕ забываем ID
+            if "is not modified" in err_str or "retry after" in err_str or "too many requests" in err_str:
+                return
+            else:
+                STATUS_MSG.pop(chat_id, None)
     try:
         msg = bot.send_message(chat_id, text, parse_mode='HTML', reply_markup=markup)
         STATUS_MSG[chat_id] = msg.message_id
