@@ -12,6 +12,7 @@ import time
 import json
 from collections import deque
 from datetime import datetime
+from zoneinfo import ZoneInfo
 
 # Импортируем наши внешние модули
 from markdown import split_text_safely, md_to_html
@@ -103,7 +104,8 @@ def load_limits_state():
         except Exception as e: 
             print(f"Ошибка загрузки лимитов: {e}")
     
-    today_str = datetime.utcnow().strftime("%Y-%m-%d")
+    # Дата по тихоокеанскому времени (PT)
+    today_str = datetime.now(ZoneInfo("America/Los_Angeles")).strftime("%Y-%m-%d")
     for i in [1, 2, 3]:
         if i not in API_RPD_HISTORY or API_RPD_HISTORY[i].get("date") != today_str:
             API_RPD_HISTORY[i] = {"date": today_str, "usage": {}}
@@ -193,7 +195,6 @@ def set_status(chat_id, text: str, show_abort=False):
             return
         except Exception as e:
             err_str = str(e).lower()
-            # Умный фильтр: если сообщение не изменилось или Телеграм временно ограничил нас, мы НЕ забываем ID
             if "is not modified" in err_str or "retry after" in err_str or "too many requests" in err_str:
                 return
             else:
@@ -224,7 +225,8 @@ def check_api_rate_limit(chat_id, current_status_text, model_name=None):
     rpd_limit = MODEL_RPD_LIMITS.get(clean_name)
     now = time.time()
     
-    today_str = datetime.utcnow().strftime("%Y-%m-%d")
+    # Дата по тихоокеанскому времени (PT)
+    today_str = datetime.now(ZoneInfo("America/Los_Angeles")).strftime("%Y-%m-%d")
     key_data = API_RPD_HISTORY[CURRENT_KEY_NUM]
     
     if key_data["date"] != today_str:
@@ -277,7 +279,8 @@ def switch_api_key(chat_id, reason):
         
         rpd_limit = MODEL_RPD_LIMITS.get(clean_name)
         if rpd_limit:
-            today_str = datetime.utcnow().strftime("%Y-%m-%d")
+            # Дата по тихоокеанскому времени (PT)
+            today_str = datetime.now(ZoneInfo("America/Los_Angeles")).strftime("%Y-%m-%d")
             key_data = API_RPD_HISTORY.get(next_key, {"date": today_str, "usage": {}})
             if key_data["date"] == today_str and key_data["usage"].get(clean_name, 0) >= rpd_limit:
                 continue 
@@ -1077,7 +1080,7 @@ def handle_query(call):
         history_tpm = API_TOKEN_HISTORY[key_num]
         valid_tpm = sum(count for t, count in history_tpm if now - t <= 60.5)
         
-        today_str = datetime.utcnow().strftime("%Y-%m-%d")
+        today_str = datetime.now(ZoneInfo("America/Los_Angeles")).strftime("%Y-%m-%d")
         key_data = API_RPD_HISTORY.get(key_num, {"date": today_str, "usage": {}})
         if key_data["date"] != today_str:
             key_data["date"] = today_str
@@ -1088,7 +1091,7 @@ def handle_query(call):
         text += f"• API Запросов (RPM): {len(valid_rpm)}\n"
         text += f"• Токенов (TPM): ~{valid_tpm}\n\n"
         
-        text += f"📅 <b>Использование за день (RPD) [UTC]:</b>\n"
+        text += f"📅 <b>Использование за день (RPD) [PT]:</b>\n"
         if not key_data["usage"]:
             text += "<i>Нет данных за сегодня.</i>\n"
         else:
