@@ -818,7 +818,7 @@ def task_cmd(message):
     msg_wait = bot.send_message(message.chat.id, "🧠 <i>Анализирую расписание...</i>", parse_mode='HTML')
     
     try:
-        now_str = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
+        now_str = datetime.now(ZoneInfo("America/Los_Angeles")).strftime("%Y-%m-%d %H:%M:%S PT")
         parse_prompt = (
             "Convert the user's task request into a standard CRON expression and a clear system prompt for an AI agent. "
             "Return ONLY a raw JSON object with keys 'cron' and 'prompt'. No markdown formatting, no comments. "
@@ -1208,7 +1208,7 @@ def handle_query(call):
         key_num = int(data.split("_")[1])
         target_key = API_KEY_1 if key_num == 1 else (API_KEY_2 if key_num == 2 else API_KEY_3)
         if not target_key:
-            bot.answer_callback_query(call.id, f"❌ KEY {key_num} не задан!", show_alert=True)
+            bot.answer_callback_query(call.id, f"❌ KEY {key_num} type= не задан!", show_alert=True)
             return
         CURRENT_KEY_NUM = key_num
         genai.configure(api_key=target_key)
@@ -1219,7 +1219,6 @@ def handle_query(call):
         return
 
     if data.startswith("mod_"):
-        global CURRENT_MODEL
         CURRENT_MODEL = data.replace("mod_", "")
         clean_name = CURRENT_MODEL.replace('models/', '')
         try: bot.delete_message(call.message.chat.id, call.message.message_id)
