@@ -104,7 +104,6 @@ def load_limits_state():
         except Exception as e: 
             print(f"Ошибка загрузки лимитов: {e}")
     
-    # Дата по тихоокеанскому времени (PT)
     today_str = datetime.now(ZoneInfo("America/Los_Angeles")).strftime("%Y-%m-%d")
     for i in [1, 2, 3]:
         if i not in API_RPD_HISTORY or API_RPD_HISTORY[i].get("date") != today_str:
@@ -225,7 +224,6 @@ def check_api_rate_limit(chat_id, current_status_text, model_name=None):
     rpd_limit = MODEL_RPD_LIMITS.get(clean_name)
     now = time.time()
     
-    # Дата по тихоокеанскому времени (PT)
     today_str = datetime.now(ZoneInfo("America/Los_Angeles")).strftime("%Y-%m-%d")
     key_data = API_RPD_HISTORY[CURRENT_KEY_NUM]
     
@@ -279,7 +277,6 @@ def switch_api_key(chat_id, reason):
         
         rpd_limit = MODEL_RPD_LIMITS.get(clean_name)
         if rpd_limit:
-            # Дата по тихоокеанскому времени (PT)
             today_str = datetime.now(ZoneInfo("America/Los_Angeles")).strftime("%Y-%m-%d")
             key_data = API_RPD_HISTORY.get(next_key, {"date": today_str, "usage": {}})
             if key_data["date"] == today_str and key_data["usage"].get(clean_name, 0) >= rpd_limit:
@@ -592,6 +589,7 @@ def init_models(model_name, role="admin", mode="auto"):
         )
 
 def trim_chat_history(agent, model_name=None):
+    """Обрезает историю, гарантируя сохранение валидной последовательности."""
     if not model_name: model_name = CURRENT_MODEL
     if not model_name: return
         
@@ -607,6 +605,7 @@ def trim_chat_history(agent, model_name=None):
         return
         
     cut_idx = len(agent.history) - max_history
+    safe_idx = -1
     
     while cut_idx < len(agent.history):
         msg = agent.history[cut_idx]
@@ -617,11 +616,12 @@ def trim_chat_history(agent, model_name=None):
                     is_function_response = True
                     break
             if not is_function_response:
+                safe_idx = cut_idx
                 break 
         cut_idx += 1
         
-    if cut_idx < len(agent.history):
-        agent.history = agent.history[cut_idx:]
+    if safe_idx != -1:
+        agent.history = agent.history[safe_idx:]
 
 def get_gemma_react_prompt(clean_model_name):
     sys_str = "\n\n" + PROMPTS.get("GEMMA4_ADMIN_REACT", "") if "gemma-4" in clean_model_name.lower() else "\n\n" + PROMPTS.get("GEMMA_ADMIN_REACT", "")
@@ -669,7 +669,7 @@ def execute_scheduled_task(chat_id, prompt, model_name, task_id):
         
         response = safe_send_message(task_chat, chat_id, prompt, status_text, model_name=model_name)
         
-        parse_and_route_response(task_chat, chat_id, response, msg_first.message_id, prompt, is_background=True)
+        parse_and_route_response(task_chat, chat_id, response, msg_first.message_id, prompt, is_background=True, model_name=model_name, task_id=task_id)
         
     except Exception as e:
         clear_status(chat_id)
@@ -901,18 +901,19 @@ def handle_document(message):
 #  ЕДИНЫЙ ПАРСЕР И МАРШРУТИЗАТОР ОТВЕТОВ
 # ─────────────────────────────────────────────
 
-def parse_and_route_response(agent, chat_id, response, first_msg_id, original_text, is_background=False):
+def parse_and_route_response(agent, chat_id, response, first_msg_id, original_text, is_background=False, model_name=None, task_id=None):
+    if not model_name: model_name = CURRENT_MODEL
+    clean_model_name = model_name.replace('models/', '') if model_name else ""
+
     if ABORT_FLAGS.get(chat_id):
-        clean_model_name = CURRENT_MODEL.replace('models/', '') if CURRENT_MODEL else ""
-        finish_response(chat_id, "🛑 <b>Выполнение принудительно остановлено.</b>", first_msg_id, clean_model_name)
+        finish_response(chat_id, "🛑 <b>Выполнение принудительно остановлено.</b>", first_msg_id, clean_model_name, is_background, task_id)
         return
 
-    clean_model_name = CURRENT_MODEL.replace('models/', '')
     is_gemma = "gemma" in clean_model_name.lower()
     role = MODEL_ROLE.get(chat_id, "admin")
     
     if role == "chat":
-        finish_response(chat_id, response.text, first_msg_id, clean_model_name)
+        finish_response(chat_id, response.text, first_msg_id, clean_model_name, is_background, task_id)
         return
 
     action = None
@@ -955,11 +956,11 @@ def parse_and_route_response(agent, chat_id, response, first_msg_id, original_te
     if action:
         action["msg_id"] = first_msg_id
         action["orig_text"] = original_text
-        process_action_request(agent, chat_id, action, is_background)
+        process_action_request(agent, chat_id, action, is_background, model_name, task_id)
     else:
-        finish_response(chat_id, response.text, first_msg_id, clean_model_name)
+        finish_response(chat_id, response.text, first_msg_id, clean_model_name, is_background, task_id)
 
-def finish_response(chat_id, text, msg_id, clean_model_name):
+def finish_response(chat_id, text, msg_id, clean_model_name, is_background=False, task_id=None):
     markup = None
     if ACTION_LOGS.get(chat_id):
         stats = TURN_STATS.get(chat_id, {"rpd": 0, "tpm": 0})
@@ -970,11 +971,20 @@ def finish_response(chat_id, text, msg_id, clean_model_name):
         markup = InlineKeyboardMarkup()
         markup.add(InlineKeyboardButton("🛠 Выполненные действия", callback_data=f"show_acts_{msg_id}"))
     
-    send_long_text(chat_id, text, first_msg_id=msg_id, prefix=f"<b>{clean_model_name}:</b>\n\n", reply_markup=markup)
-    if VOICE_MODE.get(chat_id): generate_and_send_voice(chat_id, text)
+    if is_background and task_id:
+        prefix = f"⏰ <b>Запуск фоновой задачи:</b> <code>{task_id}</code>\n\n<b>Отчет ({clean_model_name}):</b>\n\n"
+        used_actions = ACTION_LOGS.get(chat_id, [])
+        log_actions_str = ", ".join([f"{a[0]}: {str(a[1])[:30]}..." for a in used_actions]) if used_actions else "No tools used"
+        task.log_task_event(f"EXECUTE: Chat={chat_id} | ID={task_id} | Actions: [{log_actions_str}]")
+    else:
+        prefix = f"<b>{clean_model_name}:</b>\n\n"
+        
+    send_long_text(chat_id, text, first_msg_id=msg_id, prefix=prefix, reply_markup=markup)
+    if VOICE_MODE.get(chat_id) and not is_background: 
+        generate_and_send_voice(chat_id, text)
     clear_status(chat_id)
 
-def process_action_request(agent, chat_id, action, is_background=False):
+def process_action_request(agent, chat_id, action, is_background=False, model_name=None, task_id=None):
     mode = MODEL_MODE.get(chat_id, "semi")
     
     if action["name"] in ["sleep", "sleep_tool"]:
@@ -991,11 +1001,12 @@ def process_action_request(agent, chat_id, action, is_background=False):
         markup.row(InlineKeyboardButton("✅ Выполнить", callback_data=f"act_yes_{chat_id}"), InlineKeyboardButton("❌ Отмена", callback_data=f"act_no_{chat_id}"))
         bot.send_message(chat_id, f"🤖 <b>Запрос действия ИИ:</b>\n\n{action['disp_name']}:\n<code>{html.escape(action['disp_val'])}</code>", parse_mode='HTML', reply_markup=markup)
     else:
-        execute_pending_action(agent, chat_id, action, is_background)
+        execute_pending_action(agent, chat_id, action, is_background, model_name, task_id)
 
-def execute_pending_action(agent, chat_id, action, is_background=False):
+def execute_pending_action(agent, chat_id, action, is_background=False, model_name=None, task_id=None):
+    clean_model_name = model_name.replace('models/', '') if model_name else ""
     if ABORT_FLAGS.get(chat_id):
-        finish_response(chat_id, "🛑 <b>Выполнение принудительно остановлено.</b>\nНажмите кнопку ниже, чтобы посмотреть выполненные действия.", action["msg_id"], CURRENT_MODEL.replace('models/', ''))
+        finish_response(chat_id, "🛑 <b>Выполнение принудительно остановлено.</b>\nНажмите кнопку ниже, чтобы посмотреть выполненные действия.", action["msg_id"], clean_model_name, is_background, task_id)
         return
         
     res = "Нет результата."
@@ -1019,17 +1030,19 @@ def execute_pending_action(agent, chat_id, action, is_background=False):
         elif fn_name == "list_my_tasks_tool": res = list_my_tasks_tool()
         elif fn_name == "sleep_tool": res = sleep_tool(args.get("seconds", 5))
         
+    if not res: res = "Success (No output)"
+        
     status_text = "🧠 <b>Анализирую результат...</b>"
     set_status(chat_id, status_text, show_abort=True)
     
     if ABORT_FLAGS.get(chat_id):
-        finish_response(chat_id, f"🛑 <b>Выполнение принудительно остановлено.</b>\nПоследний инструмент ({action['name']}) отработал, но дальнейший анализ прерван.", action["msg_id"], CURRENT_MODEL.replace('models/', ''))
+        finish_response(chat_id, f"🛑 <b>Выполнение принудительно остановлено.</b>\nПоследний инструмент ({action['name']}) отработал, но дальнейший анализ прерван.", action["msg_id"], clean_model_name, is_background, task_id)
         return
     
     try:
         if action["type"] == "react":
             followup_prompt = f"РЕЗУЛЬТАТ ВЫПОЛНЕНИЯ ({action['name']}):\n{res}\nОсновываясь на этом, дай финальный ответ или вызови новый тег."
-            response = safe_send_message(agent, chat_id, followup_prompt, status_text)
+            response = safe_send_message(agent, chat_id, followup_prompt, status_text, model_name=model_name)
             if hasattr(agent, 'history') and len(agent.history) >= 2:
                 agent.history[-2].parts[0].text = f"[Система сообщила результат действия {action['name']}]"
                 
@@ -1038,12 +1051,14 @@ def execute_pending_action(agent, chat_id, action, is_background=False):
             if "all_calls" in action and len(action["all_calls"]) > 1:
                 for extra in action["all_calls"][1:]:
                     func_responses.append({"function_response": {"name": extra.name, "response": {"result": "Ignored. Execute ONE function at a time."}}})
-            response = safe_send_message(agent, chat_id, func_responses, status_text)
+            response = safe_send_message(agent, chat_id, func_responses, status_text, model_name=model_name)
             
-        parse_and_route_response(agent, chat_id, response, action["msg_id"], action["orig_text"], is_background)
+        parse_and_route_response(agent, chat_id, response, action["msg_id"], action["orig_text"], is_background, model_name, task_id)
     except Exception as e:
         clear_status(chat_id)
-        handle_api_error(e, chat_id, action["msg_id"], CURRENT_MODEL.replace('models/', ''))
+        handle_api_error(e, chat_id, action["msg_id"], clean_model_name)
+        if is_background and task_id:
+            task.log_task_event(f"ERROR: Task ID={task_id} failed: {e}")
 
 # ─────────────────────────────────────────────
 #  ОБРАБОТКА CALLBACKS (КНОПКИ)
@@ -1204,6 +1219,7 @@ def handle_query(call):
         return
 
     if data.startswith("mod_"):
+        global CURRENT_MODEL
         CURRENT_MODEL = data.replace("mod_", "")
         clean_name = CURRENT_MODEL.replace('models/', '')
         try: bot.delete_message(call.message.chat.id, call.message.message_id)
@@ -1216,7 +1232,7 @@ def handle_query(call):
     if data.startswith("role_"):
         role = data.replace("role_", "")
         MODEL_ROLE[call.message.chat.id] = role
-        clean_name = CURRENT_MODEL.replace('models/', '')
+        clean_name = CURRENT_MODEL.replace('models/', '') if CURRENT_MODEL else ""
         try: bot.delete_message(call.message.chat.id, call.message.message_id)
         except: pass
         
@@ -1233,7 +1249,7 @@ def handle_query(call):
     if data.startswith("mode_"):
         mode = data.replace("mode_", "")
         MODEL_MODE[call.message.chat.id] = mode
-        clean_name = CURRENT_MODEL.replace('models/', '')
+        clean_name = CURRENT_MODEL.replace('models/', '') if CURRENT_MODEL else ""
         init_models(CURRENT_MODEL, role="admin", mode=mode)
         try: bot.delete_message(call.message.chat.id, call.message.message_id)
         except: pass
@@ -1248,7 +1264,7 @@ def handle_query(call):
             return
         try: bot.delete_message(call.message.chat.id, call.message.message_id)
         except: pass
-        execute_pending_action(chat_agent, call.message.chat.id, action)
+        execute_pending_action(chat_agent, call.message.chat.id, action, is_background=False, model_name=CURRENT_MODEL)
         return
 
     if data.startswith("act_no_"):
@@ -1268,11 +1284,11 @@ def handle_query(call):
                     if "all_calls" in action and len(action["all_calls"]) > 1:
                         for extra in action["all_calls"][1:]:
                             func_responses.append({"function_response": {"name": extra.name, "response": {"result": "Ignored."}}})
-                    resp = safe_send_message(chat_agent, call.message.chat.id, func_responses, status_text)
-                parse_and_route_response(chat_agent, call.message.chat.id, resp, action["msg_id"], action["orig_text"])
+                    resp = safe_send_message(chat_agent, call.message.chat.id, func_responses, status_text, model_name=CURRENT_MODEL)
+                parse_and_route_response(chat_agent, call.message.chat.id, resp, action["msg_id"], action["orig_text"], is_background=False, model_name=CURRENT_MODEL)
             except Exception as e:
                 clear_status(call.message.chat.id)
-                handle_api_error(e, call.message.chat.id, action["msg_id"], CURRENT_MODEL.replace('models/', ''))
+                handle_api_error(e, call.message.chat.id, action["msg_id"], CURRENT_MODEL.replace('models/', '') if CURRENT_MODEL else "")
         return
 
     if data in ["file_yes", "file_no", "file_ai"]:
@@ -1321,11 +1337,11 @@ def handle_query(call):
                 gemini_file = genai.upload_file(path=temp_file_name, mime_type=mime) if mime else genai.upload_file(path=temp_file_name)
 
                 if is_gemma:
-                    response = safe_send_message(chat_agent, call.message.chat.id, "Я текстовая модель Gemma, я пока не умею читать файлы напрямую.", status_text)
-                    parse_and_route_response(chat_agent, call.message.chat.id, response, call.message.message_id, "file")
+                    response = safe_send_message(chat_agent, call.message.chat.id, "Я текстовая модель Gemma, я пока не умею читать файлы напрямую.", status_text, model_name=CURRENT_MODEL)
+                    parse_and_route_response(chat_agent, call.message.chat.id, response, call.message.message_id, "file", is_background=False, model_name=CURRENT_MODEL)
                 else:
-                    response = safe_send_message(chat_agent, call.message.chat.id, [gemini_file, "Проанализируй этот файл. Расскажи, что в нём, либо выполни инструкции."], status_text)
-                    parse_and_route_response(chat_agent, call.message.chat.id, response, call.message.message_id, "file")
+                    response = safe_send_message(chat_agent, call.message.chat.id, [gemini_file, "Проанализируй этот файл. Расскажи, что в нём, либо выполни инструкции."], status_text, model_name=CURRENT_MODEL)
+                    parse_and_route_response(chat_agent, call.message.chat.id, response, call.message.message_id, "file", is_background=False, model_name=CURRENT_MODEL)
                 os.remove(temp_file_name)
 
             except Exception as e:
@@ -1398,7 +1414,7 @@ def handle_message(message):
             CONSECUTIVE_SLEEPS[message.chat.id] = 0
             
             try:
-                response = safe_send_message(model_advisor, message.chat.id, task_cmd, status_text, is_advisor=True)
+                response = safe_send_message(model_advisor, message.chat.id, task_cmd, status_text, is_advisor=True, model_name=CURRENT_MODEL)
                 clear_status(message.chat.id)
                 send_long_text(message.chat.id, response.text, first_msg_id=msg_first.message_id, is_code=True)
             except Exception as e:
@@ -1427,11 +1443,11 @@ def handle_message(message):
             set_status(message.chat.id, status_text, show_abort=True)
             
             if is_gemma:
-                response = safe_send_message(chat_agent, message.chat.id, "Я текстовая модель Gemma и не умею слушать звук.", status_text)
+                response = safe_send_message(chat_agent, message.chat.id, "Я текстовая модель Gemma и не умею слушать звук.", status_text, model_name=CURRENT_MODEL)
             else:
                 base_prompt = "Прослушай этот аудиофайл. Если в нём звучит команда для сервера — выполни её. Если обычный разговор — ответь."
                 prompt = f"{text}\n\n{base_prompt}" if text else base_prompt
-                response = safe_send_message(chat_agent, message.chat.id, [audio_file, prompt], status_text)
+                response = safe_send_message(chat_agent, message.chat.id, [audio_file, prompt], status_text, model_name=CURRENT_MODEL)
 
             os.remove(voice_path)
 
@@ -1446,10 +1462,10 @@ def handle_message(message):
             set_status(message.chat.id, status_text, show_abort=True)
             
             if is_gemma:
-                response = safe_send_message(chat_agent, message.chat.id, "Я текстовая модель Gemma и не умею смотреть картинки.", status_text)
+                response = safe_send_message(chat_agent, message.chat.id, "Я текстовая модель Gemma и не умею смотреть картинки.", status_text, model_name=CURRENT_MODEL)
             else:
                 prompt = text if text else "Проанализируй это изображение."
-                response = safe_send_message(chat_agent, message.chat.id, [img_file, prompt], status_text)
+                response = safe_send_message(chat_agent, message.chat.id, [img_file, prompt], status_text, model_name=CURRENT_MODEL)
 
             os.remove(photo_path)
 
@@ -1457,15 +1473,15 @@ def handle_message(message):
             if is_gemma and role == "admin":
                 react_sys = get_gemma_react_prompt(clean_model_name)
                 final_text = text + react_sys
-                response = safe_send_message(chat_agent, message.chat.id, final_text, status_text)
+                response = safe_send_message(chat_agent, message.chat.id, final_text, status_text, model_name=CURRENT_MODEL)
                 
                 if hasattr(chat_agent, 'history') and len(chat_agent.history) >= 2:
                     chat_agent.history[-2].parts[0].text = text 
                 
             else:
-                response = safe_send_message(chat_agent, message.chat.id, text, status_text)
+                response = safe_send_message(chat_agent, message.chat.id, text, status_text, model_name=CURRENT_MODEL)
 
-        parse_and_route_response(chat_agent, message.chat.id, response, msg_first.message_id, text, is_background=False)
+        parse_and_route_response(chat_agent, message.chat.id, response, msg_first.message_id, text, is_background=False, model_name=CURRENT_MODEL)
 
     except Exception as e:
         clear_status(message.chat.id)
