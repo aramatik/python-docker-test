@@ -13,7 +13,6 @@ import json
 import base64
 import wave
 import requests
-import io
 from collections import deque
 from datetime import datetime
 from zoneinfo import ZoneInfo
@@ -124,6 +123,7 @@ def load_limits_state():
             API_RPD_HISTORY[i] = {"date": today_str, "usage": {}}
 
 def save_limits_state():
+    global API_RPD_HISTORY
     os.makedirs(os.path.dirname(LIMITS_STATE_FILE), exist_ok=True)
     try:
         with open(LIMITS_STATE_FILE, "w", encoding="utf-8") as f:
@@ -218,17 +218,18 @@ def set_status(chat_id, text: str, show_abort=False):
     except: pass
 
 def clear_status(chat_id):
+    global STATUS_MSG
     msg_id = STATUS_MSG.pop(chat_id, None)
     if msg_id:
         try: bot.delete_message(chat_id, msg_id)
         except: pass
 
 def track_token_usage(token_count):
-    global CURRENT_KEY_NUM
+    global CURRENT_KEY_NUM, API_TOKEN_HISTORY
     if token_count: API_TOKEN_HISTORY[CURRENT_KEY_NUM].append((time.time(), token_count))
 
 def check_api_rate_limit(chat_id, current_status_text, model_name=None):
-    global CURRENT_KEY_NUM
+    global CURRENT_KEY_NUM, CURRENT_MODEL, MODEL_RPM_LIMITS, MODEL_TPM_LIMITS, MODEL_RPD_LIMITS, API_RPD_HISTORY, API_REQUEST_HISTORY, API_TOKEN_HISTORY
     if model_name is None: model_name = CURRENT_MODEL
     if not model_name: return
 
@@ -278,7 +279,7 @@ def check_api_rate_limit(chat_id, current_status_text, model_name=None):
     save_limits_state() 
 
 def switch_api_key(chat_id, reason):
-    global CURRENT_KEY_NUM, CURRENT_MODEL
+    global CURRENT_KEY_NUM, CURRENT_MODEL, MODEL_RPD_LIMITS, API_RPD_HISTORY, API_KEY_1, API_KEY_2, API_KEY_3
     old_key = CURRENT_KEY_NUM
     keys = [1, 2, 3]
     idx = keys.index(old_key)
@@ -305,6 +306,7 @@ def switch_api_key(chat_id, reason):
     return False
 
 def safe_send_message(agent, chat_id, prompt_or_parts, status_text="🤖 <b>Обрабатываю запрос...</b>", is_advisor=False, model_name=None):
+    global CURRENT_KEY_NUM, TURN_STATS
     max_retries = 3
     for attempt in range(max_retries):
         try:
@@ -349,8 +351,7 @@ def safe_send_message(agent, chat_id, prompt_or_parts, status_text="🤖 <b>Об
     raise Exception("Превышено количество попыток переключения ключей.")
 
 def safe_tts_request_raw(chat_id, text, voice_name, status_text):
-    """Выполняет REST запрос к TTS и возвращает чистые PCM байты для правильной склейки."""
-    global CURRENT_KEY_NUM, CURRENT_MODEL
+    global CURRENT_KEY_NUM, CURRENT_MODEL, TURN_STATS, API_KEY_1, API_KEY_2, API_KEY_3
     model_name = CURRENT_MODEL.replace('models/', '') if CURRENT_MODEL else ""
     
     max_retries = 3
@@ -390,12 +391,11 @@ def safe_tts_request_raw(chat_id, text, voice_name, status_text):
             audio_b64 = part["inlineData"]["data"]
             audio_bytes = base64.b64decode(audio_b64)
             
-            # ВАЖНО: Gemini отдает WAV с заголовком. Вскрываем и достаем чистый звук!
             try:
+                import io
                 with wave.open(io.BytesIO(audio_bytes), 'rb') as wf:
                     pcm_bytes = wf.readframes(wf.getnframes())
             except Exception:
-                # Фолбэк на случай, если пришел чистый PCM
                 if audio_bytes.startswith(b'RIFF'):
                     pcm_bytes = audio_bytes[44:]
                 else:
@@ -512,6 +512,7 @@ def generate_and_send_voice(chat_id, text):
 # ─────────────────────────────────────────────
 
 def execute_bash(command: str) -> str:
+    global CURRENT_CHAT_ID, ACTION_LOGS
     if CURRENT_CHAT_ID:
         ACTION_LOGS.setdefault(CURRENT_CHAT_ID, []).append(("bash", command))
         short_cmd = command if len(command) <= 80 else command[:77] + "…"
@@ -524,6 +525,7 @@ def execute_bash(command: str) -> str:
     except Exception as e: return f"Ошибка: {str(e)}"
 
 def search_web_tool(query: str) -> str:
+    global CURRENT_CHAT_ID, ACTION_LOGS
     if CURRENT_CHAT_ID:
         ACTION_LOGS.setdefault(CURRENT_CHAT_ID, []).append(("search", query))
         short_q = query if len(query) <= 80 else query[:77] + "…"
@@ -532,6 +534,7 @@ def search_web_tool(query: str) -> str:
     return web_search.search_web(query)
 
 def download_file_tool(url: str) -> str:
+    global CURRENT_CHAT_ID, ACTION_LOGS
     if CURRENT_CHAT_ID:
         ACTION_LOGS.setdefault(CURRENT_CHAT_ID, []).append(("download", url))
         short_url = url if len(url) <= 70 else url[:67] + "…"
@@ -540,7 +543,7 @@ def download_file_tool(url: str) -> str:
     return web_search.download_file_tool(url)
 
 def send_file_to_telegram(filepath: str) -> str:
-    global CURRENT_CHAT_ID
+    global CURRENT_CHAT_ID, ACTION_LOGS
     if CURRENT_CHAT_ID:
         ACTION_LOGS.setdefault(CURRENT_CHAT_ID, []).append(("file", filepath))
         short_path = os.path.basename(filepath)
@@ -554,7 +557,7 @@ def send_file_to_telegram(filepath: str) -> str:
     except Exception as e: return f"Ошибка отправки файла: {str(e)}"
 
 def delete_scheduled_task_tool(task_id: str) -> str:
-    global CURRENT_CHAT_ID
+    global CURRENT_CHAT_ID, ACTION_LOGS
     if not CURRENT_CHAT_ID: return "Error: Chat ID unknown."
     ACTION_LOGS.setdefault(CURRENT_CHAT_ID, []).append(("delete_task", task_id))
     if task.delete_task(CURRENT_CHAT_ID, task_id, deleted_by="AI_AGENT"):
@@ -562,7 +565,7 @@ def delete_scheduled_task_tool(task_id: str) -> str:
     return f"Error: Task {task_id} not found or already deleted."
 
 def list_my_tasks_tool() -> str:
-    global CURRENT_CHAT_ID
+    global CURRENT_CHAT_ID, ACTION_LOGS
     if not CURRENT_CHAT_ID: return "Error: Chat ID unknown."
     ACTION_LOGS.setdefault(CURRENT_CHAT_ID, []).append(("list_tasks", "all"))
     tasks = task.get_all_tasks(CURRENT_CHAT_ID)
@@ -572,7 +575,7 @@ def list_my_tasks_tool() -> str:
     return res
 
 def sleep_tool(seconds) -> str:
-    global CURRENT_CHAT_ID
+    global CURRENT_CHAT_ID, ACTION_LOGS, ABORT_FLAGS
     try:
         sec_val = int(float(seconds))
     except:
@@ -595,6 +598,7 @@ def sleep_tool(seconds) -> str:
 # ─────────────────────────────────────────────
 
 def get_models_lists():
+    global PRIORITY_MODELS, CURRENT_KEY_NUM, MODEL_RESTRICTED_KEYS, MODEL_RPM_LIMITS, MODEL_TPM_LIMITS, MODEL_RPD_LIMITS
     raw_models = [m.name for m in genai.list_models() if 'generateContent' in m.supported_generation_methods]
     priority, other, used_models = [], [], set()
 
@@ -630,7 +634,7 @@ def get_models_lists():
     return priority, other
 
 def get_models_keyboard(show_all=False):
-    global PRIORITY_MODELS_CACHE, OTHER_MODELS_CACHE, AVAILABLE_MODELS
+    global PRIORITY_MODELS_CACHE, OTHER_MODELS_CACHE, AVAILABLE_MODELS, MODEL_RPM_LIMITS
     if not PRIORITY_MODELS_CACHE and not OTHER_MODELS_CACHE:
         PRIORITY_MODELS_CACHE, OTHER_MODELS_CACHE = get_models_lists()
         AVAILABLE_MODELS = PRIORITY_MODELS_CACHE + OTHER_MODELS_CACHE
@@ -654,7 +658,7 @@ def get_models_keyboard(show_all=False):
     return markup
 
 def init_models(model_name, role="admin", mode="auto"):
-    global chat_agent, model_advisor
+    global chat_agent, model_advisor, PROMPTS
     is_gemma = "gemma" in model_name.lower()
 
     if is_gemma:
@@ -683,7 +687,7 @@ def init_models(model_name, role="admin", mode="auto"):
         )
 
 def trim_chat_history(agent, model_name=None):
-    """Обрезает историю, гарантируя сохранение валидной последовательности."""
+    global CURRENT_MODEL, MODEL_TPM_LIMITS
     if not model_name: model_name = CURRENT_MODEL
     if not model_name: return
         
@@ -718,6 +722,7 @@ def trim_chat_history(agent, model_name=None):
         agent.history = agent.history[safe_idx:]
 
 def get_gemma_react_prompt(clean_model_name):
+    global PROMPTS
     sys_str = "\n\n" + PROMPTS.get("GEMMA4_ADMIN_REACT", "") if "gemma-4" in clean_model_name.lower() else "\n\n" + PROMPTS.get("GEMMA_ADMIN_REACT", "")
     if "<SLEEP>" not in sys_str:
         sys_str += "\nЕсли нужно подождать, напиши <SLEEP>секунды</SLEEP>."
@@ -728,6 +733,7 @@ def get_gemma_react_prompt(clean_model_name):
 # ─────────────────────────────────────────────
 
 def execute_scheduled_task(chat_id, prompt, model_name, task_id):
+    global ABORT_FLAGS, PROMPTS, CURRENT_CHAT_ID, ACTION_LOGS, TURN_STATS, CONSECUTIVE_SLEEPS
     try:
         ABORT_FLAGS[chat_id] = False
         msg_first = bot.send_message(chat_id, f"⏰ <b>Запуск фоновой задачи:</b> <code>{task_id}</code>", parse_mode='HTML')
@@ -754,7 +760,6 @@ def execute_scheduled_task(chat_id, prompt, model_name, task_id):
         )
         task_chat = task_model.start_chat(enable_automatic_function_calling=False) 
         
-        global CURRENT_CHAT_ID
         CURRENT_CHAT_ID = chat_id
         
         ACTION_LOGS[chat_id] = []
@@ -805,6 +810,7 @@ def send_help(message):
 
 @bot.message_handler(commands=['status'])
 def status_cmd(message):
+    global CURRENT_KEY_NUM
     if message.from_user.id not in ADMIN_IDS: return
     markup = InlineKeyboardMarkup()
     markup.add(
@@ -821,17 +827,18 @@ def change_model(message):
 
 @bot.message_handler(commands=['reload'])
 def reload_configs_cmd(message):
+    global PRIORITY_MODELS_CACHE, OTHER_MODELS_CACHE, AVAILABLE_MODELS, PRIORITY_MODELS, PROMPTS
     if message.from_user.id not in ADMIN_IDS: return
     try:
         load_models_config()
         load_prompts_config()
-        global PRIORITY_MODELS_CACHE, OTHER_MODELS_CACHE, AVAILABLE_MODELS
         PRIORITY_MODELS_CACHE, OTHER_MODELS_CACHE, AVAILABLE_MODELS = [], [], [] 
         bot.reply_to(message, f"✅ Конфигурация обновлена!\nЗагружено <b>{len(PRIORITY_MODELS)}</b> моделей.\nПромпты: <b>{', '.join(PROMPTS.keys())}</b>.", parse_mode='HTML')
     except Exception as e: bot.reply_to(message, f"❌ Ошибка: {e}")
 
 @bot.message_handler(commands=['changekey'])
 def change_key_cmd(message):
+    global CURRENT_KEY_NUM
     if message.from_user.id not in ADMIN_IDS: return
     markup = InlineKeyboardMarkup()
     markup.add(
@@ -843,6 +850,7 @@ def change_key_cmd(message):
 
 @bot.message_handler(commands=['voice'])
 def voice_mode_cmd(message):
+    global VOICE_MODE
     if message.from_user.id not in ADMIN_IDS: return
     is_active = VOICE_MODE.get(message.chat.id, False)
     status_text = "ВКЛЮЧЕН 🟢" if is_active else "ВЫКЛЮЧЕН 🔴"
@@ -852,8 +860,8 @@ def voice_mode_cmd(message):
 
 @bot.message_handler(commands=['clear'])
 def clear_cmd(message):
+    global chat_agent, CURRENT_MODEL, MODEL_ROLE, MODEL_MODE
     if message.from_user.id not in ADMIN_IDS: return
-    global chat_agent, CURRENT_MODEL
     if not CURRENT_MODEL:
         bot.reply_to(message, "⚠️ Модель еще не выбрана. Память пуста.")
         return
@@ -895,6 +903,7 @@ def del_task_cmd(message):
 
 @bot.message_handler(commands=['task'])
 def task_cmd(message):
+    global CURRENT_MODEL
     if message.from_user.id not in ADMIN_IDS: return
     if not CURRENT_MODEL:
         bot.reply_to(message, "⚠️ Сначала выберите модель (/gemini), которая будет выполнять эту задачу.")
@@ -981,8 +990,8 @@ def process_search_query(message, search_type="regular"):
 
 @bot.message_handler(content_types=['document'])
 def handle_document(message):
+    global CURRENT_CHAT_ID, ABORT_FLAGS, PENDING_FILES
     if message.from_user.id not in ADMIN_IDS: return
-    global CURRENT_CHAT_ID
     CURRENT_CHAT_ID = message.chat.id
     ABORT_FLAGS[message.chat.id] = False
     PENDING_FILES[message.chat.id] = {'file_id': message.document.file_id, 'file_name': message.document.file_name, 'mime_type': message.document.mime_type}
@@ -996,6 +1005,7 @@ def handle_document(message):
 # ─────────────────────────────────────────────
 
 def parse_and_route_response(agent, chat_id, response, first_msg_id, original_text, is_background=False, model_name=None, task_id=None):
+    global CURRENT_MODEL, ABORT_FLAGS, MODEL_ROLE
     if not model_name: model_name = CURRENT_MODEL
     clean_model_name = model_name.replace('models/', '') if model_name else ""
 
@@ -1055,6 +1065,7 @@ def parse_and_route_response(agent, chat_id, response, first_msg_id, original_te
         finish_response(chat_id, response.text, first_msg_id, clean_model_name, is_background, task_id)
 
 def finish_response(chat_id, text, msg_id, clean_model_name, is_background=False, task_id=None):
+    global ACTION_LOGS, TURN_STATS, LAST_ACTIONS, VOICE_MODE
     markup = None
     if ACTION_LOGS.get(chat_id):
         stats = TURN_STATS.get(chat_id, {"rpd": 0, "tpm": 0})
@@ -1079,6 +1090,7 @@ def finish_response(chat_id, text, msg_id, clean_model_name, is_background=False
     clear_status(chat_id)
 
 def process_action_request(agent, chat_id, action, is_background=False, model_name=None, task_id=None):
+    global MODEL_MODE, CONSECUTIVE_SLEEPS, PENDING_ACTION
     mode = MODEL_MODE.get(chat_id, "semi")
     
     if action["name"] in ["sleep", "sleep_tool"]:
@@ -1098,6 +1110,7 @@ def process_action_request(agent, chat_id, action, is_background=False, model_na
         execute_pending_action(agent, chat_id, action, is_background, model_name, task_id)
 
 def execute_pending_action(agent, chat_id, action, is_background=False, model_name=None, task_id=None):
+    global CURRENT_MODEL, ABORT_FLAGS
     clean_model_name = model_name.replace('models/', '') if model_name else ""
     if ABORT_FLAGS.get(chat_id):
         finish_response(chat_id, "🛑 <b>Выполнение принудительно остановлено.</b>\nНажмите кнопку ниже, чтобы посмотреть выполненные действия.", action["msg_id"], clean_model_name, is_background, task_id)
@@ -1160,9 +1173,12 @@ def execute_pending_action(agent, chat_id, action, is_background=False, model_na
 
 @bot.callback_query_handler(func=lambda call: True)
 def handle_query(call):
-    if call.from_user.id not in ADMIN_IDS: return
     global CURRENT_MODEL, CURRENT_KEY_NUM, PRIORITY_MODELS_CACHE, OTHER_MODELS_CACHE, AVAILABLE_MODELS
-    global CURRENT_CHAT_ID, MODEL_ROLE, MODEL_MODE, PENDING_ACTION
+    global CURRENT_CHAT_ID, MODEL_ROLE, MODEL_MODE, PENDING_ACTION, TTS_SETTINGS, VOICE_MODE
+    global API_REQUEST_HISTORY, API_TOKEN_HISTORY, API_RPD_HISTORY, MODEL_RPD_LIMITS, ABORT_FLAGS, LAST_ACTIONS
+    global PENDING_SEARCH_RESULTS, PENDING_FILES, ACTION_LOGS, TURN_STATS, STATUS_MSG, chat_agent, API_KEY_1, API_KEY_2, API_KEY_3
+
+    if call.from_user.id not in ADMIN_IDS: return
     data = call.data
 
     if data.startswith("abort_"):
@@ -1359,7 +1375,6 @@ def handle_query(call):
         return
 
     if data.startswith("mod_"):
-        global CURRENT_MODEL
         CURRENT_MODEL = data.replace("mod_", "")
         clean_name = CURRENT_MODEL.replace('models/', '')
         try: bot.delete_message(call.message.chat.id, call.message.message_id)
@@ -1502,9 +1517,10 @@ def handle_query(call):
 
 @bot.message_handler(content_types=['voice', 'text', 'photo'])
 def handle_message(message):
+    global CURRENT_CHAT_ID, CURRENT_MODEL, ABORT_FLAGS, PENDING_ACTION, MODEL_ROLE, TTS_SETTINGS, TURN_STATS, ACTION_LOGS, LAST_ACTIONS, STATUS_MSG, CONSECUTIVE_SLEEPS, chat_agent, model_advisor
+    
     if message.from_user.id not in ADMIN_IDS: return
 
-    global CURRENT_CHAT_ID
     CURRENT_CHAT_ID = message.chat.id
     ABORT_FLAGS[message.chat.id] = False
     text = (message.text or message.caption or "").strip()
