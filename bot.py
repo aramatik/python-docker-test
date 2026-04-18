@@ -58,7 +58,7 @@ PENDING_SEARCH_RESULTS = {}
 # Единые настройки для ВСЕХ моделей
 MODEL_ROLE = {}  
 MODEL_MODE = {}  
-TTS_FORMAT = {} 
+TTS_SETTINGS = {} # {chat_id: {"fmt": "opus", "reader": "Kore", "hero": "Puck"}}
 PENDING_ACTION = {} 
 
 ACTION_LOGS = {}
@@ -70,6 +70,15 @@ STATUS_MSG = {}
 TURN_STATS = {}
 CONSECUTIVE_SLEEPS = {}
 ABORT_FLAGS = {} 
+
+# Доступные голоса Gemini TTS
+TTS_VOICES = {
+    "Puck": "Puck (М, Задорный / Высокий)",
+    "Charon": "Charon (М, Строгий / Низкий)",
+    "Kore": "Kore (Ж, Спокойный / Нейтральный)",
+    "Fenrir": "Fenrir (М, Грубый / Бас)",
+    "Aoede": "Aoede (Ж, Мягкий / Теплый)"
+}
 
 # ─────────────────────────────────────────────
 #  КОНФИГУРАЦИЯ: ПРОМПТЫ, МОДЕЛИ, ЛИМИТЫ
@@ -338,7 +347,8 @@ def safe_send_message(agent, chat_id, prompt_or_parts, status_text="🤖 <b>Об
                 
     raise Exception("Превышено количество попыток переключения ключей.")
 
-def safe_tts_request(chat_id, text, voice_name, status_text):
+def safe_tts_request_raw(chat_id, text, voice_name, status_text):
+    """Выполняет REST запрос к TTS и возвращает сырые PCM байты для дальнейшей склейки."""
     global CURRENT_KEY_NUM, CURRENT_MODEL
     model_name = CURRENT_MODEL.replace('models/', '') if CURRENT_MODEL else ""
     
@@ -379,13 +389,6 @@ def safe_tts_request(chat_id, text, voice_name, status_text):
             audio_b64 = part["inlineData"]["data"]
             pcm_bytes = base64.b64decode(audio_b64)
             
-            output_wav_path = f"temp_tts_out_{chat_id}_{int(time.time())}.wav"
-            with wave.open(output_wav_path, "wb") as wf:
-                wf.setnchannels(1)       # Моно
-                wf.setsampwidth(2)       # 16-bit
-                wf.setframerate(24000)   # 24 kHz (Gemini standard)
-                wf.writeframes(pcm_bytes)
-            
             usage = res_json.get("usageMetadata", {})
             tokens_used = usage.get("totalTokenCount", 0)
             
@@ -395,7 +398,7 @@ def safe_tts_request(chat_id, text, voice_name, status_text):
             
             track_token_usage(tokens_used)
             
-            return output_wav_path, tokens_used
+            return pcm_bytes, tokens_used
 
         except Exception as e:
             error_text = str(e)
@@ -1300,15 +1303,51 @@ def handle_query(call):
 
     if data.startswith("tts_fmt_"):
         fmt = data.split("_")[2] 
-        TTS_FORMAT[call.message.chat.id] = fmt
+        if call.message.chat.id not in TTS_SETTINGS: TTS_SETTINGS[call.message.chat.id] = {}
+        TTS_SETTINGS[call.message.chat.id]["fmt"] = fmt
         MODEL_ROLE[call.message.chat.id] = "tts"
+        try: bot.delete_message(call.message.chat.id, call.message.message_id)
+        except: pass
+        
+        markup = InlineKeyboardMarkup()
+        for v_id, v_desc in TTS_VOICES.items():
+            markup.add(InlineKeyboardButton(v_desc, callback_data=f"tts_rdr_{v_id}"))
+        bot.send_message(call.message.chat.id, f"Формат <b>{fmt.upper()}</b> сохранен.\n\nВыберите голос <b>ЧТЕЦА</b> (основной текст):", reply_markup=markup, parse_mode='HTML')
+        return
+
+    if data.startswith("tts_rdr_"):
+        reader = data.split("_")[2]
+        if call.message.chat.id not in TTS_SETTINGS: TTS_SETTINGS[call.message.chat.id] = {"fmt": "opus"}
+        TTS_SETTINGS[call.message.chat.id]["reader"] = reader
+        try: bot.delete_message(call.message.chat.id, call.message.message_id)
+        except: pass
+        
+        markup = InlineKeyboardMarkup()
+        for v_id, v_desc in TTS_VOICES.items():
+            markup.add(InlineKeyboardButton(v_desc, callback_data=f"tts_hro_{v_id}"))
+        bot.send_message(call.message.chat.id, f"Чтец <b>{reader}</b> выбран.\n\nВыберите голос <b>ГЕРОЯ</b> (для реплик):", reply_markup=markup, parse_mode='HTML')
+        return
+
+    if data.startswith("tts_hro_"):
+        hero = data.split("_")[2]
+        if call.message.chat.id not in TTS_SETTINGS: TTS_SETTINGS[call.message.chat.id] = {"fmt": "opus", "reader": "Kore"}
+        TTS_SETTINGS[call.message.chat.id]["hero"] = hero
+        fmt = TTS_SETTINGS[call.message.chat.id].get("fmt", "opus")
+        reader = TTS_SETTINGS[call.message.chat.id].get("reader", "Kore")
         clean_name = CURRENT_MODEL.replace('models/', '') if CURRENT_MODEL else ""
         try: bot.delete_message(call.message.chat.id, call.message.message_id)
         except: pass
-        bot.send_message(call.message.chat.id, f"✅ <b>{clean_name}</b> запущен в режиме: <b>Синтез речи (TTS) -> {fmt.upper()}</b>\n\nОтправьте текст для озвучки. Поддерживаются теги голоса, например: <code>&lt;voice:Puck&gt;</code>", parse_mode='HTML')
+        
+        msg_text = (f"✅ <b>{clean_name}</b> запущен в режиме TTS.\n\n"
+                    f"Формат: <b>{fmt.upper()}</b>\n"
+                    f"Чтец: <b>{reader}</b>\n"
+                    f"Герой: <b>{hero}</b>\n\n"
+                    f"Отправьте текст для озвучки. Реплики героя выделяйте тегом:\n<code>&lt;hero&gt;Текст героя&lt;/hero&gt;</code>")
+        bot.send_message(call.message.chat.id, msg_text, parse_mode='HTML')
         return
 
     if data.startswith("mod_"):
+        global CURRENT_MODEL
         CURRENT_MODEL = data.replace("mod_", "")
         clean_name = CURRENT_MODEL.replace('models/', '')
         try: bot.delete_message(call.message.chat.id, call.message.message_id)
@@ -1316,7 +1355,7 @@ def handle_query(call):
         
         if "tts" in clean_name.lower():
             markup = InlineKeyboardMarkup()
-            markup.row(InlineKeyboardButton("WAV", callback_data="tts_fmt_wav"), InlineKeyboardButton("OPUS (Голосовое)", callback_data="tts_fmt_opus"))
+            markup.row(InlineKeyboardButton("WAV", callback_data="tts_fmt_wav"), InlineKeyboardButton("OPUS (Голос.)", callback_data="tts_fmt_opus"))
             bot.send_message(call.message.chat.id, f"Выбрана TTS-модель <b>{clean_name}</b>.\nВыберите формат аудио:", reply_markup=markup, parse_mode='HTML')
         else:
             markup = InlineKeyboardMarkup()
@@ -1503,47 +1542,68 @@ def handle_message(message):
         status_text = "🎙 <b>Генерирую речь...</b>"
         set_status(message.chat.id, status_text, show_abort=True)
         
-        voice = "Kore" 
-        voice_match = re.search(r'<voice:\s*([a-zA-Z]+)\s*>', text, re.IGNORECASE)
-        if voice_match:
-            voice = voice_match.group(1)
-            text = text.replace(voice_match.group(0), "").strip()
+        settings = TTS_SETTINGS.get(message.chat.id, {"fmt": "opus", "reader": "Kore", "hero": "Puck"})
+        fmt = settings.get("fmt", "opus")
+        reader_voice = settings.get("reader", "Kore")
+        hero_voice = settings.get("hero", "Puck")
 
         TURN_STATS[message.chat.id] = {"rpd": 0, "tpm": 0}
         ACTION_LOGS[message.chat.id] = []
-        msg_first = bot.send_message(message.chat.id, f"<b>{clean_model_name} (Voice: {voice}):</b>\n\nОбрабатываю...", parse_mode='HTML')
+        msg_first = bot.send_message(message.chat.id, f"<b>{clean_model_name} (Voice: Multi):</b>\n\nОбрабатываю текст...", parse_mode='HTML')
 
         try:
-            audio_path, tokens_used = safe_tts_request(message.chat.id, text, voice, status_text)
+            parts = []
+            pattern = r'(<hero>.*?</hero>)'
+            chunks = re.split(pattern, text, flags=re.DOTALL | re.IGNORECASE)
             
-            if ABORT_FLAGS.get(message.chat.id):
-                clear_status(message.chat.id)
-                bot.edit_message_text("🛑 <b>Генерация прервана.</b>", chat_id=message.chat.id, message_id=msg_first.message_id, parse_mode='HTML')
-                if audio_path and os.path.exists(audio_path): os.remove(audio_path)
-                return
+            for chunk in chunks:
+                if not chunk.strip(): continue
+                if re.match(pattern, chunk, flags=re.DOTALL | re.IGNORECASE):
+                    hero_text = re.sub(r'</?hero>', '', chunk, flags=re.IGNORECASE).strip()
+                    if hero_text: parts.append((hero_text, hero_voice))
+                else:
+                    parts.append((chunk.strip(), reader_voice))
+            
+            total_pcm = b""
+            total_tokens = 0
+            
+            for chunk_text, voice in parts:
+                if ABORT_FLAGS.get(message.chat.id):
+                    clear_status(message.chat.id)
+                    bot.edit_message_text("🛑 <b>Генерация прервана.</b>", chat_id=message.chat.id, message_id=msg_first.message_id, parse_mode='HTML')
+                    return
+                
+                pcm, tokens = safe_tts_request_raw(message.chat.id, chunk_text, voice, status_text)
+                total_pcm += pcm
+                total_tokens += tokens
 
             clear_status(message.chat.id)
-            fmt = TTS_FORMAT.get(message.chat.id, "opus")
+            
+            output_wav_path = f"temp_tts_out_{message.chat.id}_{int(time.time())}.wav"
+            with wave.open(output_wav_path, "wb") as wf:
+                wf.setnchannels(1)       
+                wf.setsampwidth(2)       
+                wf.setframerate(24000)   
+                wf.writeframes(total_pcm)
             
             stats = TURN_STATS[message.chat.id]
-            stats["tpm"] += tokens_used
-            ACTION_LOGS[message.chat.id].append(("tts", f"Voice: {voice}, Format: {fmt.upper()}"))
+            ACTION_LOGS[message.chat.id].append(("tts", f"Reader: {reader_voice}, Hero: {hero_voice}, Format: {fmt.upper()}"))
             LAST_ACTIONS[msg_first.message_id] = {"actions": ACTION_LOGS[message.chat.id].copy(), "stats": stats}
             markup = InlineKeyboardMarkup()
             markup.add(InlineKeyboardButton("🛠 Отчет о запросе", callback_data=f"show_tts_acts_{msg_first.message_id}"))
 
-            bot.edit_message_text(f"<b>{clean_model_name} (Voice: {voice}):</b>\n✅ Аудио сгенерировано.", chat_id=message.chat.id, message_id=msg_first.message_id, parse_mode='HTML', reply_markup=markup)
+            bot.edit_message_text(f"<b>{clean_model_name} (Voice: Multi):</b>\n✅ Аудио сгенерировано.", chat_id=message.chat.id, message_id=msg_first.message_id, parse_mode='HTML', reply_markup=markup)
 
             if fmt == "opus":
                 opus_path = f"temp_gemini_tts_{message.message_id}.ogg"
-                subprocess.run(f"ffmpeg -i {audio_path} -c:a libopus -b:a 32k -v quiet -y {opus_path}", shell=True, timeout=60)
+                subprocess.run(f"ffmpeg -i {output_wav_path} -c:a libopus -b:a 32k -v quiet -y {opus_path}", shell=True, timeout=60)
                 if os.path.exists(opus_path):
                     with open(opus_path, 'rb') as f: bot.send_voice(message.chat.id, f, reply_to_message_id=msg_first.message_id)
                     os.remove(opus_path)
             else:
-                with open(audio_path, 'rb') as f: bot.send_document(message.chat.id, f, reply_to_message_id=msg_first.message_id)
+                with open(output_wav_path, 'rb') as f: bot.send_document(message.chat.id, f, reply_to_message_id=msg_first.message_id)
             
-            if os.path.exists(audio_path): os.remove(audio_path)
+            if os.path.exists(output_wav_path): os.remove(output_wav_path)
 
         except Exception as e:
             clear_status(message.chat.id)
