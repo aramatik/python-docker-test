@@ -1347,7 +1347,6 @@ def handle_query(call):
         return
 
     if data.startswith("mod_"):
-        global CURRENT_MODEL
         CURRENT_MODEL = data.replace("mod_", "")
         clean_name = CURRENT_MODEL.replace('models/', '')
         try: bot.delete_message(call.message.chat.id, call.message.message_id)
