@@ -123,7 +123,6 @@ def load_limits_state():
             API_RPD_HISTORY[i] = {"date": today_str, "usage": {}}
 
 def save_limits_state():
-    global API_RPD_HISTORY
     os.makedirs(os.path.dirname(LIMITS_STATE_FILE), exist_ok=True)
     try:
         with open(LIMITS_STATE_FILE, "w", encoding="utf-8") as f:
@@ -218,18 +217,17 @@ def set_status(chat_id, text: str, show_abort=False):
     except: pass
 
 def clear_status(chat_id):
-    global STATUS_MSG
     msg_id = STATUS_MSG.pop(chat_id, None)
     if msg_id:
         try: bot.delete_message(chat_id, msg_id)
         except: pass
 
 def track_token_usage(token_count):
-    global CURRENT_KEY_NUM, API_TOKEN_HISTORY
+    global CURRENT_KEY_NUM
     if token_count: API_TOKEN_HISTORY[CURRENT_KEY_NUM].append((time.time(), token_count))
 
 def check_api_rate_limit(chat_id, current_status_text, model_name=None):
-    global CURRENT_KEY_NUM, CURRENT_MODEL, MODEL_RPM_LIMITS, MODEL_TPM_LIMITS, MODEL_RPD_LIMITS, API_RPD_HISTORY, API_REQUEST_HISTORY, API_TOKEN_HISTORY
+    global CURRENT_KEY_NUM
     if model_name is None: model_name = CURRENT_MODEL
     if not model_name: return
 
@@ -279,7 +277,7 @@ def check_api_rate_limit(chat_id, current_status_text, model_name=None):
     save_limits_state() 
 
 def switch_api_key(chat_id, reason):
-    global CURRENT_KEY_NUM, CURRENT_MODEL, MODEL_RPD_LIMITS, API_RPD_HISTORY, API_KEY_1, API_KEY_2, API_KEY_3
+    global CURRENT_KEY_NUM, CURRENT_MODEL
     old_key = CURRENT_KEY_NUM
     keys = [1, 2, 3]
     idx = keys.index(old_key)
@@ -306,7 +304,6 @@ def switch_api_key(chat_id, reason):
     return False
 
 def safe_send_message(agent, chat_id, prompt_or_parts, status_text="🤖 <b>Обрабатываю запрос...</b>", is_advisor=False, model_name=None):
-    global CURRENT_KEY_NUM, TURN_STATS
     max_retries = 3
     for attempt in range(max_retries):
         try:
@@ -350,8 +347,9 @@ def safe_send_message(agent, chat_id, prompt_or_parts, status_text="🤖 <b>Об
                 
     raise Exception("Превышено количество попыток переключения ключей.")
 
-def safe_tts_request_raw(chat_id, text, voice_name, status_text):
-    global CURRENT_KEY_NUM, CURRENT_MODEL, TURN_STATS, API_KEY_1, API_KEY_2, API_KEY_3
+def safe_tts_request_raw(chat_id, text, reader_voice, hero_voice, status_text):
+    """Выполняет REST запрос к TTS, используя нативный multiSpeakerVoiceConfig."""
+    global CURRENT_KEY_NUM, CURRENT_MODEL
     model_name = CURRENT_MODEL.replace('models/', '') if CURRENT_MODEL else ""
     
     max_retries = 3
@@ -360,18 +358,54 @@ def safe_tts_request_raw(chat_id, text, voice_name, status_text):
             check_api_rate_limit(chat_id, status_text, model_name)
             
             target_key = API_KEY_1 if CURRENT_KEY_NUM == 1 else (API_KEY_2 if CURRENT_KEY_NUM == 2 else API_KEY_3)
+            # Внимание: multiSpeakerVoiceConfig доступен в v1alpha
             url = f"https://generativelanguage.googleapis.com/v1alpha/models/{model_name}:generateContent?key={target_key}"
+            
+            # Парсим текст и превращаем его в скрипт
+            has_hero = False
+            script_text = ""
+            pattern = r'(<hero>.*?</hero>)'
+            chunks = re.split(pattern, text, flags=re.DOTALL | re.IGNORECASE)
+            
+            for chunk in chunks:
+                if not chunk.strip(): continue
+                if re.match(pattern, chunk, flags=re.DOTALL | re.IGNORECASE):
+                    hero_text = re.sub(r'</?hero>', '', chunk, flags=re.IGNORECASE).strip()
+                    if hero_text:
+                        script_text += f"\nHero: {hero_text}\n"
+                        has_hero = True
+                else:
+                    script_text += f"\nReader: {chunk.strip()}\n"
+                    
+            script_text = script_text.strip()
+            
+            if has_hero:
+                speech_config = {
+                    "multiSpeakerVoiceConfig": {
+                        "speakerVoiceConfigs": [
+                            {
+                                "speaker": "Reader",
+                                "voiceConfig": {"prebuiltVoiceConfig": {"voiceName": reader_voice}}
+                            },
+                            {
+                                "speaker": "Hero",
+                                "voiceConfig": {"prebuiltVoiceConfig": {"voiceName": hero_voice}}
+                            }
+                        ]
+                    }
+                }
+            else:
+                speech_config = {
+                    "voiceConfig": {
+                        "prebuiltVoiceConfig": {"voiceName": reader_voice}
+                    }
+                }
+
             payload = {
-                "contents": [{"parts": [{"text": text}]}],
+                "contents": [{"parts": [{"text": script_text}]}],
                 "generationConfig": {
                     "responseModalities": ["AUDIO"],
-                    "speechConfig": {
-                        "voiceConfig": {
-                            "prebuiltVoiceConfig": {
-                                "voiceName": voice_name
-                            }
-                        }
-                    }
+                    "speechConfig": speech_config
                 }
             }
             
@@ -391,15 +425,10 @@ def safe_tts_request_raw(chat_id, text, voice_name, status_text):
             audio_b64 = part["inlineData"]["data"]
             audio_bytes = base64.b64decode(audio_b64)
             
-            try:
-                import io
-                with wave.open(io.BytesIO(audio_bytes), 'rb') as wf:
-                    pcm_bytes = wf.readframes(wf.getnframes())
-            except Exception:
-                if audio_bytes.startswith(b'RIFF'):
-                    pcm_bytes = audio_bytes[44:]
-                else:
-                    pcm_bytes = audio_bytes
+            # Сохраняем цельный WAV-файл от Google
+            output_wav_path = f"temp_tts_out_{chat_id}_{int(time.time())}.wav"
+            with open(output_wav_path, "wb") as f:
+                f.write(audio_bytes)
             
             usage = res_json.get("usageMetadata", {})
             tokens_used = usage.get("totalTokenCount", 0)
@@ -410,7 +439,7 @@ def safe_tts_request_raw(chat_id, text, voice_name, status_text):
             
             track_token_usage(tokens_used)
             
-            return pcm_bytes, tokens_used
+            return output_wav_path, tokens_used
 
         except Exception as e:
             error_text = str(e)
@@ -1580,39 +1609,15 @@ def handle_message(message):
         msg_first = bot.send_message(message.chat.id, f"<b>{clean_model_name} (Voice: Multi):</b>\n\nОбрабатываю текст...", parse_mode='HTML')
 
         try:
-            parts = []
-            pattern = r'(<hero>.*?</hero>)'
-            chunks = re.split(pattern, text, flags=re.DOTALL | re.IGNORECASE)
+            audio_path, tokens_used = safe_tts_request_raw(message.chat.id, text, reader_voice, hero_voice, status_text)
             
-            for chunk in chunks:
-                if not chunk.strip(): continue
-                if re.match(pattern, chunk, flags=re.DOTALL | re.IGNORECASE):
-                    hero_text = re.sub(r'</?hero>', '', chunk, flags=re.IGNORECASE).strip()
-                    if hero_text: parts.append((hero_text, hero_voice))
-                else:
-                    parts.append((chunk.strip(), reader_voice))
-            
-            total_pcm = b""
-            total_tokens = 0
-            
-            for chunk_text, voice in parts:
-                if ABORT_FLAGS.get(message.chat.id):
-                    clear_status(message.chat.id)
-                    bot.edit_message_text("🛑 <b>Генерация прервана.</b>", chat_id=message.chat.id, message_id=msg_first.message_id, parse_mode='HTML')
-                    return
-                
-                pcm, tokens = safe_tts_request_raw(message.chat.id, chunk_text, voice, status_text)
-                total_pcm += pcm
-                total_tokens += tokens
+            if ABORT_FLAGS.get(message.chat.id):
+                clear_status(message.chat.id)
+                bot.edit_message_text("🛑 <b>Генерация прервана.</b>", chat_id=message.chat.id, message_id=msg_first.message_id, parse_mode='HTML')
+                if audio_path and os.path.exists(audio_path): os.remove(audio_path)
+                return
 
             clear_status(message.chat.id)
-            
-            output_wav_path = f"temp_tts_out_{message.chat.id}_{int(time.time())}.wav"
-            with wave.open(output_wav_path, "wb") as wf:
-                wf.setnchannels(1)       
-                wf.setsampwidth(2)       
-                wf.setframerate(24000)   
-                wf.writeframes(total_pcm)
             
             stats = TURN_STATS[message.chat.id]
             ACTION_LOGS[message.chat.id].append(("tts", f"Reader: {reader_voice}, Hero: {hero_voice}, Format: {fmt.upper()}"))
@@ -1624,14 +1629,14 @@ def handle_message(message):
 
             if fmt == "opus":
                 opus_path = f"temp_gemini_tts_{message.message_id}.ogg"
-                subprocess.run(f"ffmpeg -i {output_wav_path} -c:a libopus -b:a 32k -v quiet -y {opus_path}", shell=True, timeout=60)
+                subprocess.run(f"ffmpeg -i {audio_path} -c:a libopus -b:a 32k -v quiet -y {opus_path}", shell=True, timeout=60)
                 if os.path.exists(opus_path):
                     with open(opus_path, 'rb') as f: bot.send_voice(message.chat.id, f, reply_to_message_id=msg_first.message_id)
                     os.remove(opus_path)
             else:
-                with open(output_wav_path, 'rb') as f: bot.send_document(message.chat.id, f, reply_to_message_id=msg_first.message_id)
+                with open(audio_path, 'rb') as f: bot.send_document(message.chat.id, f, reply_to_message_id=msg_first.message_id)
             
-            if os.path.exists(output_wav_path): os.remove(output_wav_path)
+            if os.path.exists(audio_path): os.remove(audio_path)
 
         except Exception as e:
             clear_status(message.chat.id)
