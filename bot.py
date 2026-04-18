@@ -13,6 +13,7 @@ import json
 import base64
 import wave
 import requests
+import io
 from collections import deque
 from datetime import datetime
 from zoneinfo import ZoneInfo
@@ -58,7 +59,7 @@ PENDING_SEARCH_RESULTS = {}
 # Единые настройки для ВСЕХ моделей
 MODEL_ROLE = {}  
 MODEL_MODE = {}  
-TTS_SETTINGS = {} # {chat_id: {"fmt": "opus", "reader": "Kore", "hero": "Puck"}}
+TTS_SETTINGS = {} 
 PENDING_ACTION = {} 
 
 ACTION_LOGS = {}
@@ -348,7 +349,7 @@ def safe_send_message(agent, chat_id, prompt_or_parts, status_text="🤖 <b>Об
     raise Exception("Превышено количество попыток переключения ключей.")
 
 def safe_tts_request_raw(chat_id, text, voice_name, status_text):
-    """Выполняет REST запрос к TTS и возвращает сырые PCM байты для дальнейшей склейки."""
+    """Выполняет REST запрос к TTS и возвращает чистые PCM байты для правильной склейки."""
     global CURRENT_KEY_NUM, CURRENT_MODEL
     model_name = CURRENT_MODEL.replace('models/', '') if CURRENT_MODEL else ""
     
@@ -387,7 +388,18 @@ def safe_tts_request_raw(chat_id, text, voice_name, status_text):
             
             part = res_json["candidates"][0]["content"]["parts"][0]
             audio_b64 = part["inlineData"]["data"]
-            pcm_bytes = base64.b64decode(audio_b64)
+            audio_bytes = base64.b64decode(audio_b64)
+            
+            # ВАЖНО: Gemini отдает WAV с заголовком. Вскрываем и достаем чистый звук!
+            try:
+                with wave.open(io.BytesIO(audio_bytes), 'rb') as wf:
+                    pcm_bytes = wf.readframes(wf.getnframes())
+            except Exception:
+                # Фолбэк на случай, если пришел чистый PCM
+                if audio_bytes.startswith(b'RIFF'):
+                    pcm_bytes = audio_bytes[44:]
+                else:
+                    pcm_bytes = audio_bytes
             
             usage = res_json.get("usageMetadata", {})
             tokens_used = usage.get("totalTokenCount", 0)
@@ -1347,6 +1359,7 @@ def handle_query(call):
         return
 
     if data.startswith("mod_"):
+        global CURRENT_MODEL
         CURRENT_MODEL = data.replace("mod_", "")
         clean_name = CURRENT_MODEL.replace('models/', '')
         try: bot.delete_message(call.message.chat.id, call.message.message_id)
