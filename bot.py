@@ -10,6 +10,9 @@ import asyncio
 import edge_tts
 import time
 import json
+import base64
+import wave
+import requests
 from collections import deque
 from datetime import datetime
 from zoneinfo import ZoneInfo
@@ -55,6 +58,7 @@ PENDING_SEARCH_RESULTS = {}
 # Единые настройки для ВСЕХ моделей
 MODEL_ROLE = {}  
 MODEL_MODE = {}  
+TTS_FORMAT = {} # НОВОЕ: Сохраняет выбранный формат для TTS (wav или opus)
 PENDING_ACTION = {} 
 
 ACTION_LOGS = {}
@@ -329,6 +333,84 @@ def safe_send_message(agent, chat_id, prompt_or_parts, status_text="🤖 <b>Об
             elif "function response turn comes immediately after a function call" in error_text:
                 if not is_advisor and hasattr(agent, 'history'): agent.history.clear()
                 raise Exception("Сбой синхронизации API! Контекст был поврежден. Память очищена.")
+            else:
+                raise e
+                
+    raise Exception("Превышено количество попыток переключения ключей.")
+
+def safe_tts_request(chat_id, text, voice_name, status_text):
+    """Обертка для отправки REST-запроса на TTS-модели (без установки google-genai)."""
+    global CURRENT_KEY_NUM, CURRENT_MODEL
+    model_name = CURRENT_MODEL.replace('models/', '') if CURRENT_MODEL else ""
+    
+    max_retries = 3
+    for attempt in range(max_retries):
+        try:
+            check_api_rate_limit(chat_id, status_text, model_name)
+            
+            target_key = API_KEY_1 if CURRENT_KEY_NUM == 1 else (API_KEY_2 if CURRENT_KEY_NUM == 2 else API_KEY_3)
+            # TTS доступен в v1alpha
+            url = f"https://generativelanguage.googleapis.com/v1alpha/models/{model_name}:generateContent?key={target_key}"
+            payload = {
+                "contents": [{"parts": [{"text": text}]}],
+                "generationConfig": {
+                    "responseModalities": ["AUDIO"],
+                    "speechConfig": {
+                        "voiceConfig": {
+                            "prebuiltVoiceConfig": {
+                                "voiceName": voice_name
+                            }
+                        }
+                    }
+                }
+            }
+            
+            res = requests.post(url, json=payload)
+            
+            if res.status_code == 429:
+                raise Exception("Quota exceeded")
+                
+            res_json = res.json()
+            if "error" in res_json:
+                err_msg = res_json["error"].get("message", str(res_json))
+                if "429" in err_msg or "Quota" in err_msg:
+                    raise Exception("Quota exceeded")
+                raise Exception(err_msg)
+            
+            # Извлекаем Base64 аудио и конвертируем в WAV
+            part = res_json["candidates"][0]["content"]["parts"][0]
+            audio_b64 = part["inlineData"]["data"]
+            pcm_bytes = base64.b64decode(audio_b64)
+            
+            output_wav_path = f"temp_tts_out_{chat_id}_{int(time.time())}.wav"
+            with wave.open(output_wav_path, "wb") as wf:
+                wf.setnchannels(1)       # Моно
+                wf.setsampwidth(2)       # 16-bit
+                wf.setframerate(24000)   # 24 kHz (Gemini standard)
+                wf.writeframes(pcm_bytes)
+            
+            usage = res_json.get("usageMetadata", {})
+            tokens_used = usage.get("totalTokenCount", 0)
+            
+            if chat_id in TURN_STATS:
+                TURN_STATS[chat_id]["rpd"] += 1
+                TURN_STATS[chat_id]["tpm"] += tokens_used
+            
+            track_token_usage(tokens_used)
+            
+            return output_wav_path, tokens_used
+
+        except Exception as e:
+            error_text = str(e)
+            if "RPD_LIMIT_REACHED" in error_text:
+                if switch_api_key(chat_id, f"Достигнут дневной лимит (RPD) на ключе {CURRENT_KEY_NUM}."):
+                    continue
+                else: raise Exception("Все доступные ключи исчерпали дневной лимит (RPD) для этой модели.")
+                
+            elif "429" in error_text or "Quota exceeded" in error_text:
+                if switch_api_key(chat_id, f"Превышена квота API (Ошибка 429) на ключе {CURRENT_KEY_NUM}."):
+                    continue
+                else: raise Exception("Все ключи исчерпали квоту API (429). Попробуйте позже.")
             else:
                 raise e
                 
@@ -806,8 +888,8 @@ def task_cmd(message):
         bot.reply_to(message, "⚠️ Сначала выберите модель (/gemini), которая будет выполнять эту задачу.")
         return
         
-    if "gemma" in CURRENT_MODEL.lower():
-        bot.reply_to(message, "⚠️ Фоновые задачи по расписанию поддерживаются <b>ТОЛЬКО для моделей Gemini</b>, так как они требуют нативного Function Calling. Пожалуйста, смените модель.", parse_mode='HTML')
+    if "gemma" in CURRENT_MODEL.lower() or "tts" in CURRENT_MODEL.lower():
+        bot.reply_to(message, "⚠️ Фоновые задачи по расписанию поддерживаются <b>ТОЛЬКО для текстовых моделей Gemini</b>. Пожалуйста, смените модель.", parse_mode='HTML')
         return
         
     user_text = message.text.replace("/task", "").strip()
@@ -1143,8 +1225,8 @@ def handle_query(call):
         except: pass
         return
 
-    if data.startswith("show_acts_"):
-        try: target_msg_id = int(data.split("_")[2])
+    if data.startswith("show_acts_") or data.startswith("show_tts_acts_"):
+        try: target_msg_id = int(data.split("_")[-1])
         except: target_msg_id = 0
         action_data = LAST_ACTIONS.get(target_msg_id)
         
@@ -1169,6 +1251,7 @@ def handle_query(call):
             elif act_type == "delete_task": log_text += f"🗑 <b>Удалил задачу:</b> <i>ID {html.escape(act_val)}</i>\n"
             elif act_type == "list_tasks": log_text += f"📋 <b>Просмотрел активные задачи</b>\n"
             elif act_type == "sleep": log_text += f"💤 <b>Пауза:</b> <i>{act_val} сек.</i>\n"
+            elif act_type == "tts": log_text += f"🎙 <b>Синтез речи:</b> <i>{html.escape(act_val)}</i>\n"
 
         if bash_commands:
             bash_str = "\n".join(bash_commands)
@@ -1208,7 +1291,7 @@ def handle_query(call):
         key_num = int(data.split("_")[1])
         target_key = API_KEY_1 if key_num == 1 else (API_KEY_2 if key_num == 2 else API_KEY_3)
         if not target_key:
-            bot.answer_callback_query(call.id, f"❌ KEY {key_num} type= не задан!", show_alert=True)
+            bot.answer_callback_query(call.id, f"❌ KEY {key_num} не задан!", show_alert=True)
             return
         CURRENT_KEY_NUM = key_num
         genai.configure(api_key=target_key)
@@ -1218,14 +1301,31 @@ def handle_query(call):
         bot.send_message(call.message.chat.id, f"✅ Активен <b>KEY {key_num}</b>.\nВызовите /gemini для выбора модели.", parse_mode='HTML')
         return
 
+    if data.startswith("tts_fmt_"):
+        fmt = data.split("_")[2] 
+        TTS_FORMAT[call.message.chat.id] = fmt
+        MODEL_ROLE[call.message.chat.id] = "tts"
+        clean_name = CURRENT_MODEL.replace('models/', '') if CURRENT_MODEL else ""
+        try: bot.delete_message(call.message.chat.id, call.message.message_id)
+        except: pass
+        bot.send_message(call.message.chat.id, f"✅ <b>{clean_name}</b> запущен в режиме: <b>Синтез речи (TTS) -> {fmt.upper()}</b>\n\nОтправьте текст для озвучки. Поддерживаются теги голоса, например: <code>&lt;voice:Puck&gt;</code>", parse_mode='HTML')
+        return
+
     if data.startswith("mod_"):
+        global CURRENT_MODEL
         CURRENT_MODEL = data.replace("mod_", "")
         clean_name = CURRENT_MODEL.replace('models/', '')
         try: bot.delete_message(call.message.chat.id, call.message.message_id)
         except: pass
-        markup = InlineKeyboardMarkup()
-        markup.row(InlineKeyboardButton("🛠 Админ", callback_data="role_admin"), InlineKeyboardButton("💬 Чат-бот", callback_data="role_chat"))
-        bot.send_message(call.message.chat.id, f"Выбрана модель <b>{clean_name}</b>.\nВыберите роль ИИ:", reply_markup=markup, parse_mode='HTML')
+        
+        if "tts" in clean_name.lower():
+            markup = InlineKeyboardMarkup()
+            markup.row(InlineKeyboardButton("WAV", callback_data="tts_fmt_wav"), InlineKeyboardButton("OPUS (Голосовое)", callback_data="tts_fmt_opus"))
+            bot.send_message(call.message.chat.id, f"Выбрана TTS-модель <b>{clean_name}</b>.\nВыберите формат аудио:", reply_markup=markup, parse_mode='HTML')
+        else:
+            markup = InlineKeyboardMarkup()
+            markup.row(InlineKeyboardButton("🛠 Админ", callback_data="role_admin"), InlineKeyboardButton("💬 Чат-бот", callback_data="role_chat"))
+            bot.send_message(call.message.chat.id, f"Выбрана модель <b>{clean_name}</b>.\nВыберите роль ИИ:", reply_markup=markup, parse_mode='HTML')
         return
 
     if data.startswith("role_"):
@@ -1394,6 +1494,65 @@ def handle_message(message):
 
     is_voice = message.content_type == 'voice'
     is_photo = message.content_type == 'photo'
+
+    if role == "tts":
+        if is_voice or is_photo:
+            bot.send_message(message.chat.id, "⚠️ Режим TTS поддерживает только текст.")
+            return
+            
+        if not text:
+            bot.send_message(message.chat.id, "⚠️ Отправьте текст для озвучки.")
+            return
+            
+        status_text = "🎙 <b>Генерирую речь...</b>"
+        set_status(message.chat.id, status_text, show_abort=True)
+        
+        voice = "Kore" 
+        voice_match = re.search(r'<voice:\s*([a-zA-Z]+)\s*>', text, re.IGNORECASE)
+        if voice_match:
+            voice = voice_match.group(1)
+            text = text.replace(voice_match.group(0), "").strip()
+
+        TURN_STATS[message.chat.id] = {"rpd": 0, "tpm": 0}
+        ACTION_LOGS[message.chat.id] = []
+        msg_first = bot.send_message(message.chat.id, f"<b>{clean_model_name} (Voice: {voice}):</b>\n\nОбрабатываю...", parse_mode='HTML')
+
+        try:
+            audio_path, tokens_used = safe_tts_request(message.chat.id, text, voice, status_text)
+            
+            if ABORT_FLAGS.get(message.chat.id):
+                clear_status(message.chat.id)
+                bot.edit_message_text("🛑 <b>Генерация прервана.</b>", chat_id=message.chat.id, message_id=msg_first.message_id, parse_mode='HTML')
+                if audio_path and os.path.exists(audio_path): os.remove(audio_path)
+                return
+
+            clear_status(message.chat.id)
+            fmt = TTS_FORMAT.get(message.chat.id, "opus")
+            
+            stats = TURN_STATS[message.chat.id]
+            stats["tpm"] += tokens_used
+            ACTION_LOGS[message.chat.id].append(("tts", f"Voice: {voice}, Format: {fmt.upper()}"))
+            LAST_ACTIONS[msg_first.message_id] = {"actions": ACTION_LOGS[message.chat.id].copy(), "stats": stats}
+            markup = InlineKeyboardMarkup()
+            markup.add(InlineKeyboardButton("🛠 Отчет о запросе", callback_data=f"show_tts_acts_{msg_first.message_id}"))
+
+            bot.edit_message_text(f"<b>{clean_model_name} (Voice: {voice}):</b>\n✅ Аудио сгенерировано.", chat_id=message.chat.id, message_id=msg_first.message_id, parse_mode='HTML', reply_markup=markup)
+
+            if fmt == "opus":
+                opus_path = f"temp_gemini_tts_{message.message_id}.ogg"
+                subprocess.run(f"ffmpeg -i {audio_path} -c:a libopus -b:a 32k -v quiet -y {opus_path}", shell=True, timeout=60)
+                if os.path.exists(opus_path):
+                    with open(opus_path, 'rb') as f: bot.send_voice(message.chat.id, f, reply_to_message_id=msg_first.message_id)
+                    os.remove(opus_path)
+            else:
+                with open(audio_path, 'rb') as f: bot.send_document(message.chat.id, f, reply_to_message_id=msg_first.message_id)
+            
+            if os.path.exists(audio_path): os.remove(audio_path)
+
+        except Exception as e:
+            clear_status(message.chat.id)
+            handle_api_error(e, message.chat.id, msg_first.message_id, clean_model_name)
+        return
 
     if not is_voice and not is_photo:
         if text.startswith('!'):
