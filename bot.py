@@ -358,7 +358,6 @@ def safe_tts_request_raw(chat_id, text, reader_voice, hero_voice, status_text):
             check_api_rate_limit(chat_id, status_text, model_name)
             
             target_key = API_KEY_1 if CURRENT_KEY_NUM == 1 else (API_KEY_2 if CURRENT_KEY_NUM == 2 else API_KEY_3)
-            # Внимание: multiSpeakerVoiceConfig доступен в v1alpha
             url = f"https://generativelanguage.googleapis.com/v1alpha/models/{model_name}:generateContent?key={target_key}"
             
             # Парсим текст и превращаем его в скрипт
@@ -425,10 +424,17 @@ def safe_tts_request_raw(chat_id, text, reader_voice, hero_voice, status_text):
             audio_b64 = part["inlineData"]["data"]
             audio_bytes = base64.b64decode(audio_b64)
             
-            # Сохраняем цельный WAV-файл от Google
+            # ВАЖНО: Отсекаем возможный RIFF-заголовок, чтобы безопасно собрать свой WAV
+            pcm_bytes = audio_bytes[44:] if audio_bytes.startswith(b'RIFF') else audio_bytes
+            
             output_wav_path = f"temp_tts_out_{chat_id}_{int(time.time())}.wav"
-            with open(output_wav_path, "wb") as f:
-                f.write(audio_bytes)
+            
+            # Строим правильный WAV-контейнер
+            with wave.open(output_wav_path, "wb") as wf:
+                wf.setnchannels(1)       # Mono
+                wf.setsampwidth(2)       # 16-bit
+                wf.setframerate(24000)   # 24 kHz (Gemini TTS standard)
+                wf.writeframes(pcm_bytes)
             
             usage = res_json.get("usageMetadata", {})
             tokens_used = usage.get("totalTokenCount", 0)
