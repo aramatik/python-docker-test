@@ -58,7 +58,7 @@ PENDING_SEARCH_RESULTS = {}
 # Единые настройки для ВСЕХ моделей
 MODEL_ROLE = {}  
 MODEL_MODE = {}  
-TTS_FORMAT = {} # НОВОЕ: Сохраняет выбранный формат для TTS (wav или opus)
+TTS_FORMAT = {} 
 PENDING_ACTION = {} 
 
 ACTION_LOGS = {}
@@ -339,7 +339,6 @@ def safe_send_message(agent, chat_id, prompt_or_parts, status_text="🤖 <b>Об
     raise Exception("Превышено количество попыток переключения ключей.")
 
 def safe_tts_request(chat_id, text, voice_name, status_text):
-    """Обертка для отправки REST-запроса на TTS-модели (без установки google-genai)."""
     global CURRENT_KEY_NUM, CURRENT_MODEL
     model_name = CURRENT_MODEL.replace('models/', '') if CURRENT_MODEL else ""
     
@@ -349,7 +348,6 @@ def safe_tts_request(chat_id, text, voice_name, status_text):
             check_api_rate_limit(chat_id, status_text, model_name)
             
             target_key = API_KEY_1 if CURRENT_KEY_NUM == 1 else (API_KEY_2 if CURRENT_KEY_NUM == 2 else API_KEY_3)
-            # TTS доступен в v1alpha
             url = f"https://generativelanguage.googleapis.com/v1alpha/models/{model_name}:generateContent?key={target_key}"
             payload = {
                 "contents": [{"parts": [{"text": text}]}],
@@ -377,7 +375,6 @@ def safe_tts_request(chat_id, text, voice_name, status_text):
                     raise Exception("Quota exceeded")
                 raise Exception(err_msg)
             
-            # Извлекаем Base64 аудио и конвертируем в WAV
             part = res_json["candidates"][0]["content"]["parts"][0]
             audio_b64 = part["inlineData"]["data"]
             pcm_bytes = base64.b64decode(audio_b64)
@@ -1312,7 +1309,6 @@ def handle_query(call):
         return
 
     if data.startswith("mod_"):
-        global CURRENT_MODEL
         CURRENT_MODEL = data.replace("mod_", "")
         clean_name = CURRENT_MODEL.replace('models/', '')
         try: bot.delete_message(call.message.chat.id, call.message.message_id)
