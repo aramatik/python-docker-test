@@ -71,14 +71,44 @@ TURN_STATS = {}
 CONSECUTIVE_SLEEPS = {}
 ABORT_FLAGS = {} 
 
-# Доступные голоса Gemini TTS
 TTS_VOICES = {
+    # Ваши изначальные голоса
     "Puck": "Puck (М, Задорный / Высокий)",
     "Charon": "Charon (М, Строгий / Низкий)",
     "Kore": "Kore (Ж, Спокойный / Нейтральный)",
     "Fenrir": "Fenrir (М, Грубый / Бас)",
-    "Aoede": "Aoede (Ж, Мягкий / Теплый)"
+    "Aoede": "Aoede (Ж, Мягкий / Теплый)",
+
+    # Дополнительные женские голоса (Ж)
+    "Zephyr": "Zephyr (Ж, Яркий / Звонкий)",
+    "Leda": "Leda (Ж, Юный / Свежий)",
+    "Callirrhoe": "Callirrhoe (Ж, Непринужденный / Легкий)",
+    "Autonoe": "Autonoe (Ж, Яркий / Энергичный)",
+    "Despina": "Despina (Ж, Плавный / Бархатный)",
+    "Erinome": "Erinome (Ж, Чистый / Ясный)",
+    "Laomedeia": "Laomedeia (Ж, Оптимистичный / Задорный)",
+    "Achernar": "Achernar (Ж, Мягкий / Тихий)",
+    "Gacrux": "Gacrux (Ж, Зрелый / Уверенный)",
+    "Pulcherrima": "Pulcherrima (Ж, Решительный / Прямой)",
+    "Vindemiatrix": "Vindemiatrix (Ж, Нежный / Ласковый)",
+    "Sulafat": "Sulafat (Ж, Теплый / Уютный)",
+
+    # Дополнительные мужские голоса (М)
+    "Orus": "Orus (М, Твердый / Уверенный)",
+    "Enceladus": "Enceladus (М, С придыханием / Глубокий)",
+    "Iapetus": "Iapetus (М, Чистый / Понятный)",
+    "Umbriel": "Umbriel (М, Расслабленный / Спокойный)",
+    "Algenib": "Algenib (М, Хриплый / Текстурный)",
+    "Algieba": "Algieba (М, Гладкий / Ровный)",
+    "Schedar": "Schedar (М, Сбалансированный / Нейтральный)",
+    "Achird": "Achird (М, Дружелюбный / Располагающий)",
+    "Zubenelgenubi": "Zubenelgenubi (М, Повседневный / Простой)",
+    "Sadachbia": "Sadachbia (М, Живой / Подвижный)",
+    "Sadaltager": "Sadaltager (М, Знающий / Экспертный)",
+    "Alnilam": "Alnilam (М, Твердый / Четкий)",
+    "Rasalgethi": "Rasalgethi (М, Информативный / Дикторский)"
 }
+
 
 # ─────────────────────────────────────────────
 #  КОНФИГУРАЦИЯ: ПРОМПТЫ, МОДЕЛИ, ЛИМИТЫ
