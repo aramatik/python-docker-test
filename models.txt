@@ -13,3 +13,4 @@ gemini-2.5-flash-preview-tts [RPM:3, TPM:10000, RPD:10]
 gemini-3.1-flash-tts-preview [RPM:3, TPM:10000, RPD:10]
 gemma-4-26b-a4b-it [RPM:15, TPM:2500000, RPD:1500]
 gemma-4-31b-it [RPM:15, TPM:2500000, RPD:1500]
+antigravity-preview-05-2026
