@@ -17,6 +17,11 @@ from collections import deque
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
+try:
+    from google import genai as genai_new
+except Exception:
+    genai_new = None
+
 # Импортируем наши внешние модули
 from markdown import split_text_safely, md_to_html
 from search import parse_search_query, run_grep_search, run_archive_search, format_search_results
@@ -70,6 +75,10 @@ STATUS_MSG = {}
 TURN_STATS = {}
 CONSECUTIVE_SLEEPS = {}
 ABORT_FLAGS = {}
+
+# Antigravity state
+ANTIGRAVITY_ENVIRONMENTS = {}
+ANTIGRAVITY_INTERACTIONS = {}
 
 # Защита от бесконечного переключения ключей при 429
 API_KEY_COOLDOWN = {
@@ -159,6 +168,7 @@ API_TOKEN_HISTORY = {1: deque(), 2: deque(), 3: deque()}
 def load_limits_state():
     global API_RPD_HISTORY
     os.makedirs(os.path.dirname(LIMITS_STATE_FILE), exist_ok=True)
+
     if os.path.exists(LIMITS_STATE_FILE):
         try:
             with open(LIMITS_STATE_FILE, "r", encoding="utf-8") as f:
@@ -186,6 +196,7 @@ def save_limits_state():
 def load_prompts_config():
     global PROMPTS
     PROMPTS.clear()
+
     if not os.path.exists(PROMPTS_FILE):
         with open(PROMPTS_FILE, "w", encoding="utf-8") as f:
             f.write("")
@@ -193,6 +204,7 @@ def load_prompts_config():
     with open(PROMPTS_FILE, "r", encoding="utf-8") as f:
         current_key = None
         current_text = []
+
         for line in f:
             match = re.match(r'^\[(.*?)\]$', line.strip())
             if match:
@@ -202,12 +214,14 @@ def load_prompts_config():
                 current_text = []
             else:
                 current_text.append(line.rstrip('\n'))
+
         if current_key:
             PROMPTS[current_key] = "\n".join(current_text).strip()
 
 
 def load_models_config():
     global PRIORITY_MODELS, MODEL_RPM_LIMITS, MODEL_RESTRICTED_KEYS, MODEL_TPM_LIMITS, MODEL_RPD_LIMITS
+
     PRIORITY_MODELS.clear()
     MODEL_RPM_LIMITS.clear()
     MODEL_RESTRICTED_KEYS.clear()
@@ -280,12 +294,32 @@ def get_antigravity_prompt():
     return PROMPTS.get("ANTIGRAVITY_ADMIN", "").strip() or DEFAULT_ANTIGRAVITY_PROMPT
 
 
+def g(obj, name, default=None):
+    if obj is None:
+        return default
+    if isinstance(obj, dict):
+        return obj.get(name, default)
+    return getattr(obj, name, default)
+
+
+def short_text(val, limit=160):
+    s = str(val)
+    return s if len(s) <= limit else s[:limit - 1] + "…"
+
+
+def get_usage_total_tokens(usage):
+    if not usage:
+        return 0
+    return g(usage, "total_tokens", 0) or g(usage, "total_token_count", 0) or 0
+
+
 # ─────────────────────────────────────────────
 #  Live-статус, Трекер Лимитов и Авто-Переключение
 # ─────────────────────────────────────────────
 
 def set_status(chat_id, text: str, show_abort=False):
     global STATUS_MSG
+
     markup = None
     if show_abort:
         markup = InlineKeyboardMarkup()
@@ -785,6 +819,9 @@ def handle_api_error(e, chat_id, message_id, clean_model_name):
 # ─────────────────────────────────────────────
 
 def safe_edit_message(chat_id, message_id, text, parse_mode='HTML', reply_markup=None):
+    if not message_id:
+        return
+
     try:
         bot.edit_message_text(
             chat_id=chat_id,
@@ -1066,6 +1103,11 @@ def get_models_lists():
                 if not best_match:
                     best_match = m
 
+        # Если Antigravity не виден в list_models, но указан в models.txt,
+        # пробуем добавить его вручную.
+        if not best_match and "antigravity" in p.lower():
+            best_match = f"models/{p}"
+
         if best_match:
             priority.append(best_match)
             used_models.add(best_match)
@@ -1131,19 +1173,10 @@ def init_models(model_name, role="admin", mode="auto"):
         model_advisor = genai.GenerativeModel(model_name=model_name)
 
     elif is_antigravity:
-        # Antigravity работает без локальных инструментов бота.
-        sys_prompt = get_antigravity_prompt()
-
-        model_agent = genai.GenerativeModel(
-            model_name=model_name,
-            system_instruction=sys_prompt
-        )
-        chat_agent = model_agent.start_chat()
-
-        model_advisor = genai.GenerativeModel(
-            model_name=model_name,
-            system_instruction=PROMPTS.get("GEMINI_ADVISOR", "")
-        )
+        # Antigravity вызывается через Interactions API,
+        # поэтому обычный chat_agent для него не создаётся.
+        chat_agent = None
+        model_advisor = None
 
     else:
         if role == "chat":
@@ -1239,11 +1272,378 @@ def get_gemma_react_prompt(clean_model_name):
 
 
 # ─────────────────────────────────────────────
+#  ANTIGRAVITY: INTERACTIONS API + LIVE STATUS
+# ─────────────────────────────────────────────
+
+def run_antigravity_interaction(
+    chat_id,
+    user_text,
+    model_name=None,
+    first_msg_id=None,
+    is_background=False,
+    task_id=None,
+    image_path=None
+):
+    global CURRENT_KEY_NUM
+
+    if genai_new is None:
+        raise Exception(
+            "Не установлен пакет google-genai. "
+            "Добавьте google-genai>=2.3.0 в requirements.txt."
+        )
+
+    if model_name is None:
+        model_name = CURRENT_MODEL
+
+    agent_id = get_clean_model_name(model_name) or "antigravity-preview-05-2026"
+    display_name = get_clean_model_name(model_name) or agent_id
+    custom_prompt = get_antigravity_prompt()
+
+    if image_path and os.path.exists(image_path):
+        with open(image_path, "rb") as f:
+            image_b64 = base64.b64encode(f.read()).decode("utf-8")
+
+        mime_type = "image/png" if image_path.lower().endswith(".png") else "image/jpeg"
+        text_part = user_text.strip() if user_text and user_text.strip() else "Проанализируй это изображение."
+
+        if custom_prompt:
+            text_part = f"{custom_prompt}\n\n{text_part}"
+
+        input_payload = [
+            {"type": "text", "text": text_part},
+            {
+                "type": "image",
+                "data": image_b64,
+                "mime_type": mime_type
+            }
+        ]
+    else:
+        text_part = user_text.strip() if user_text and user_text.strip() else ""
+        input_payload = f"{custom_prompt}\n\n{text_part}" if custom_prompt else text_part
+
+    if not input_payload:
+        input_payload = "Выполни задачу."
+
+    if first_msg_id is None:
+        msg = bot.send_message(
+            chat_id,
+            f"<b>{display_name}:</b>\n\n🪐 Запускаю Antigravity...",
+            parse_mode='HTML'
+        )
+        first_msg_id = msg.message_id
+
+    abort_markup = InlineKeyboardMarkup()
+    abort_markup.add(InlineKeyboardButton("🛑 Аварийный стоп", callback_data=f"abort_{chat_id}"))
+
+    status_line = ["🪐 <b>Antigravity выполняет задачу в песочнице Google...</b>"]
+    actions = []
+    final_parts = []
+    final_text = ""
+    total_tokens = 0
+    interaction_id = None
+    environment_id = ANTIGRAVITY_ENVIRONMENTS.get(chat_id, "remote")
+    previous_interaction_id = ANTIGRAVITY_INTERACTIONS.get(chat_id)
+    last_edit = 0
+    completed = False
+    use_background = True
+
+    ACTION_LOGS.setdefault(chat_id, [])
+
+    def edit_live(force=False):
+        nonlocal last_edit
+
+        now = time.time()
+        if not force and now - last_edit < 0.8:
+            return
+
+        last_edit = now
+
+        text = f"<b>{display_name}:</b>\n\n{status_line[0]}\n"
+
+        if actions:
+            text += "\n<b>Действия:</b>\n" + "\n".join(actions[-12:])
+
+        if final_parts:
+            preview = "".join(final_parts)
+            if len(preview) > 1500:
+                preview = preview[:1500] + "…"
+            text += "\n\n" + html.escape(preview)
+
+        safe_edit_message(chat_id, first_msg_id, text, parse_mode='HTML', reply_markup=abort_markup)
+
+    def add_action(line, log_value=None):
+        actions.append(line)
+        ACTION_LOGS[chat_id].append(("antigravity", log_value or line))
+
+    def cancel_interaction(client):
+        if interaction_id:
+            try:
+                client.interactions.cancel(id=interaction_id)
+            except Exception:
+                pass
+
+    max_retries = 4
+
+    for attempt in range(max_retries):
+        try:
+            check_api_rate_limit(chat_id, status_line[0], model_name)
+
+            target_key = get_api_key_by_num(CURRENT_KEY_NUM)
+            client = genai_new.Client(api_key=target_key)
+
+            kwargs = {
+                "agent": agent_id,
+                "input": input_payload,
+                "environment": environment_id,
+                "stream": True
+            }
+
+            if previous_interaction_id:
+                kwargs["previous_interaction_id"] = previous_interaction_id
+
+            if use_background:
+                kwargs["background"] = True
+
+            status_line[0] = "🪐 <b>Запускаю Antigravity...</b>"
+            edit_live(True)
+
+            stream = client.interactions.create(**kwargs)
+
+            for event in stream:
+                if ABORT_FLAGS.get(chat_id):
+                    status_line[0] = "🛑 <b>Останавливаю Antigravity...</b>"
+                    edit_live(True)
+                    cancel_interaction(client)
+                    finish_response(
+                        chat_id,
+                        "🛑 Выполнение Antigravity было остановлено пользователем.",
+                        first_msg_id,
+                        display_name,
+                        is_background,
+                        task_id
+                    )
+                    return
+
+                event_type = g(event, "event_type", None) or g(event, "type", None)
+
+                if event_type == "interaction.created":
+                    interaction_obj = g(event, "interaction", None)
+                    if interaction_obj:
+                        interaction_id = g(interaction_obj, "id", interaction_id)
+                        environment_id = g(interaction_obj, "environment_id", environment_id) or environment_id
+                    status_line[0] = "🪐 <b>Antigravity создан. Выполняю задачу...</b>"
+                    edit_live(True)
+
+                elif event_type == "step.start":
+                    step = g(event, "step", None)
+                    step_type = g(step, "type", "step")
+
+                    if step_type == "function_call":
+                        name = g(step, "name", "tool")
+                        args = g(step, "arguments", None)
+
+                        if args and args != {}:
+                            line = f"⚙️ <code>{html.escape(short_text(name))}</code> <code>{html.escape(short_text(args))}</code>"
+                            log_val = f"{name}: {short_text(args)}"
+                        else:
+                            line = f"⚙️ <code>{html.escape(short_text(name))}</code>"
+                            log_val = str(name)
+
+                        add_action(line, log_val)
+                        status_line[0] = f"🪐 <b>Выполняю:</b> <code>{html.escape(short_text(name))}</code>"
+                        edit_live(True)
+
+                    elif step_type == "model_output":
+                        status_line[0] = "🪐 <b>Формирую ответ...</b>"
+                        edit_live()
+
+                    elif step_type == "thought":
+                        status_line[0] = "🧠 <b>Размышляю...</b>"
+                        edit_live()
+
+                    else:
+                        status_line[0] = f"🪐 <b>Шаг:</b> <code>{html.escape(short_text(step_type))}</code>"
+                        edit_live()
+
+                elif event_type == "step.delta":
+                    delta = g(event, "delta", None)
+                    delta_type = g(delta, "type", None)
+
+                    if delta_type == "text":
+                        txt = g(delta, "text", "")
+                        if txt:
+                            final_parts.append(txt)
+                            status_line[0] = "🪐 <b>Пишу ответ...</b>"
+                            edit_live()
+
+                    elif delta_type == "arguments_delta":
+                        args = g(delta, "arguments", None) or g(delta, "text", "")
+                        if args and actions:
+                            actions[-1] = f"⚙️ <code>{html.escape(short_text(args, 220))}</code>"
+                            edit_live()
+
+                    elif delta_type == "thought_summary":
+                        content = g(delta, "content", None)
+                        txt = g(content, "text", None) or g(delta, "text", "")
+                        if txt:
+                            add_action(f"🧠 <code>{html.escape(short_text(txt))}</code>", f"thought: {short_text(txt)}")
+                            status_line[0] = "🧠 <b>Размышляю...</b>"
+                            edit_live()
+
+                elif event_type == "step.stop":
+                    usage = g(event, "usage", None)
+                    step_tokens = get_usage_total_tokens(usage)
+                    if step_tokens:
+                        total_tokens = max(total_tokens, step_tokens)
+                    edit_live()
+
+                elif event_type == "interaction.completed":
+                    interaction_obj = g(event, "interaction", None)
+                    if interaction_obj:
+                        interaction_id = g(interaction_obj, "id", interaction_id)
+                        environment_id = g(interaction_obj, "environment_id", environment_id) or environment_id
+                        out = g(interaction_obj, "output_text", None)
+                        if out:
+                            final_text = out
+                        usage = g(interaction_obj, "usage", None)
+                        total_tokens = get_usage_total_tokens(usage) or total_tokens
+
+                    completed = True
+                    break
+
+                elif event_type in ["interaction.failed", "error"]:
+                    err = g(event, "error", None) or g(event, "message", None) or "Antigravity interaction failed"
+                    raise Exception(str(err))
+
+            # Если стрим закончился, но interaction.completed не пришёл.
+            if not completed and interaction_id:
+                status_line[0] = "🪐 <b>Ожидаю завершения фоновой задачи...</b>"
+                edit_live(True)
+
+                while True:
+                    if ABORT_FLAGS.get(chat_id):
+                        status_line[0] = "🛑 <b>Останавливаю Antigravity...</b>"
+                        edit_live(True)
+                        cancel_interaction(client)
+                        finish_response(
+                            chat_id,
+                            "🛑 Выполнение Antigravity было остановлено пользователем.",
+                            first_msg_id,
+                            display_name,
+                            is_background,
+                            task_id
+                        )
+                        return
+
+                    time.sleep(5)
+
+                    interaction_obj = client.interactions.get(id=interaction_id)
+                    status = g(interaction_obj, "status", "")
+
+                    status_line[0] = f"🪐 <b>Статус:</b> <code>{html.escape(short_text(status or 'in_progress'))}</code>"
+                    edit_live(True)
+
+                    if status not in ["in_progress", "queued", ""]:
+                        if status == "completed":
+                            completed = True
+                            final_text = g(interaction_obj, "output_text", "") or final_text
+                            environment_id = g(interaction_obj, "environment_id", environment_id) or environment_id
+                            usage = g(interaction_obj, "usage", None)
+                            total_tokens = get_usage_total_tokens(usage) or total_tokens
+                        elif status == "incomplete":
+                            completed = True
+                            final_text = g(interaction_obj, "output_text", "") or final_text
+                            final_text += "\n\n⚠️ Antigravity остановился по лимиту токенов. Можно отправить «продолжи»."
+                            environment_id = g(interaction_obj, "environment_id", environment_id) or environment_id
+                        else:
+                            raise Exception(f"Antigravity interaction status: {status}")
+
+                        break
+
+            if completed:
+                if environment_id and environment_id != "remote":
+                    ANTIGRAVITY_ENVIRONMENTS[chat_id] = environment_id
+
+                if interaction_id:
+                    ANTIGRAVITY_INTERACTIONS[chat_id] = interaction_id
+
+                if chat_id in TURN_STATS:
+                    TURN_STATS[chat_id]["rpd"] += 1
+                    TURN_STATS[chat_id]["tpm"] += total_tokens
+
+                record_successful_request(model_name, total_tokens)
+
+                final_answer = final_text or "".join(final_parts).strip()
+                if not final_answer:
+                    final_answer = "✅ Задача выполнена, но текстовый ответ не получен."
+
+                finish_response(
+                    chat_id,
+                    final_answer,
+                    first_msg_id,
+                    display_name,
+                    is_background,
+                    task_id
+                )
+                return
+
+            raise Exception("Antigravity: поток завершился без статуса completed.")
+
+        except Exception as e:
+            error_text = str(e)
+
+            # Если API не принимает background/stream в таком виде, пробуем без background.
+            if use_background and ("background" in error_text.lower() or "stream" in error_text.lower()):
+                use_background = False
+                continue
+
+            if "RPD_LIMIT_REACHED" in error_text:
+                if switch_api_key(
+                    chat_id,
+                    f"Достигнут дневной лимит (RPD) на ключе {CURRENT_KEY_NUM}.",
+                    model_name=model_name,
+                    cooldown_current=False
+                ):
+                    environment_id = ANTIGRAVITY_ENVIRONMENTS.get(chat_id, environment_id)
+                    previous_interaction_id = ANTIGRAVITY_INTERACTIONS.get(chat_id)
+                    continue
+                else:
+                    raise Exception("Все доступные ключи исчерпали дневной лимит (RPD) для этой модели.")
+
+            elif (
+                "API_KEY_COOLDOWN" in error_text
+                or "API_KEY_RESTRICTED" in error_text
+                or "429" in error_text
+                or "Quota exceeded" in error_text
+                or "RESOURCE_EXHAUSTED" in error_text
+            ):
+                if switch_api_key(
+                    chat_id,
+                    f"Превышена квота API или ключ временно недоступен (KEY {CURRENT_KEY_NUM}).",
+                    model_name=model_name,
+                    cooldown_current=True,
+                    cooldown_seconds=60
+                ):
+                    environment_id = ANTIGRAVITY_ENVIRONMENTS.get(chat_id, environment_id)
+                    previous_interaction_id = ANTIGRAVITY_INTERACTIONS.get(chat_id)
+                    continue
+                else:
+                    raise Exception("Все ключи исчерпали квоту API (429). Попробуйте позже.")
+
+            else:
+                raise e
+
+    raise Exception("Превышено количество попыток переключения ключей.")
+
+
+# ─────────────────────────────────────────────
 #  ФОНОВЫЙ ВЫПОЛНИТЕЛЬ ЗАДАЧ (SCHEDULER CALLBACK)
 # ─────────────────────────────────────────────
 
 def execute_scheduled_task(chat_id, prompt, model_name, task_id):
     global ABORT_FLAGS, PROMPTS, CURRENT_CHAT_ID, ACTION_LOGS, TURN_STATS, CONSECUTIVE_SLEEPS
+
+    msg_first = None
 
     try:
         ABORT_FLAGS[chat_id] = False
@@ -1259,60 +1659,51 @@ def execute_scheduled_task(chat_id, prompt, model_name, task_id):
 
         clean_model_name = model_name.replace('models/', '')
 
-        if "antigravity" in clean_model_name.lower():
-            task_specific_instructions = (
-                f"\n\n[SYSTEM: BACKGROUND TASK RUNNER]\n"
-                f"1. You are currently running as a background scheduled task.\n"
-                f"2. Your unique Task ID is: {task_id}\n"
-                f"3. You do NOT have local Telegram bot tools. Do not try to call execute_bash, search_web_tool, delete_scheduled_task_tool or any other local tool.\n"
-                f"4. Work inside your own Google sandbox.\n"
-                f"5. If you create artifacts, upload them according to the user's instructions and include links/paths in the final report.\n"
-                f"6. If the task must be stopped, clearly state in the final report that the task is completed and should be stopped manually.\n"
-                f"7. Complete the user's prompt and provide the final report.\n"
-            )
-
-            system_prompt = get_antigravity_prompt() + task_specific_instructions
-
-            task_model = genai.GenerativeModel(
-                model_name=model_name,
-                system_instruction=system_prompt
-            )
-            task_chat = task_model.start_chat()
-
-        else:
-            task_specific_instructions = (
-                f"\n\n[SYSTEM: BACKGROUND TASK RUNNER]\n"
-                f"1. You are currently running as a background scheduled task.\n"
-                f"2. Your unique Task ID is: {task_id}\n"
-                f"3. State Management: You have no memory of previous runs. If you need to keep track of counts or data between executions, you MUST use the `execute_bash` tool to read/write to a text file in `/app/downloads/tasks/state_{task_id}.txt`.\n"
-                f"4. Self-Deletion: If your instructions say to stop or delete the task after a certain condition, use the `delete_scheduled_task_tool(task_id)` passing your ID: {task_id}.\n"
-                f"5. Try to combine your bash commands into a single script execution to save time. Do not make more than 1-2 bash calls per execution.\n"
-                f"6. Complete the user's prompt using your tools, and provide the final report.\n"
-                f"7. Return EXACTLY ONE tool call at a time. Do NOT use parallel function calling."
-            )
-
-            system_prompt = PROMPTS.get("GEMINI_ADMIN", "") + task_specific_instructions
-
-            task_model = genai.GenerativeModel(
-                model_name=model_name,
-                tools=[
-                    execute_bash,
-                    search_web_tool,
-                    download_file_tool,
-                    send_file_to_telegram,
-                    delete_scheduled_task_tool,
-                    list_my_tasks_tool,
-                    sleep_tool
-                ],
-                system_instruction=system_prompt
-            )
-            task_chat = task_model.start_chat(enable_automatic_function_calling=False)
-
         CURRENT_CHAT_ID = chat_id
-
         ACTION_LOGS[chat_id] = []
         TURN_STATS[chat_id] = {"rpd": 0, "tpm": 0}
         CONSECUTIVE_SLEEPS[chat_id] = 0
+
+        if "antigravity" in clean_model_name.lower():
+            clear_status(chat_id)
+
+            run_antigravity_interaction(
+                chat_id,
+                prompt,
+                model_name=model_name,
+                first_msg_id=msg_first.message_id,
+                is_background=True,
+                task_id=task_id
+            )
+            return
+
+        task_specific_instructions = (
+            f"\n\n[SYSTEM: BACKGROUND TASK RUNNER]\n"
+            f"1. You are currently running as a background scheduled task.\n"
+            f"2. Your unique Task ID is: {task_id}\n"
+            f"3. State Management: You have no memory of previous runs. If you need to keep track of counts or data between executions, you MUST use the `execute_bash` tool to read/write to a text file in `/app/downloads/tasks/state_{task_id}.txt`.\n"
+            f"4. Self-Deletion: If your instructions say to stop or delete the task after a certain condition, use the `delete_scheduled_task_tool(task_id)` passing your ID: {task_id}.\n"
+            f"5. Try to combine your bash commands into a single script execution to save time. Do not make more than 1-2 bash calls per execution.\n"
+            f"6. Complete the user's prompt using your tools, and provide the final report.\n"
+            f"7. Return EXACTLY ONE tool call at a time. Do NOT use parallel function calling."
+        )
+
+        system_prompt = PROMPTS.get("GEMINI_ADMIN", "") + task_specific_instructions
+
+        task_model = genai.GenerativeModel(
+            model_name=model_name,
+            tools=[
+                execute_bash,
+                search_web_tool,
+                download_file_tool,
+                send_file_to_telegram,
+                delete_scheduled_task_tool,
+                list_my_tasks_tool,
+                sleep_tool
+            ],
+            system_instruction=system_prompt
+        )
+        task_chat = task_model.start_chat(enable_automatic_function_calling=False)
 
         response = safe_send_message(task_chat, chat_id, prompt, status_text, model_name=model_name)
 
@@ -1329,7 +1720,10 @@ def execute_scheduled_task(chat_id, prompt, model_name, task_id):
 
     except Exception as e:
         clear_status(chat_id)
-        handle_api_error(e, chat_id, msg_first.message_id, model_name.replace('models/', ''))
+
+        if msg_first:
+            handle_api_error(e, chat_id, msg_first.message_id, model_name.replace('models/', ''))
+
         task.log_task_event(f"ERROR: Task ID={task_id} failed: {e}")
 
 
@@ -1478,6 +1872,12 @@ def clear_cmd(message):
 
     if not CURRENT_MODEL:
         bot.reply_to(message, "⚠️ Модель еще не выбрана. Память пуста.")
+        return
+
+    if is_antigravity_model_name(CURRENT_MODEL):
+        ANTIGRAVITY_ENVIRONMENTS.pop(message.chat.id, None)
+        ANTIGRAVITY_INTERACTIONS.pop(message.chat.id, None)
+        bot.reply_to(message, "🧹 Контекст и песочница Antigravity сброшены.")
         return
 
     try:
@@ -1891,6 +2291,9 @@ def parse_and_route_response(
 def finish_response(chat_id, text, msg_id, clean_model_name, is_background=False, task_id=None):
     global ACTION_LOGS, TURN_STATS, LAST_ACTIONS, VOICE_MODE
 
+    if not text:
+        text = "✅ Запрос обработан, но модель вернула пустой ответ."
+
     markup = None
 
     if ACTION_LOGS.get(chat_id):
@@ -2251,6 +2654,8 @@ def handle_query(call):
                 log_text += f"💤 <b>Пауза:</b> <i>{act_val} сек.</i>\n"
             elif act_type == "tts":
                 log_text += f"🎙 <b>Синтез речи:</b> <i>{html.escape(act_val)}</i>\n"
+            elif act_type == "antigravity":
+                log_text += f"🪐 <b>Antigravity:</b> <i>{html.escape(str(act_val))}</i>\n"
 
         if bash_commands:
             bash_str = "\n".join(bash_commands)
@@ -2665,6 +3070,7 @@ def handle_query(call):
 
             clean_name = CURRENT_MODEL.replace('models/', '')
             is_gemma = "gemma" in clean_name.lower()
+            is_antigravity = "antigravity" in clean_name.lower()
 
             CURRENT_CHAT_ID = call.message.chat.id
             ABORT_FLAGS[CURRENT_CHAT_ID] = False
@@ -2677,6 +3083,8 @@ def handle_query(call):
             status_text = "🧠 <b>Анализирую файл...</b>"
             set_status(call.message.chat.id, status_text, show_abort=True)
 
+            temp_file_name = None
+
             try:
                 file_info = bot.get_file(file_info_dict['file_id'])
                 temp_file_name = f"temp_ai_{file_info_dict['file_name']}"
@@ -2684,11 +3092,28 @@ def handle_query(call):
                 with open(temp_file_name, 'wb') as new_file:
                     new_file.write(bot.download_file(file_info.file_path))
 
-                mime = file_info_dict['mime_type']
+                mime = file_info_dict['mime_type'] or ""
 
-                gemini_file = genai.upload_file(path=temp_file_name, mime_type=mime) if mime else genai.upload_file(path=temp_file_name)
+                if is_antigravity:
+                    clear_status(call.message.chat.id)
 
-                if is_gemma:
+                    if mime.startswith("image/"):
+                        run_antigravity_interaction(
+                            call.message.chat.id,
+                            "Проанализируй этот файл.",
+                            model_name=CURRENT_MODEL,
+                            first_msg_id=call.message.message_id,
+                            image_path=temp_file_name
+                        )
+                    else:
+                        safe_edit_message(
+                            call.message.chat.id,
+                            call.message.message_id,
+                            "⚠️ Antigravity поддерживает только текст и изображения как ввод. "
+                            "Этот файл не может быть отправлен напрямую."
+                        )
+
+                elif is_gemma:
                     response = safe_send_message(
                         chat_agent,
                         call.message.chat.id,
@@ -2696,7 +3121,20 @@ def handle_query(call):
                         status_text,
                         model_name=CURRENT_MODEL
                     )
+
+                    parse_and_route_response(
+                        chat_agent,
+                        call.message.chat.id,
+                        response,
+                        call.message.message_id,
+                        "file",
+                        is_background=False,
+                        model_name=CURRENT_MODEL
+                    )
+
                 else:
+                    gemini_file = genai.upload_file(path=temp_file_name, mime_type=mime) if mime else genai.upload_file(path=temp_file_name)
+
                     response = safe_send_message(
                         chat_agent,
                         call.message.chat.id,
@@ -2705,21 +3143,23 @@ def handle_query(call):
                         model_name=CURRENT_MODEL
                     )
 
-                parse_and_route_response(
-                    chat_agent,
-                    call.message.chat.id,
-                    response,
-                    call.message.message_id,
-                    "file",
-                    is_background=False,
-                    model_name=CURRENT_MODEL
-                )
-
-                os.remove(temp_file_name)
+                    parse_and_route_response(
+                        chat_agent,
+                        call.message.chat.id,
+                        response,
+                        call.message.message_id,
+                        "file",
+                        is_background=False,
+                        model_name=CURRENT_MODEL
+                    )
 
             except Exception as e:
                 clear_status(call.message.chat.id)
                 handle_api_error(e, call.message.chat.id, call.message.message_id, clean_name)
+
+            finally:
+                if temp_file_name and os.path.exists(temp_file_name):
+                    os.remove(temp_file_name)
 
             PENDING_FILES.pop(call.message.chat.id, None)
             return
@@ -2784,7 +3224,7 @@ def handle_message(message):
 
     pending = PENDING_ACTION.pop(message.chat.id, None)
 
-    if pending and pending.get("type") == "native":
+    if pending and pending.get("type") == "native" and chat_agent is not None:
         try:
             chat_agent.send_message(
                 {
@@ -2815,6 +3255,114 @@ def handle_message(message):
     is_voice = message.content_type == 'voice'
     is_photo = message.content_type == 'photo'
 
+    # Отдельная ветка для Antigravity.
+    if is_antigravity:
+        ACTION_LOGS[message.chat.id] = []
+        TURN_STATS[message.chat.id] = {"rpd": 0, "tpm": 0}
+        CONSECUTIVE_SLEEPS[message.chat.id] = 0
+        STATUS_MSG.pop(message.chat.id, None)
+
+        if not is_voice and not is_photo and text.startswith('!'):
+            cmd = text[1:].strip()
+
+            bot.send_message(
+                message.chat.id,
+                f"⚡ Выполняю напрямую:\n<code>{html.escape(cmd)}</code>",
+                parse_mode='HTML'
+            )
+
+            result = execute_bash(cmd)
+            send_long_text(message.chat.id, result, is_code=True)
+            return
+
+        if not is_voice and not is_photo and text.startswith('#'):
+            task_cmd = text[1:].strip()
+
+            msg_first = bot.send_message(
+                message.chat.id,
+                f"<b>{clean_model_name}:</b>\n\n🪐 Запускаю Antigravity...",
+                parse_mode='HTML'
+            )
+
+            try:
+                run_antigravity_interaction(
+                    message.chat.id,
+                    f"Ты советник. Дай краткий полезный ответ или команду.\n\n{task_cmd}",
+                    model_name=CURRENT_MODEL,
+                    first_msg_id=msg_first.message_id
+                )
+            except Exception as e:
+                clear_status(message.chat.id)
+                handle_api_error(e, message.chat.id, msg_first.message_id, clean_model_name)
+
+            return
+
+        if is_voice:
+            bot.send_message(
+                message.chat.id,
+                "⚠️ Antigravity пока не поддерживает аудио-ввод. Отправьте текст или изображение."
+            )
+            return
+
+        if is_photo:
+            photo_path = f"temp_ag_photo_{message.message_id}.jpg"
+
+            try:
+                file_info = bot.get_file(message.photo[-1].file_id)
+
+                with open(photo_path, 'wb') as new_file:
+                    new_file.write(bot.download_file(file_info.file_path))
+
+                msg_first = bot.send_message(
+                    message.chat.id,
+                    f"<b>{clean_model_name}:</b>\n\n🪐 Запускаю Antigravity...",
+                    parse_mode='HTML'
+                )
+
+                run_antigravity_interaction(
+                    message.chat.id,
+                    text,
+                    model_name=CURRENT_MODEL,
+                    first_msg_id=msg_first.message_id,
+                    image_path=photo_path
+                )
+
+            except Exception as e:
+                clear_status(message.chat.id)
+                handle_api_error(
+                    e,
+                    message.chat.id,
+                    getattr(locals().get("msg_first", None), "message_id", None),
+                    clean_model_name
+                )
+
+            finally:
+                if os.path.exists(photo_path):
+                    os.remove(photo_path)
+
+            return
+
+        # Обычный текст для Antigravity.
+        msg_first = bot.send_message(
+            message.chat.id,
+            f"<b>{clean_model_name}:</b>\n\n🪐 Запускаю Antigravity...",
+            parse_mode='HTML'
+        )
+
+        try:
+            run_antigravity_interaction(
+                message.chat.id,
+                text,
+                model_name=CURRENT_MODEL,
+                first_msg_id=msg_first.message_id
+            )
+        except Exception as e:
+            clear_status(message.chat.id)
+            handle_api_error(e, message.chat.id, msg_first.message_id, clean_model_name)
+
+        return
+
+    # Обычные модели ниже.
     if role == "tts":
         if is_voice or is_photo:
             bot.send_message(message.chat.id, "⚠️ Режим TTS поддерживает только текст.")
@@ -2982,20 +3530,12 @@ def handle_message(message):
         parse_mode='HTML'
     )
 
-    if is_antigravity:
-        status_text = "🪐 <b>Antigravity выполняет запрос в своей песочнице Google...</b>"
-    else:
-        status_text = "🤖 <b>Обрабатываю запрос...</b>"
-
+    status_text = "🤖 <b>Обрабатываю запрос...</b>"
     set_status(message.chat.id, status_text, show_abort=True)
 
     try:
         if is_voice:
-            set_status(
-                message.chat.id,
-                "🪐 <b>Antigravity анализирует аудио...</b>" if is_antigravity else "🎙 <b>Слушаю голосовое сообщение...</b>",
-                show_abort=True
-            )
+            set_status(message.chat.id, "🎙 <b>Слушаю голосовое сообщение...</b>", show_abort=True)
 
             file_info = bot.get_file(message.voice.file_id)
             voice_path = f"temp_voice_{message.message_id}.ogg"
@@ -3005,7 +3545,7 @@ def handle_message(message):
 
             audio_file = genai.upload_file(path=voice_path, mime_type="audio/ogg")
 
-            status_text = "🪐 <b>Antigravity анализирует аудио...</b>" if is_antigravity else "🧠 <b>Анализирую аудио...</b>"
+            status_text = "🧠 <b>Анализирую аудио...</b>"
             set_status(message.chat.id, status_text, show_abort=True)
 
             if is_gemma:
@@ -3036,11 +3576,7 @@ def handle_message(message):
             os.remove(voice_path)
 
         elif is_photo:
-            set_status(
-                message.chat.id,
-                "🪐 <b>Antigravity анализирует изображение...</b>" if is_antigravity else "🖼 <b>Анализирую изображение...</b>",
-                show_abort=True
-            )
+            set_status(message.chat.id, "🖼 <b>Анализирую изображение...</b>", show_abort=True)
 
             file_info = bot.get_file(message.photo[-1].file_id)
             photo_path = f"temp_photo_{message.message_id}.jpg"
@@ -3050,7 +3586,7 @@ def handle_message(message):
 
             img_file = genai.upload_file(path=photo_path)
 
-            status_text = "🪐 <b>Antigravity анализирует изображение...</b>" if is_antigravity else "🖼 <b>Анализирую изображение...</b>"
+            status_text = "🖼 <b>Анализирую изображение...</b>"
             set_status(message.chat.id, status_text, show_abort=True)
 
             if is_gemma:
