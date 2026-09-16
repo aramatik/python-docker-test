@@ -535,10 +535,8 @@ def switch_api_key(chat_id, reason, model_name=None, cooldown_current=False, coo
         CURRENT_KEY_NUM = next_key
         genai.configure(api_key=target_key)
 
-        # Сохраняем контекст глобального чата при переключении ключа.
         reinit_global_models_preserve_history(chat_id)
 
-        # Список моделей может зависеть от KEY:, поэтому кэш лучше сбросить.
         PRIORITY_MODELS_CACHE, OTHER_MODELS_CACHE, AVAILABLE_MODELS = [], [], []
 
         if chat_id:
@@ -583,7 +581,6 @@ def safe_send_message(
                 TURN_STATS[chat_id]["rpd"] += 1
                 TURN_STATS[chat_id]["tpm"] += token_count
 
-            # Учитываем запрос только после успешного ответа.
             record_successful_request(model_name, token_count)
 
             if not is_advisor:
@@ -722,12 +719,10 @@ def safe_tts_request_raw(chat_id, text, reader_voice, hero_voice, status_text):
             audio_b64 = part["inlineData"]["data"]
             audio_bytes = base64.b64decode(audio_b64)
 
-            # ВАЖНО: Отсекаем возможный RIFF-заголовок, чтобы безопасно собрать свой WAV
             pcm_bytes = audio_bytes[44:] if audio_bytes.startswith(b'RIFF') else audio_bytes
 
             output_wav_path = f"temp_tts_out_{chat_id}_{int(time.time())}.wav"
 
-            # Строим правильный WAV-контейнер
             with wave.open(output_wav_path, "wb") as wf:
                 wf.setnchannels(1)       # Mono
                 wf.setsampwidth(2)       # 16-bit
@@ -741,7 +736,6 @@ def safe_tts_request_raw(chat_id, text, reader_voice, hero_voice, status_text):
                 TURN_STATS[chat_id]["rpd"] += 1
                 TURN_STATS[chat_id]["tpm"] += tokens_used
 
-            # Учитываем запрос только после успешного ответа.
             record_successful_request(model_name, tokens_used)
 
             return output_wav_path, tokens_used
@@ -1103,8 +1097,6 @@ def get_models_lists():
                 if not best_match:
                     best_match = m
 
-        # Если Antigravity не виден в list_models, но указан в models.txt,
-        # пробуем добавить его вручную.
         if not best_match and "antigravity" in p.lower():
             best_match = f"models/{p}"
 
@@ -1173,8 +1165,6 @@ def init_models(model_name, role="admin", mode="auto"):
         model_advisor = genai.GenerativeModel(model_name=model_name)
 
     elif is_antigravity:
-        # Antigravity вызывается через Interactions API,
-        # поэтому обычный chat_agent для него не создаётся.
         chat_agent = None
         model_advisor = None
 
@@ -1515,7 +1505,6 @@ def run_antigravity_interaction(
                     err = g(event, "error", None) or g(event, "message", None) or "Antigravity interaction failed"
                     raise Exception(str(err))
 
-            # Если стрим закончился, но interaction.completed не пришёл.
             if not completed and interaction_id:
                 status_line[0] = "🪐 <b>Ожидаю завершения фоновой задачи...</b>"
                 edit_live(True)
@@ -1592,7 +1581,6 @@ def run_antigravity_interaction(
         except Exception as e:
             error_text = str(e)
 
-            # Если API не принимает background/stream в таком виде, пробуем без background.
             if use_background and ("background" in error_text.lower() or "stream" in error_text.lower()):
                 use_background = False
                 continue
@@ -1944,7 +1932,7 @@ def del_task_cmd(message):
 
 @bot.message_handler(commands=['task'])
 def task_cmd(message):
-    global CURRENT_MODEL
+    global CURRENT_MODEL, CURRENT_KEY_NUM
 
     if message.from_user.id not in ADMIN_IDS:
         return
@@ -2005,10 +1993,50 @@ def task_cmd(message):
             f"User request: '{user_text}'"
         )
 
-        parser_model = genai.GenerativeModel("gemini-2.5-flash")
-        res = parser_model.generate_content(parse_prompt)
+        # Выполняем анализ и создание задачи той моделью, которая активна в данный момент
+        if is_antigravity_model_name(CURRENT_MODEL):
+            if genai_new is None:
+                raise Exception("Не установлен пакет google-genai для Antigravity.")
+            
+            target_key = get_api_key_by_num(CURRENT_KEY_NUM)
+            client = genai_new.Client(api_key=target_key)
+            agent_id = get_clean_model_name(CURRENT_MODEL) or "antigravity-preview-05-2026"
+            
+            stream = client.interactions.create(
+                agent=agent_id,
+                input=parse_prompt,
+                stream=True
+            )
+            raw_text = ""
+            for event in stream:
+                event_type = g(event, "event_type", None) or g(event, "type", None)
+                if event_type == "step.delta":
+                    delta = g(event, "delta", None)
+                    if g(delta, "type", None) == "text":
+                        raw_text += g(delta, "text", "")
+                elif event_type == "interaction.completed":
+                    interaction_obj = g(event, "interaction", None)
+                    if interaction_obj and g(interaction_obj, "output_text", None):
+                        raw_text = g(interaction_obj, "output_text")
+        else:
+            parser_model = genai.GenerativeModel(CURRENT_MODEL)
+            res = safe_send_message(
+                parser_model,
+                message.chat.id,
+                parse_prompt,
+                status_text="🧠 <b>Анализирую расписание...</b>",
+                is_advisor=True,
+                model_name=CURRENT_MODEL
+            )
+            raw_text = res.text or ""
 
-        cleaned_json_text = res.text.strip().lstrip("```json").lstrip("```").rstrip("```").strip()
+        # Извлекаем чистый JSON даже если модель добавила markdown-блоки или пояснения
+        json_match = re.search(r'\{.*\}', raw_text, re.DOTALL)
+        if json_match:
+            cleaned_json_text = json_match.group(0).strip()
+        else:
+            cleaned_json_text = raw_text.strip().lstrip("```json").lstrip("```").rstrip("```").strip()
+
         parsed_data = json.loads(cleaned_json_text)
 
         cron_expr = parsed_data["cron"]
@@ -2169,7 +2197,6 @@ def parse_and_route_response(
     is_antigravity = "antigravity" in clean_model_name.lower()
     role = MODEL_ROLE.get(chat_id, "admin")
 
-    # Antigravity не использует локальные инструменты бота.
     if role == "chat" or is_antigravity:
         finish_response(
             chat_id,
@@ -2839,7 +2866,6 @@ def handle_query(call):
             )
 
         elif "antigravity" in clean_name.lower():
-            # Antigravity сразу работает как агент, без выбора роли.
             MODEL_ROLE[call.message.chat.id] = "admin"
             MODEL_MODE[call.message.chat.id] = "auto"
 
@@ -3245,7 +3271,6 @@ def handle_message(message):
 
     role = MODEL_ROLE.get(message.chat.id, "admin")
 
-    # Antigravity всегда работает как агент.
     if is_antigravity:
         MODEL_ROLE[message.chat.id] = "admin"
         if not MODEL_MODE.get(message.chat.id):
@@ -3255,7 +3280,6 @@ def handle_message(message):
     is_voice = message.content_type == 'voice'
     is_photo = message.content_type == 'photo'
 
-    # Отдельная ветка для Antigravity.
     if is_antigravity:
         ACTION_LOGS[message.chat.id] = []
         TURN_STATS[message.chat.id] = {"rpd": 0, "tpm": 0}
@@ -3342,7 +3366,6 @@ def handle_message(message):
 
             return
 
-        # Обычный текст для Antigravity.
         msg_first = bot.send_message(
             message.chat.id,
             f"<b>{clean_model_name}:</b>\n\n🪐 Запускаю Antigravity...",
@@ -3362,7 +3385,6 @@ def handle_message(message):
 
         return
 
-    # Обычные модели ниже.
     if role == "tts":
         if is_voice or is_photo:
             bot.send_message(message.chat.id, "⚠️ Режим TTS поддерживает только текст.")
